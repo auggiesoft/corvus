@@ -1,0 +1,46 @@
+# Build every Corvus binary with tools/release.sh. On a v* tag, publish them as a GitHub Release;
+# run by hand (workflow_dispatch) to get the same files as a build artifact without releasing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME}"; else v="ci-${GITHUB_SHA::7}"; fi
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package
+        run: tools/release.sh "${{ steps.ver.outputs.v }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: corvus-${{ steps.ver.outputs.v }}
+          path: dist/${{ steps.ver.outputs.v }}/*
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.ver.outputs.v }}"
+          notes="docs/releases/$v.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          gh release create "$v" dist/"$v"/* --title "Corvus $v" "$@"

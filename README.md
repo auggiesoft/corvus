@@ -36,6 +36,10 @@ at boot. For comparison, the Mini's stock firmware driven from the PC managed 0.
 
 ## Try it
 
+Prebuilt firmware images, libraries and Corvus Sweep for Linux are on the
+[Releases](https://github.com/auggiesoft/corvus/releases) page, built by `tools/release.sh` in GitHub
+Actions on every version tag. To build everything yourself, run `tools/release.sh` (Docker and Rust).
+
 Corvus Sweep has a simulator that models the firmware's timing, so you can try it with no radio:
 
 ```

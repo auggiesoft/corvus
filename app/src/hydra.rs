@@ -66,12 +66,20 @@ impl Board {
         }
     }
 
-    /// The library this repo builds for the board (host/build/build.sh).
-    fn repo_lib(self) -> &'static str {
+    /// The library file this repo builds for the board (host/build/build.sh), and where it lands.
+    fn lib_file(self) -> &'static str {
         match self {
-            Board::RFOne => "../host/build/out/linux/libhydrasdr.so.1.1.4",
-            Board::Airspy | Board::Mini => "../host/build/out/airspy-linux/libairspy.so.1.0.10",
+            Board::RFOne => "libhydrasdr.so.1.1.4",
+            Board::Airspy | Board::Mini => "libairspy.so.1.0.10",
         }
+    }
+
+    fn repo_lib(self) -> String {
+        let dir = match self {
+            Board::RFOne => "linux",
+            Board::Airspy | Board::Mini => "airspy-linux",
+        };
+        format!("../host/build/out/{dir}/{}", self.lib_file())
     }
 
     fn system_lib(self) -> &'static str {
@@ -216,10 +224,16 @@ pub fn default_serial() -> u64 {
         .unwrap_or(0)
 }
 
-/// Default library: CORVUS_LIB, else this repo's build for the board (host/build/build.sh), else the loader's.
+/// Default library: CORVUS_LIB, else one next to the executable (release archives), else this repo's build
+/// for the board (host/build/build.sh), else the loader's.
 pub fn default_lib_path(board: Board) -> PathBuf {
     if let Ok(p) = std::env::var("CORVUS_LIB") {
         return PathBuf::from(p);
+    }
+    if let Some(beside) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(board.lib_file()))) {
+        if beside.exists() {
+            return beside;
+        }
     }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join(board.repo_lib());
     if repo.exists() {

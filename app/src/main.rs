@@ -57,7 +57,8 @@ corvus-sweep [options]
                         is the Airspy R2 (10 MSPS), mini the Airspy Mini (6 MSPS)
   --sim                 run the built-in simulator instead of the board
   --lib PATH            the board's library with the sweep API (default: env CORVUS_LIB,
-                        then the repo's host/build/out build, then the system loader)
+                        then one next to this program, then the repo's host/build/out
+                        build, then the system loader)
   --serial HEX          open the board with this serial (default: env CORVUS_SERIAL,
                         else the first one found)
   --range START:STOP    sweep range in MHz, e.g. 88:108
