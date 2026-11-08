@@ -4,6 +4,7 @@ Copyright (c) 2012, Jared Boone <jared@sharebrained.com>
 Copyright (c) 2014, Youssef Touil <youssef@airspy.com>
 Copyright (c) 2014, Benjamin Vernoux <bvernoux@airspy.com>
 Copyright (c) 2015, Ian Gilmour <ian@sdrsharp.com>
+Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (sweep API).
 
 All rights reserved.
 
@@ -33,6 +34,8 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #include "iqconverter_float.h"
 #include "iqconverter_int16.h"
 #include "filters.h"
+
+static void sweep_clear_stale(struct airspy_device* device);
 
 #ifndef bool
 typedef int bool;
@@ -819,6 +822,9 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number)
 	lib_device->streaming = false;
 	lib_device->stop_requested = false;
 	lib_device->sample_type = AIRSPY_SAMPLE_FLOAT32_IQ;
+
+	/* A host that died mid-sweep leaves sweep firmware sweeping, which STALLs the tuner init. */
+	sweep_clear_stale(lib_device);
 
 	result = airspy_read_samplerates_from_fw(lib_device, &lib_device->supported_samplerate_count, 0);
 	if (result == AIRSPY_SUCCESS)
@@ -1909,6 +1915,9 @@ int airspy_list_devices(uint64_t *serials, int count)
 		case AIRSPY_ERROR_STREAMING_STOPPED:
 			return "AIRSPY_ERROR_STREAMING_STOPPED";
 
+		case AIRSPY_ERROR_UNSUPPORTED:
+			return "AIRSPY_ERROR_UNSUPPORTED";
+
 		case AIRSPY_ERROR_OTHER:
 			return "AIRSPY_ERROR_OTHER";
 
@@ -1930,6 +1939,183 @@ int airspy_list_devices(uint64_t *serials, int count)
 		default:
 			return "Unknown Board ID";
 		}
+	}
+
+	/* ========================================================================
+	 * Firmware sweep mode (Corvus firmware "...-sweepN")
+	 * ======================================================================== */
+
+#define AIRSPY_VENDOR_SWEEP_START (0x70)
+#define AIRSPY_VENDOR_SWEEP_STOP  (0x71)
+#define SWEEP_MAGIC_HDR (0xA55A)
+#define SWEEP_MAGIC_ID  (0x5357)
+#define SWEEP_MAGIC_TRL (0x5AA5)
+
+	static int sweep_vendor_out(airspy_device_t* device, uint8_t request, unsigned char* data, uint16_t length)
+	{
+		int result = libusb_control_transfer(
+			device->usb_device,
+			LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+			request, 0, 0, data, length, 0);
+		if (result == LIBUSB_ERROR_PIPE)
+		{
+			return AIRSPY_ERROR_UNSUPPORTED; /* STALL: firmware without sweep mode */
+		}
+		if (result < 0 || result != (int)length)
+		{
+			return AIRSPY_ERROR_LIBUSB;
+		}
+		return AIRSPY_SUCCESS;
+	}
+
+	/* On open: end a sweep left running by a previous host (a claimed interface means no other host has it).
+	 * Only sent to "-sweep" firmware, so stock firmware never sees the request. Errors are ignored. */
+	static void sweep_clear_stale(airspy_device_t* device)
+	{
+		char version[256] = "";
+
+		if (airspy_version_string_read(device, version, 255) == AIRSPY_SUCCESS && strstr(version, "-sweep") != NULL)
+		{
+			(void)sweep_vendor_out(device, AIRSPY_VENDOR_SWEEP_STOP, NULL, 0);
+		}
+	}
+
+	int ADDCALL airspy_sweep_fw_revision(airspy_device_t* device)
+	{
+		char version[256] = "";
+		const char* p;
+		int n = 0;
+		int result;
+
+		if (device == NULL)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		result = airspy_version_string_read(device, version, 255);
+		if (result != AIRSPY_SUCCESS)
+		{
+			return result;
+		}
+		p = strstr(version, "-sweep");
+		if (p == NULL)
+		{
+			return 0;
+		}
+		for (p += 6; *p >= '0' && *p <= '9' && n < 10000; p++)
+		{
+			n = n * 10 + (*p - '0');
+		}
+		return (n > 0) ? n : 1;
+	}
+
+	int ADDCALL airspy_sweep_supported(airspy_device_t* device)
+	{
+		int rev = airspy_sweep_fw_revision(device);
+		if (rev < 0)
+		{
+			return rev;
+		}
+		return (rev > 0) ? AIRSPY_TRUE : AIRSPY_SUCCESS;
+	}
+
+	int ADDCALL airspy_sweep_start(airspy_device_t* device, const airspy_sweep_params_t* params)
+	{
+		unsigned char buf[16];
+		uint64_t last_hz;
+		int result;
+
+		if (device == NULL || params == NULL || params->n_steps == 0 || params->dwell_blocks == 0)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		last_hz = (uint64_t)params->f_start_hz + (uint64_t)(params->n_steps - 1) * params->f_step_hz;
+		if (last_hz > 0xFFFFFFFFull)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		/* Tags only survive the RAW pass-through, and the firmware only sweeps unpacked 16 KB blocks. */
+		if (device->sample_type != AIRSPY_SAMPLE_RAW || device->packing_enabled)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		/* The firmware acks but ignores a start while the receiver is off. */
+		if (airspy_is_streaming(device) != AIRSPY_TRUE)
+		{
+			return AIRSPY_ERROR_STREAMING_STOPPED;
+		}
+		result = airspy_sweep_fw_revision(device);
+		if (result < 0)
+		{
+			return result;
+		}
+		/* Older sweep firmware ignores the flags byte, so refuse rather than silently sweep in plain order. */
+		if (result == 0 || (params->flags & ~AIRSPY_SWEEP_FLAG_VCO_ORDER) != 0 ||
+			((params->flags & AIRSPY_SWEEP_FLAG_VCO_ORDER) && result < 4))
+		{
+			return AIRSPY_ERROR_UNSUPPORTED;
+		}
+
+		buf[0] = (unsigned char)(params->f_start_hz);
+		buf[1] = (unsigned char)(params->f_start_hz >> 8);
+		buf[2] = (unsigned char)(params->f_start_hz >> 16);
+		buf[3] = (unsigned char)(params->f_start_hz >> 24);
+		buf[4] = (unsigned char)(params->f_step_hz);
+		buf[5] = (unsigned char)(params->f_step_hz >> 8);
+		buf[6] = (unsigned char)(params->f_step_hz >> 16);
+		buf[7] = (unsigned char)(params->f_step_hz >> 24);
+		buf[8] = (unsigned char)(params->n_steps);
+		buf[9] = (unsigned char)(params->n_steps >> 8);
+		buf[10] = params->skip_blocks;
+		buf[11] = params->dwell_blocks;
+		buf[12] = params->lock_reads;
+		buf[13] = params->flags;
+		buf[14] = (unsigned char)(params->lock_timeout);
+		buf[15] = (unsigned char)(params->lock_timeout >> 8);
+		return sweep_vendor_out(device, AIRSPY_VENDOR_SWEEP_START, buf, sizeof(buf));
+	}
+
+	int ADDCALL airspy_sweep_stop(airspy_device_t* device)
+	{
+		if (device == NULL)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		return sweep_vendor_out(device, AIRSPY_VENDOR_SWEEP_STOP, NULL, 0);
+	}
+
+	int ADDCALL airspy_sweep_parse_block(const uint16_t* block, airspy_sweep_block_info_t* info)
+	{
+		const uint16_t* h;
+		const uint16_t* t;
+
+		if (block == NULL)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		h = block;
+		t = block + AIRSPY_SWEEP_BLOCK_SAMPLES - AIRSPY_SWEEP_TAG_SAMPLES;
+		if (h[0] != SWEEP_MAGIC_HDR || h[1] != SWEEP_MAGIC_ID)
+		{
+			return AIRSPY_SWEEP_BLOCK_UNTAGGED;
+		}
+		/* Header and trailer are written together before the block is queued; a mismatch
+		 * means the ADC DMA overwrote part of the block while USB was still sending it. */
+		if (t[0] != SWEEP_MAGIC_TRL || h[2] != t[2] || h[3] != t[3] || h[6] != t[6] || h[7] != t[7])
+		{
+			return AIRSPY_SWEEP_BLOCK_TORN;
+		}
+		if (info != NULL)
+		{
+			info->step = h[2];
+			info->block = h[3];
+			info->sweep = (uint32_t)h[4] | ((uint32_t)h[5] << 16);
+			info->freq_hz = (uint32_t)h[6] | ((uint32_t)h[7] << 16);
+			info->dma_count = (uint32_t)t[4] | ((uint32_t)t[5] << 16);
+			info->lock_polls = (uint16_t)(t[1] & 0x7FFF);
+			info->lock_timed_out = (uint8_t)((t[1] >> 15) & 1);
+			info->reserved = 0;
+		}
+		return AIRSPY_SWEEP_BLOCK_VALID;
 	}
 
 #ifdef __cplusplus

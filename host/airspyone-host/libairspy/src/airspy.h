@@ -3,6 +3,7 @@ Copyright (c) 2012, Jared Boone <jared@sharebrained.com>
 Copyright (c) 2013, Michael Ossmann <mike@ossmann.com>
 Copyright (c) 2013-2016, Benjamin Vernoux <bvernoux@airspy.com>
 Copyright (C) 2013-2016, Youssef Touil <youssef@airspy.com>
+Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (sweep API).
 
 All rights reserved.
 
@@ -71,6 +72,7 @@ enum airspy_error
 	AIRSPY_ERROR_THREAD = -1001,
 	AIRSPY_ERROR_STREAMING_THREAD_ERR = -1002,
 	AIRSPY_ERROR_STREAMING_STOPPED = -1003,
+	AIRSPY_ERROR_UNSUPPORTED = -12, /* Corvus: firmware lacks the requested feature (sweep mode) */
 	AIRSPY_ERROR_OTHER = -9999,
 };
 
@@ -214,6 +216,78 @@ extern ADDAPI const char* ADDCALL airspy_board_id_name(enum airspy_board_id boar
 
 /* Parameter sector_num shall be between 2 & 13 (sector 0 & 1 are reserved) */
 extern ADDAPI int ADDCALL airspy_spiflash_erase_sector(struct airspy_device* device, const uint16_t sector_num);
+
+/**
+ * Firmware sweep mode (Corvus firmware "...-sweepN" for the Airspy R2/Mini)
+ *
+ * The firmware retunes the R820T itself, waits for PLL lock and sends only
+ * tagged 16 KB blocks (8192 RAW samples) captured after lock. Each block's
+ * first and last 8 samples are replaced by a header/trailer, so the usable
+ * samples are [AIRSPY_SWEEP_TAG_SAMPLES, AIRSPY_SWEEP_BLOCK_SAMPLES -
+ * AIRSPY_SWEEP_TAG_SAMPLES).
+ *
+ * Usage: sample type AIRSPY_SAMPLE_RAW, then the sample rate (the R2's 10 MSPS
+ * setting: airspy_set_samplerate(0) or 10000000; ADC 20 MHz real, IF 5 MHz),
+ * packing off, gains as wanted, airspy_start_rx(), then airspy_sweep_start().
+ * Parse every AIRSPY_SWEEP_BLOCK_SAMPLES-sample block in the callback with
+ * airspy_sweep_parse_block() and drop anything not AIRSPY_SWEEP_BLOCK_VALID.
+ * While sweeping the firmware STALLs tuner, gain and sample-rate requests;
+ * airspy_sweep_stop() (or airspy_stop_rx()) ends the sweep.
+ *
+ * The RAW spectrum is real-valued with the IF at a quarter of the ADC rate
+ * and inverted: RF = freq_hz - (f - IF).
+ *
+ * Detect at runtime with airspy_sweep_supported(), and at load time by the
+ * presence of the airspy_sweep_* symbols. Same protocol and tags as the
+ * Corvus RFOne firmware.
+ */
+#define AIRSPY_FEATURE_SWEEP 1
+#define AIRSPY_SWEEP_BLOCK_SAMPLES (8192)       /* RAW samples per sweep block (16 KB) */
+#define AIRSPY_SWEEP_TAG_SAMPLES   (8)          /* header/trailer size at each end of a block */
+#define AIRSPY_SWEEP_FLAG_VCO_ORDER (0x01)      /* VCO-continuous visiting order (sweep4+) */
+
+/* Sweep plan (sent to the firmware as 16 bytes, little-endian). */
+typedef struct {
+	uint32_t f_start_hz;   /* centre frequency of step 0 */
+	uint32_t f_step_hz;    /* centre spacing; 8 MHz recommended at 10 MSPS */
+	uint16_t n_steps;      /* steps per sweep (>= 1) */
+	uint8_t  skip_blocks;  /* extra blocks discarded after lock (0) */
+	uint8_t  dwell_blocks; /* blocks sent per step (>= 1) */
+	uint8_t  lock_reads;   /* consecutive PLL-locked reads required (2; 0 = no lock check) */
+	uint8_t  flags;        /* AIRSPY_SWEEP_FLAG_* (0 = plain ascending order) */
+	uint16_t lock_timeout; /* maximum lock polls, ~0.1 ms each (200) */
+} airspy_sweep_params_t;
+
+enum airspy_sweep_block_status {
+	AIRSPY_SWEEP_BLOCK_VALID = 0,    /* tagged, header and trailer agree */
+	AIRSPY_SWEEP_BLOCK_UNTAGGED = 1, /* normal-mode data (before start / after stop) */
+	AIRSPY_SWEEP_BLOCK_TORN = 2,     /* header/trailer mismatch: overwritten during transfer */
+};
+
+/* Tag contents of a sweep block. */
+typedef struct {
+	uint32_t freq_hz;        /* centre frequency of this step */
+	uint32_t sweep;          /* pass counter; keeps increasing across restarts */
+	uint32_t dma_count;      /* device block counter (409.6 us per count at 10 MSPS) */
+	uint16_t step;           /* step index within the sweep */
+	uint16_t block;          /* block index within the step's dwell */
+	uint16_t lock_polls;     /* PLL lock polls the retune took */
+	uint8_t  lock_timed_out; /* 1 if lock was not confirmed within lock_timeout */
+	uint8_t  reserved;
+} airspy_sweep_block_info_t;
+
+/* AIRSPY_TRUE if the firmware has sweep mode, AIRSPY_SUCCESS (0) if not, or an error code */
+extern ADDAPI int ADDCALL airspy_sweep_supported(struct airspy_device* device);
+/* N from a "...-sweepN" version string, 0 without sweep mode, or an error code (< 0) */
+extern ADDAPI int ADDCALL airspy_sweep_fw_revision(struct airspy_device* device);
+/* Start (or restart with a new plan). AIRSPY_ERROR_INVALID_PARAM for a bad plan or a stream that is not
+ * RAW/unpacked, AIRSPY_ERROR_STREAMING_STOPPED when not streaming, AIRSPY_ERROR_UNSUPPORTED without sweep
+ * firmware or when flags need a newer one */
+extern ADDAPI int ADDCALL airspy_sweep_start(struct airspy_device* device, const airspy_sweep_params_t* params);
+/* Stop the sweep; streaming continues in normal mode */
+extern ADDAPI int ADDCALL airspy_sweep_stop(struct airspy_device* device);
+/* Validate an AIRSPY_SWEEP_BLOCK_SAMPLES-sample RAW block and read its tags (info may be NULL) */
+extern ADDAPI int ADDCALL airspy_sweep_parse_block(const uint16_t* block, airspy_sweep_block_info_t* info);
 
 #ifdef __cplusplus
 } // __cplusplus defined.
