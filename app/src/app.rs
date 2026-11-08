@@ -108,10 +108,10 @@ impl Config {
         }
     }
 
-    /// Fit saved or profile settings to the board: the R2 has no 12 MSPS setting and one antenna input.
+    /// Fit saved or profile settings to the board: its rates (the Airspys have one each) and ports.
     pub fn fit_board(&mut self) {
         if self.rate != board_rate(self.rate) {
-            self.set_rate(Rate::M10);
+            self.set_rate(board_rate(self.rate));
         }
         if !crate::hydra::board().has_ports() {
             self.port = 0;
@@ -224,9 +224,9 @@ impl Profile {
     }
 
     /// The profile's rate and step on this board: on the R2 (10 MSPS only) a 10 MHz step becomes 8 MHz,
-    /// the widest step that stays flat at 10 MSPS.
+    /// the widest step that stays flat at 10 MSPS; on the Mini (6 MSPS) steps become its widest.
     fn target(&self) -> (Rate, f64) {
-        fit_rate_step(self.rate, self.step_mhz, crate::hydra::board().has_12msps())
+        fit_rate_step(self.rate, self.step_mhz, crate::hydra::board().rates())
     }
 
     pub fn apply(&self, c: &mut Config) {
@@ -921,13 +921,20 @@ impl App {
                 theme::more(ui, "engine-more", "Rate, order, dwell and lock check", |ui| {
                     let mut rate = self.cfg.rate;
                     let rate_hint = "10 MSPS: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.\n12 MSPS: 24 MSPS real, tuner filter wide open, steps up to 10 MHz, about a third more GHz/s.";
-                    if crate::hydra::board().has_12msps() {
+                    if crate::hydra::board().rates().len() > 1 {
                         if theme::row_hint(ui, "Rate", rate_hint, |ui| theme::segmented(ui, &mut rate, &[(Rate::M10, "10 MSPS"), (Rate::M12, "12 MSPS")])) {
                             self.cfg.set_rate(rate);
                         }
                     } else {
-                        theme::row_hint(ui, "Rate", "The Airspy R2's fastest setting: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.", |ui| {
-                            ui.label(RichText::new("10 MSPS").size(theme::SM).color(INK));
+                        let only = format!(
+                            "The {}'s fastest setting: {:.0} MSPS real, IF {:.0} MHz, steps up to {} MHz.",
+                            crate::hydra::board().name(),
+                            self.cfg.rate.adc_hz() / 1e6,
+                            self.cfg.rate.if_hz() / 1e6,
+                            fmt_trim(self.cfg.rate.max_window_hz() / 1e6, 1)
+                        );
+                        theme::row_hint(ui, "Rate", &only, |ui| {
+                            ui.label(RichText::new(format!("{} MSPS", self.cfg.rate.msps())).size(theme::SM).color(INK));
                             false
                         });
                     }
@@ -1710,7 +1717,7 @@ impl App {
                     self.cfg.bump_step(if key == Key::OpenBracket { -1 } else { 1 });
                     self.toast(format!("Step {} MHz", fmt_trim(self.cfg.step_mhz, 1)), false);
                 }
-                Key::M if crate::hydra::board().has_12msps() => {
+                Key::M if crate::hydra::board().rates().len() > 1 => {
                     self.cfg.set_rate(if self.cfg.rate == Rate::M10 { Rate::M12 } else { Rate::M10 });
                     self.toast(format!("{} MSPS, {} MHz steps", self.cfg.rate.msps(), fmt_trim(self.cfg.step_mhz, 1)), false);
                 }
@@ -2245,10 +2252,10 @@ fn fmt_trim(v: f64, dec: usize) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
 }
 
-/// A rate and step for a board with or without the 12 MSPS setting: without it, 10 MSPS, keeping the step
-/// if 10 MSPS offers it and otherwise using 10 MSPS's default (8 MHz).
-fn fit_rate_step(rate: Rate, step_mhz: f64, has_12msps: bool) -> (Rate, f64) {
-    let fitted = if has_12msps { rate } else { Rate::M10 };
+/// A rate and step for a board's rates: the rate if the board has it, else the board's default rate,
+/// keeping the step if that rate offers it and otherwise using that rate's default step.
+fn fit_rate_step(rate: Rate, step_mhz: f64, rates: &[Rate]) -> (Rate, f64) {
+    let fitted = if rates.contains(&rate) { rate } else { rates[0] };
     if fitted == rate || fitted.steps().iter().any(|&(v, _)| (v - step_mhz).abs() < 1e-9) {
         (fitted, step_mhz)
     } else {
@@ -2258,7 +2265,8 @@ fn fit_rate_step(rate: Rate, step_mhz: f64, has_12msps: bool) -> (Rate, f64) {
 
 /// The board's rate for a requested one: the R2 runs 10 MSPS only.
 fn board_rate(rate: Rate) -> Rate {
-    if crate::hydra::board().has_12msps() { rate } else { Rate::M10 }
+    let rates = crate::hydra::board().rates();
+    if rates.contains(&rate) { rate } else { rates[0] }
 }
 
 /// "Connect the RFOne" / "Connect the Airspy R2" (a static string for the condition's button).
@@ -2266,6 +2274,7 @@ fn connect_label() -> &'static str {
     match crate::hydra::board() {
         crate::hydra::Board::RFOne => "Connect the RFOne",
         crate::hydra::Board::Airspy => "Connect the Airspy R2",
+        crate::hydra::Board::Mini => "Connect the Airspy Mini",
     }
 }
 
@@ -2359,10 +2368,12 @@ mod tests {
     fn profiles_fit_a_board_without_12msps() {
         // Fastest and Bursts use 10 MHz steps at 12 MSPS: on the R2 they become 8 MHz at 10 MSPS;
         // Quality and Weak keep their 8 MHz steps.
-        let fitted: Vec<(Rate, f64)> = PROFILES.iter().map(|p| fit_rate_step(p.rate, p.step_mhz, false)).collect();
+        let fitted: Vec<(Rate, f64)> = PROFILES.iter().map(|p| fit_rate_step(p.rate, p.step_mhz, &[Rate::M10])).collect();
         assert_eq!(fitted, vec![(Rate::M10, 8.0), (Rate::M10, 8.0), (Rate::M10, 8.0), (Rate::M10, 8.0)]);
+        let mini: Vec<(Rate, f64)> = PROFILES.iter().map(|p| fit_rate_step(p.rate, p.step_mhz, &[Rate::M6])).collect();
+        assert_eq!(mini, vec![(Rate::M6, 4.0); 4]);
         for p in PROFILES {
-            assert_eq!(fit_rate_step(p.rate, p.step_mhz, true), (p.rate, p.step_mhz));
+            assert_eq!(fit_rate_step(p.rate, p.step_mhz, &[Rate::M12, Rate::M10]), (p.rate, p.step_mhz));
         }
     }
 

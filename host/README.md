@@ -105,5 +105,6 @@ else is unchanged and the version still reports 1.0.10.
 - `git log -- host/airspyone-host` shows the unmodified import first, then the change.
 - Test: `uv run --no-project --with numpy python host/tests/test_airspy_sweep_api.py --serial <hex>` (error
   paths, tuner requests refused mid-sweep, stop and restart, 40 rapid plan switches with every block on its
-  plan's grid). Passes on an R2 with the Corvus firmware.
+  plan's grid). Passes on an R2 and (with `--msps 6`) a Mini with the Corvus firmware.
+- Rate on the Mini: `airspy_set_samplerate(6000000)` (or index 0) under RAW: ADC 12 MHz real, IF 3 MHz.
 

@@ -53,8 +53,8 @@ fn install_signal_handlers() {
 const USAGE: &str = "\
 corvus-sweep [options]
 
-  --board rfone|airspy  which board (default: env CORVUS_BOARD, else rfone); airspy is
-                        the Airspy R2: 10 MSPS only, one antenna input
+  --board rfone|airspy|mini  which board (default: env CORVUS_BOARD, else rfone): airspy
+                        is the Airspy R2 (10 MSPS), mini the Airspy Mini (6 MSPS)
   --sim                 run the built-in simulator instead of the board
   --lib PATH            the board's library with the sweep API (default: env CORVUS_LIB,
                         then the repo's host/build/out build, then the system loader)
@@ -91,7 +91,7 @@ fn main() -> eframe::Result {
         match a.as_str() {
             "--sim" => opts.sim = true,
             "--lib" => lib = Some(PathBuf::from(val("--lib"))),
-            "--board" => board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy")),
+            "--board" => board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini")),
             "--serial" => {
                 let v = val("--serial");
                 opts.serial = u64::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or_else(|_| die("bad --serial"));
@@ -127,7 +127,8 @@ fn main() -> eframe::Result {
                 let r = match val("--msps").as_str() {
                     "10" => plan::Rate::M10,
                     "12" => plan::Rate::M12,
-                    _ => die("--msps 10|12"),
+                    "6" => plan::Rate::M6,
+                    _ => die("--msps 10|12|6"),
                 };
                 opts.overrides.push(Box::new(move |c| c.set_rate(r)));
             }

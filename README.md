@@ -1,6 +1,7 @@
 # Corvus
 
-Firmware sweep mode and a live wideband spectrum analyser for the HydraSDR RFOne and the Airspy R2.
+Firmware sweep mode and a live wideband spectrum analyser for the HydraSDR RFOne, the Airspy R2 and
+the Airspy Mini.
 
 The board retunes itself and streams only blocks captured after the tuner's PLL has locked, each
 tagged with the step it belongs to. On the host, Corvus Sweep stitches those steps into one seamless
@@ -47,7 +48,9 @@ With an RFOne:
   Windows.
 - Airspy R2: the firmware, libairspy and Corvus Sweep (`--board airspy`) work on one R2: 6.5 GHz/s,
   about 3.65 full passes a second over 24–1800 MHz at 10 MSPS (the R2 has no 12 MSPS setting), with
-  clean integrity. The same image should run on the Airspy Mini, untested.
+  clean integrity.
+- Airspy Mini: the same firmware image, `--board mini`: 2.9 GHz/s, about 1.6 full passes a second at
+  6 MSPS with 4 MHz steps, on one Mini. Its stock firmware managed 0.2–0.4 GHz/s driven from the PC.
 
 ## Licensing
 

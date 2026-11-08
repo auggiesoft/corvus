@@ -8,8 +8,9 @@ pub const F_MAX_HZ: f64 = 1800e6;
 /// Samples per DMA block, the unit of the firmware's block counter.
 pub const BLOCK_WORDS: usize = 8192;
 
-/// The RFOne sample-rate setting the sweep runs at. The ADC samples the tuner's IF (a quarter of the
-/// ADC rate) as real samples; the tuner IF filter is set with it. See docs/measurements.md, "12 MSPS".
+/// The sample-rate setting the sweep runs at (RFOne: 10 or 12, Airspy R2: 10, Airspy Mini: 6). The ADC
+/// samples the tuner's IF (a quarter of the ADC rate) as real samples; the tuner IF filter is set with it.
+/// See docs/measurements.md, "12 MSPS".
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub enum Rate {
     /// 20 MSPS real, IF 5 MHz, tuner filter 59. Flat ±1 dB over −4.70…+4.20 MHz.
@@ -18,6 +19,9 @@ pub enum Rate {
     /// each block takes 341 µs instead of 410 µs: +33 % GHz/s at 10 MHz steps.
     #[default]
     M12,
+    /// Airspy Mini: 12 MSPS real, IF 3 MHz, 683 µs blocks. Flat ±2 dB over −2.7…+2.2 MHz (measured on one
+    /// Mini with a carrier); a carrier 3.25–4 MHz out folds back at about −20 dB.
+    M6,
 }
 
 impl Rate {
@@ -26,6 +30,7 @@ impl Rate {
         match self {
             Rate::M10 => 10,
             Rate::M12 => 12,
+            Rate::M6 => 6,
         }
     }
 
@@ -48,6 +53,7 @@ impl Rate {
         match self {
             Rate::M10 => 9.3e6,
             Rate::M12 => 10.0e6,
+            Rate::M6 => 4.4e6,
         }
     }
 
@@ -56,6 +62,7 @@ impl Rate {
         match self {
             Rate::M10 => &[(4.0, "4"), (6.0, "6"), (8.0, "8"), (9.0, "9 MHz")],
             Rate::M12 => &[(4.0, "4"), (6.0, "6"), (8.0, "8"), (10.0, "10 MHz")],
+            Rate::M6 => &[(2.0, "2"), (3.0, "3"), (4.0, "4 MHz")],
         }
     }
 
@@ -63,6 +70,7 @@ impl Rate {
         match self {
             Rate::M10 => 8.0,
             Rate::M12 => 10.0,
+            Rate::M6 => 4.0,
         }
     }
 }

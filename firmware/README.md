@@ -7,7 +7,7 @@ to. That's what lets Corvus Sweep stitch a 24–1800 MHz spectrum about five tim
 | Board | Source | Status |
 |---|---|---|
 | HydraSDR RFOne | `rfone/`: the RFOne firmware v1.0.2, plus sweep mode | `v1.0.2-sweep5`, in daily use on one board |
-| Airspy R2 (and Mini) | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode | `v1.0.0-rc10-6-8-gcf1a374-sweep5`, tested on one R2 (below); Mini untested |
+| Airspy R2 and Airspy Mini | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode. One image for both: it detects the board at boot | `v1.0.0-rc10-6-8-gcf1a374-sweep5`, tested on one R2 and one Mini (below) |
 
 `rfone/` is an import of the upstream RFOne firmware (GPL-2.0-or-later, see `rfone/LICENSE`) with
 the sweep mode on top. The new sweep files (`rfone/m0/sweep.c`, `rfone/m0/sweep.h`) are MIT; the
@@ -134,3 +134,11 @@ Sweeping 24–1800 MHz in 8 MHz steps at 10 MSPS: 808–832 steps/s, 6.5 GHz/s, 
 VCO-continuous order (692 steps/s ascending), with no torn blocks, gaps, misfiled blocks or lock
 timeouts. A host SIGKILLed mid-sweep doesn't lock out the next open, even with the stock libairspy.
 FM stations land on their channel centres. `../host/tests/test_airspy_sweep_api.py` passes.
+
+**First Mini flash (2026-11-08, from rc10, the same image):** boots as "AirSpy MINI …-sweep5"; its
+calibration (−547 ppb) survives; normal streaming holds 12 MSPS real (the 6 MSPS setting), unpacked
+and packed. Sweeping 24–1800 MHz at 6 MSPS in 4 MHz steps: 726 steps/s, 2.9 GHz/s, 1.64 passes/s in
+VCO order (573 steps/s ascending), integrity clean. The Mini's 683 µs blocks usually fit the retune
+and lock inside the block in flight, so a step takes about 2.2 blocks instead of 3. Before, with the
+stock firmware, the best host-driven sweep (retune, wait out whole 11 ms USB transfers) made 44–85
+steps/s. The API test and the stale-host check pass. Passband: `../docs/measurements.md`, "Airspy Mini".

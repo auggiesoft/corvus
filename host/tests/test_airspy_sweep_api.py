@@ -3,7 +3,8 @@
 Error paths (not streaming, non-RAW, packing on, bad plan), tuner requests refused mid-sweep and accepted
 after stop, stop -> normal stream -> restart with a new plan, and every valid block's frequency on its
 plan's grid across restarts.
-Usage: uv run --no-project --with numpy python host/tests/test_airspy_sweep_api.py [--serial HEX] [--lib PATH]
+Usage: uv run --no-project --with numpy python host/tests/test_airspy_sweep_api.py [--serial HEX] [--lib PATH] [--msps 10|6]
+--msps: the board's rate setting (R2 10, Mini 6; default 10).
 --serial defaults to env CORVUS_SERIAL, else the first Airspy found.
 """
 import ctypes as C
@@ -15,6 +16,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = sys.argv[sys.argv.index("--lib") + 1] if "--lib" in sys.argv else os.path.join(HERE, "../build/out/airspy-linux/libairspy.so.1.0.10")
+MSPS = int(sys.argv[sys.argv.index("--msps") + 1]) if "--msps" in sys.argv else 10
 SERIAL = int(sys.argv[sys.argv.index("--serial") + 1] if "--serial" in sys.argv else os.environ.get("CORVUS_SERIAL", "0"), 16)
 BLOCK = 8192
 RAW, INT16_IQ = 5, 2
@@ -90,7 +92,7 @@ try:
     full = Params(28_000_000, 8_000_000, 222, 0, 1, 2, 1, 200)
     narrow = Params(400_000_000, 8_000_000, 10, 0, 2, 2, 0, 200)
     lib.airspy_set_sample_type(dev, RAW)
-    lib.airspy_set_samplerate(dev, 10_000_000)
+    lib.airspy_set_samplerate(dev, MSPS * 1_000_000)
     lib.airspy_set_packing(dev, 0)
     lib.airspy_set_linearity_gain(dev, 10)
     check("start while not streaming", lib.airspy_sweep_start(dev, C.byref(full)), STOPPED)

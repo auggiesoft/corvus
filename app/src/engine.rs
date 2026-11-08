@@ -907,6 +907,7 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
     let name = match rate {
         Rate::M10 => format!("passband-eq-{nfft}.f32"),
         Rate::M12 => format!("passband-eq-12msps-{nfft}.f32"),
+        Rate::M6 => format!("passband-eq-6msps-{nfft}.f32"),
     };
     base.join("corvus-sweep").join(format!("{}{name}", crate::hydra::board().cache_prefix()))
 }
@@ -914,7 +915,7 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
 /// Every learned passband in the cache, counted as 10 passes so new data can still move it.
 fn load_eq_store() -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
     let mut store = HashMap::new();
-    for rate in [Rate::M10, Rate::M12] {
+    for rate in [Rate::M10, Rate::M12, Rate::M6] {
         for nfft in dsp::NFFTS {
             if let Some(v) = load_eq(rate, nfft) {
                 store.insert((rate, nfft), (v, 10));

@@ -20,8 +20,10 @@ const SAMPLE_RAW: c_int = 5;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Board {
     RFOne,
-    /// Airspy R2 (the same firmware image also runs on the Mini, untested).
+    /// Airspy R2.
     Airspy,
+    /// Airspy Mini: the same firmware image as the R2, which picks the Mini's settings at boot.
+    Mini,
 }
 
 impl Board {
@@ -29,6 +31,7 @@ impl Board {
         match s.to_ascii_lowercase().as_str() {
             "rfone" => Some(Board::RFOne),
             "airspy" | "r2" => Some(Board::Airspy),
+            "mini" | "airspy-mini" => Some(Board::Mini),
             _ => None,
         }
     }
@@ -38,13 +41,14 @@ impl Board {
         match self {
             Board::RFOne => "RFOne",
             Board::Airspy => "Airspy R2",
+            Board::Mini => "Airspy Mini",
         }
     }
 
     fn prefix(self) -> &'static str {
         match self {
             Board::RFOne => "hydrasdr_",
-            Board::Airspy => "airspy_",
+            Board::Airspy | Board::Mini => "airspy_",
         }
     }
 
@@ -53,23 +57,27 @@ impl Board {
         self == Board::RFOne
     }
 
-    /// The R2's fastest setting is 10 MSPS.
-    pub fn has_12msps(self) -> bool {
-        self == Board::RFOne
+    /// The sample-rate settings the sweep can use on this board, default first.
+    pub fn rates(self) -> &'static [Rate] {
+        match self {
+            Board::RFOne => &[Rate::M12, Rate::M10],
+            Board::Airspy => &[Rate::M10],
+            Board::Mini => &[Rate::M6],
+        }
     }
 
     /// The library this repo builds for the board (host/build/build.sh).
     fn repo_lib(self) -> &'static str {
         match self {
             Board::RFOne => "../host/build/out/linux/libhydrasdr.so.1.1.4",
-            Board::Airspy => "../host/build/out/airspy-linux/libairspy.so.1.0.10",
+            Board::Airspy | Board::Mini => "../host/build/out/airspy-linux/libairspy.so.1.0.10",
         }
     }
 
     fn system_lib(self) -> &'static str {
         match self {
             Board::RFOne => "libhydrasdr.so.1",
-            Board::Airspy => "libairspy.so.0",
+            Board::Airspy | Board::Mini => "libairspy.so.0",
         }
     }
 
@@ -78,6 +86,7 @@ impl Board {
         match self {
             Board::RFOne => "",
             Board::Airspy => "airspy-",
+            Board::Mini => "airspy-mini-",
         }
     }
 }
@@ -412,11 +421,12 @@ impl Device {
     /// Asking for "12000000" under RAW selects the firmware's 6 MSPS IQ setting (12 MSPS real); only
     /// 10000000 happens to work either way, because it matches an IQ rate-table index.
     ///
-    /// libairspy's table holds the R2's 10 MSPS setting as 10000000, which selects it under RAW too.
+    /// libairspy's table holds its settings by IQ rate (R2 10000000, Mini 6000000), which selects them
+    /// under RAW too.
     fn apply_rate(&self) -> Result<(), String> {
         let hz = match self.board {
             Board::RFOne => self.rate.adc_hz() as u32,
-            Board::Airspy => 10_000_000,
+            Board::Airspy | Board::Mini => self.rate.msps() * 1_000_000,
         };
         let m = self.rate.msps();
         unsafe { self.check(&format!("set_samplerate {m} MSPS ({hz} real)"), (self.api.set_samplerate)(self.dev, hz)) }

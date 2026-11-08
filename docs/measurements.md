@@ -136,6 +136,31 @@ is `hydrasdr_set_samplerate(24000000)` and the 10 MSPS one `20000000`. `12000000
 selects the 6 MSPS IQ setting. Normal unpacked streaming at 12 MSPS (48 MB/s) exceeds the ~45 MB/s
 USB ceiling, but a sweep sends only the measured blocks and isn't affected.
 
+## Airspy Mini
+
+One Mini on the Corvus firmware, 6 MSPS setting (12 MHz ADC, 3 MHz IF), linearity gain 10, measured with
+the steady 855.787 MHz carrier stepped past in 25 kHz steps over ±4 MHz:
+
+| | |
+|---|---|
+| flat ±2 dB | −2.73 … +2.23 MHz |
+| flat ±3 dB | −2.75 … +2.45 MHz |
+| above +2.25 MHz | falls steeply toward the DC edge (−5 dB at +2.5, −22 dB at +2.75) |
+| mirror leakage | a carrier 3.25–4 MHz outside the centre folds back at −20 to −24 dB |
+
+So the Mini's steps are centred slices up to 4.4 MHz wide (2, 3 or 4 MHz in Corvus Sweep). The flatness
+correction takes the per-step ripple from 1.6 to 0.23 dB p-p. The mirror is the Mini's main weakness at
+this rate: a strong signal just outside a step shows inside it about 20 dB down, where the RFOne at
+12 MSPS shows −32 dB.
+
+Speed over 24–1800 MHz, 4 MHz steps, dwell 1, lock reads 2: 726 steps/s, 2.9 GHz/s, 1.64 passes/s in
+VCO-continuous order, 573 steps/s ascending. Each block is 683 µs, long enough that retune and lock
+usually finish inside the block in flight, so a step averages about 2.2 blocks rather than the 3 the
+faster boards need.
+
+For comparison, the stock firmware driven from the PC (retune, then wait out the 11 ms USB transfer in
+flight and, for clean data, one more) made 44–85 steps/s: 0.2–0.4 GHz/s, one pass every 4–8 s.
+
 ## Restarts
 
 Changing gain or port mid-sweep means SWEEP_STOP, the setting, then SWEEP_START, because the firmware
