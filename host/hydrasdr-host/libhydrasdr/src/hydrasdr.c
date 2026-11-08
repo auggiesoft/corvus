@@ -4,6 +4,7 @@ Copyright (c) 2012, Jared Boone <jared@sharebrained.com>
 Copyright (c) 2014, Youssef Touil <youssef@airspy.com>
 Copyright (c) 2015, Ian Gilmour <ian@sdrsharp.com>
 Copyright (c) 2014-2026, Benjamin Vernoux <bvernoux@hydrasdr.com>
+Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (sweep API).
 
 All rights reserved.
 
@@ -29,6 +30,8 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #include <libusb.h>
 #include "hydrasdr_internal.h"
 #include "hydrasdr_shared.h"
+
+static void sweep_clear_stale(struct hydrasdr_device* dev);
 
 /*
  * ============================================================================
@@ -415,6 +418,9 @@ static int hydrasdr_open_init(struct hydrasdr_device** device, uint64_t serial_n
 		free(lib_device);
 		return result;
 	}
+
+	/* A host that died mid-sweep leaves sweep firmware sweeping, which STALLs the init requests below. */
+	sweep_clear_stale(lib_device);
 
 	// The HAL is now attached, call its init function
 	if (lib_device->hal && lib_device->hal->init) {
@@ -866,6 +872,166 @@ ADDAPI int ADDCALL hydrasdr_get_temperature(struct hydrasdr_device* device, hydr
 ADDAPI int ADDCALL hydrasdr_get_device_info(struct hydrasdr_device* device, hydrasdr_device_info_t* info)
 {
 	return HAL_DISPATCH(device, get_device_info, info);
+}
+
+/* ========================================================================
+ * Firmware sweep mode (custom RFOne firmware "...-sweepN")
+ * ======================================================================== */
+
+#define HYDRASDR_VENDOR_SWEEP_START (0x70)
+#define HYDRASDR_VENDOR_SWEEP_STOP  (0x71)
+#define SWEEP_MAGIC_HDR (0xA55A)
+#define SWEEP_MAGIC_ID  (0x5357)
+#define SWEEP_MAGIC_TRL (0x5AA5)
+
+static int sweep_vendor_out(struct hydrasdr_device* device, uint8_t request, unsigned char* data, uint16_t length)
+{
+	int result = libusb_control_transfer(
+		device->usb_handle,
+		((uint8_t)LIBUSB_ENDPOINT_OUT | (uint8_t)LIBUSB_REQUEST_TYPE_VENDOR | (uint8_t)LIBUSB_RECIPIENT_DEVICE),
+		request, 0, 0, data, length, LIBUSB_CTRL_TIMEOUT_MS);
+	if (result == LIBUSB_ERROR_PIPE) {
+		return HYDRASDR_ERROR_UNSUPPORTED; /* STALL: firmware without sweep mode */
+	}
+	if (result < 0 || result != (int)length) {
+		return HYDRASDR_ERROR_LIBUSB;
+	}
+	return HYDRASDR_SUCCESS;
+}
+
+/* On open: end a sweep left running by a previous host (a claimed interface means no other host has it).
+ * Only sent to "-sweep" firmware, so stock firmware never sees the request. Errors are ignored. */
+static void sweep_clear_stale(struct hydrasdr_device* dev)
+{
+	char version[256] = "";
+
+	if (HAL_DISPATCH(dev, version_string_read, version, 255) == HYDRASDR_SUCCESS && strstr(version, "-sweep") != NULL) {
+		(void)sweep_vendor_out(dev, HYDRASDR_VENDOR_SWEEP_STOP, NULL, 0);
+	}
+}
+
+ADDAPI int ADDCALL hydrasdr_sweep_fw_revision(struct hydrasdr_device* device)
+{
+	char version[256] = "";
+	const char* p;
+	int n = 0;
+	int result;
+
+	if (device == NULL) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	result = HAL_DISPATCH(device, version_string_read, version, 255);
+	if (result != HYDRASDR_SUCCESS) {
+		return result;
+	}
+	p = strstr(version, "-sweep");
+	if (p == NULL) {
+		return 0;
+	}
+	for (p += 6; *p >= '0' && *p <= '9' && n < 10000; p++) {
+		n = n * 10 + (*p - '0');
+	}
+	return (n > 0) ? n : 1;
+}
+
+ADDAPI int ADDCALL hydrasdr_sweep_supported(struct hydrasdr_device* device)
+{
+	int rev = hydrasdr_sweep_fw_revision(device);
+	if (rev < 0) {
+		return rev;
+	}
+	return (rev > 0) ? HYDRASDR_TRUE : HYDRASDR_SUCCESS;
+}
+
+ADDAPI int ADDCALL hydrasdr_sweep_start(struct hydrasdr_device* device, const hydrasdr_sweep_params_t* params)
+{
+	hydrasdr_streaming_t* stream;
+	unsigned char buf[16];
+	uint64_t last_hz;
+	int result;
+
+	if (device == NULL || params == NULL || params->n_steps == 0 || params->dwell_blocks == 0) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	last_hz = (uint64_t)params->f_start_hz + (uint64_t)(params->n_steps - 1) * params->f_step_hz;
+	if (last_hz > 0xFFFFFFFFull) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	/* Tags only survive the RAW pass-through, and the firmware only sweeps unpacked 16 KB blocks. */
+	stream = (hydrasdr_streaming_t*)device->private_data;
+	if (device->sample_type != HYDRASDR_SAMPLE_RAW || (stream != NULL && stream->packing_enabled)) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	/* The firmware acks but ignores a start while the receiver is off. */
+	if (!hydrasdr_generic_is_streaming(device)) {
+		return HYDRASDR_ERROR_STREAMING_STOPPED;
+	}
+	result = hydrasdr_sweep_fw_revision(device);
+	if (result < 0) {
+		return result;
+	}
+	/* Older sweep firmware ignores the flags byte, so refuse rather than silently sweep in plain order. */
+	if (result == 0 || (params->flags & ~HYDRASDR_SWEEP_FLAG_VCO_ORDER) != 0 ||
+	    ((params->flags & HYDRASDR_SWEEP_FLAG_VCO_ORDER) && result < 4)) {
+		return HYDRASDR_ERROR_UNSUPPORTED;
+	}
+
+	buf[0] = (unsigned char)(params->f_start_hz);
+	buf[1] = (unsigned char)(params->f_start_hz >> 8);
+	buf[2] = (unsigned char)(params->f_start_hz >> 16);
+	buf[3] = (unsigned char)(params->f_start_hz >> 24);
+	buf[4] = (unsigned char)(params->f_step_hz);
+	buf[5] = (unsigned char)(params->f_step_hz >> 8);
+	buf[6] = (unsigned char)(params->f_step_hz >> 16);
+	buf[7] = (unsigned char)(params->f_step_hz >> 24);
+	buf[8] = (unsigned char)(params->n_steps);
+	buf[9] = (unsigned char)(params->n_steps >> 8);
+	buf[10] = params->skip_blocks;
+	buf[11] = params->dwell_blocks;
+	buf[12] = params->lock_reads;
+	buf[13] = params->flags;
+	buf[14] = (unsigned char)(params->lock_timeout);
+	buf[15] = (unsigned char)(params->lock_timeout >> 8);
+	return sweep_vendor_out(device, HYDRASDR_VENDOR_SWEEP_START, buf, sizeof(buf));
+}
+
+ADDAPI int ADDCALL hydrasdr_sweep_stop(struct hydrasdr_device* device)
+{
+	if (device == NULL) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	return sweep_vendor_out(device, HYDRASDR_VENDOR_SWEEP_STOP, NULL, 0);
+}
+
+ADDAPI int ADDCALL hydrasdr_sweep_parse_block(const uint16_t* block, hydrasdr_sweep_block_info_t* info)
+{
+	const uint16_t* h;
+	const uint16_t* t;
+
+	if (block == NULL) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	h = block;
+	t = block + HYDRASDR_SWEEP_BLOCK_SAMPLES - HYDRASDR_SWEEP_TAG_SAMPLES;
+	if (h[0] != SWEEP_MAGIC_HDR || h[1] != SWEEP_MAGIC_ID) {
+		return HYDRASDR_SWEEP_BLOCK_UNTAGGED;
+	}
+	/* Header and trailer are written together before the block is queued; a mismatch
+	 * means the ADC DMA overwrote part of the block while USB was still sending it. */
+	if (t[0] != SWEEP_MAGIC_TRL || h[2] != t[2] || h[3] != t[3] || h[6] != t[6] || h[7] != t[7]) {
+		return HYDRASDR_SWEEP_BLOCK_TORN;
+	}
+	if (info != NULL) {
+		info->step = h[2];
+		info->block = h[3];
+		info->sweep = (uint32_t)h[4] | ((uint32_t)h[5] << 16);
+		info->freq_hz = (uint32_t)h[6] | ((uint32_t)h[7] << 16);
+		info->dma_count = (uint32_t)t[4] | ((uint32_t)t[5] << 16);
+		info->lock_polls = (uint16_t)(t[1] & 0x7FFF);
+		info->lock_timed_out = (uint8_t)((t[1] >> 15) & 1);
+		info->reserved = 0;
+	}
+	return HYDRASDR_SWEEP_BLOCK_VALID;
 }
 
 #ifdef __cplusplus

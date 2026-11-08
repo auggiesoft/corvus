@@ -3,6 +3,7 @@ Copyright (c) 2012, Jared Boone <jared@sharebrained.com>
 Copyright (c) 2013, Michael Ossmann <mike@ossmann.com>
 Copyright (C) 2013-2016, Youssef Touil <youssef@airspy.com>
 Copyright (c) 2013-2026, Benjamin Vernoux <bvernoux@hydrasdr.com>
+Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (sweep API).
 
 All rights reserved.
 
@@ -2434,6 +2435,126 @@ const char* ADDCALL hydrasdr_board_id_name(enum hydrasdr_board_id board_id);
 extern ADDAPI int ADDCALL hydrasdr_reset(struct hydrasdr_device* device);
 
 /** @} */ // end of util_api group
+
+/**
+ * @defgroup sweep_api Firmware Sweep Mode (custom RFOne firmware)
+ * @brief On-device frequency sweep for firmware builds named "...-sweepN"
+ *
+ * The firmware retunes the R828D itself, waits for PLL lock and sends only
+ * tagged 16 KB blocks (8192 RAW samples) captured after lock. Each block's
+ * first and last 8 samples are replaced by a header/trailer, so the usable
+ * samples are [HYDRASDR_SWEEP_TAG_SAMPLES, HYDRASDR_SWEEP_BLOCK_SAMPLES -
+ * HYDRASDR_SWEEP_TAG_SAMPLES).
+ *
+ * Usage: sample type HYDRASDR_SAMPLE_RAW, then the sample rate, packing off,
+ * gain/RF port as wanted, hydrasdr_start_rx(), then hydrasdr_sweep_start().
+ * Under RAW a by-value rate is the real ADC rate, not the IQ rate:
+ *
+ *   setting   set_samplerate() under RAW   ADC (real)   IF      Nyquist band
+ *   10 MSPS   20000000 (or 10000000)       20 MHz       5 MHz   0-10 MHz
+ *   12 MSPS   24000000                     24 MHz       6 MHz   0-12 MHz
+ *
+ * set_samplerate(12000000) under RAW selects the 6 MSPS IQ setting (12 MHz
+ * ADC), not 12 MSPS; 10000000 works only because it matches the IQ rate
+ * table. The firmware tunes with the IF of the current setting, so freq_hz
+ * stays the RF centre at either rate. Parse every
+ * HYDRASDR_SWEEP_BLOCK_SAMPLES-sample block in the callback with
+ * hydrasdr_sweep_parse_block() and drop anything not
+ * HYDRASDR_SWEEP_BLOCK_VALID. While sweeping the firmware STALLs tuner,
+ * gain, sample-rate, packing and RF-port requests; hydrasdr_sweep_stop()
+ * (or hydrasdr_stop_rx()) ends the sweep.
+ *
+ * The RAW spectrum is real-valued with the IF at a quarter of the ADC rate
+ * and inverted: RF = freq_hz - (f_if - IF), where IF is HYDRASDR_SWEEP_IF_HZ
+ * at 10 MSPS and 6 MHz at 12 MSPS.
+ *
+ * Detect at runtime with hydrasdr_sweep_supported(), and at load time by
+ * the presence of the hydrasdr_sweep_* symbols.
+ * @{
+ */
+
+#define HYDRASDR_FEATURE_SWEEP 1
+#define HYDRASDR_SWEEP_BLOCK_SAMPLES (8192)       /**< RAW samples per sweep block (16 KB) */
+#define HYDRASDR_SWEEP_TAG_SAMPLES   (8)          /**< header/trailer size at each end of a block */
+#define HYDRASDR_SWEEP_ADC_RATE_HZ   (20000000u)  /**< real sample rate at the 10 MSPS setting (24 MHz at 12 MSPS) */
+#define HYDRASDR_SWEEP_IF_HZ         (5000000u)   /**< R82x IF at the 10 MSPS setting (6 MHz at 12 MSPS) */
+
+/**
+ * Visit the steps in VCO-continuous order (firmware sweep4+): steps are grouped by R82x VCO divider,
+ * alternate groups are swept downwards and every pass reverses the whole order. Divider switches
+ * then cost ~0.5 ms instead of ~10 ms and there is no wrap (~16 % faster over 24-1800 MHz).
+ * Blocks still carry the grid step index and frequency, but steps no longer arrive in ascending
+ * order; a pass is complete when the sweep counter changes. Each pass starts by re-measuring the
+ * step the previous pass ended on.
+ */
+#define HYDRASDR_SWEEP_FLAG_VCO_ORDER (0x01)
+
+/** Sweep plan (sent to the firmware as 16 bytes, little-endian). */
+typedef struct {
+	uint32_t f_start_hz;   /**< centre frequency of step 0 */
+	uint32_t f_step_hz;    /**< centre spacing; ~9.3 MHz flat span, 8 MHz recommended */
+	uint16_t n_steps;      /**< steps per sweep (>= 1); wraps to step 0 after the last */
+	uint8_t  skip_blocks;  /**< extra 409.6 us blocks discarded after lock (0) */
+	uint8_t  dwell_blocks; /**< blocks sent per step (>= 1) */
+	uint8_t  lock_reads;   /**< consecutive PLL-locked reads required (2; 0 = no lock check) */
+	uint8_t  flags;        /**< HYDRASDR_SWEEP_FLAG_* (0 = plain ascending order) */
+	uint16_t lock_timeout; /**< maximum lock polls, ~0.1 ms each (200) */
+} hydrasdr_sweep_params_t;
+
+/** Result of hydrasdr_sweep_parse_block(). */
+enum hydrasdr_sweep_block_status {
+	HYDRASDR_SWEEP_BLOCK_VALID = 0,    /**< tagged, header and trailer agree */
+	HYDRASDR_SWEEP_BLOCK_UNTAGGED = 1, /**< normal-mode data (before start / after stop) */
+	HYDRASDR_SWEEP_BLOCK_TORN = 2,     /**< header/trailer mismatch: overwritten during transfer */
+};
+
+/** Tag contents of a sweep block. */
+typedef struct {
+	uint32_t freq_hz;        /**< centre frequency of this step */
+	uint32_t sweep;          /**< pass counter; keeps increasing across restarts (sweep3+) */
+	uint32_t dma_count;      /**< device block counter (409.6 us per count) */
+	uint16_t step;           /**< step index within the sweep */
+	uint16_t block;          /**< block index within the step's dwell */
+	uint16_t lock_polls;     /**< PLL lock polls the retune took */
+	uint8_t  lock_timed_out; /**< 1 if lock was not confirmed within lock_timeout */
+	uint8_t  reserved;
+} hydrasdr_sweep_block_info_t;
+
+/**
+ * @brief Does the connected firmware support sweep mode?
+ * @return HYDRASDR_TRUE if supported, HYDRASDR_SUCCESS (0) if not, or an error code
+ */
+extern ADDAPI int ADDCALL hydrasdr_sweep_supported(struct hydrasdr_device* device);
+
+/**
+ * @brief Sweep firmware revision N from a "...-sweepN" version string
+ * @return N (>= 1), 0 if the firmware has no sweep mode, or an error code (< 0)
+ */
+extern ADDAPI int ADDCALL hydrasdr_sweep_fw_revision(struct hydrasdr_device* device);
+
+/**
+ * @brief Start (or restart with a new plan) the firmware sweep
+ * @return HYDRASDR_SUCCESS; HYDRASDR_ERROR_INVALID_PARAM for a bad plan or when the
+ *         stream is not RAW/unpacked; HYDRASDR_ERROR_STREAMING_STOPPED when not
+ *         streaming; HYDRASDR_ERROR_UNSUPPORTED on firmware without sweep mode, or
+ *         when flags need a newer sweep firmware (VCO order: sweep4)
+ */
+extern ADDAPI int ADDCALL hydrasdr_sweep_start(struct hydrasdr_device* device, const hydrasdr_sweep_params_t* params);
+
+/**
+ * @brief Stop the firmware sweep; streaming continues in normal mode
+ */
+extern ADDAPI int ADDCALL hydrasdr_sweep_stop(struct hydrasdr_device* device);
+
+/**
+ * @brief Validate a HYDRASDR_SWEEP_BLOCK_SAMPLES-sample RAW block and read its tags
+ * @param[in]  block HYDRASDR_SWEEP_BLOCK_SAMPLES RAW samples
+ * @param[out] info  filled when the result is HYDRASDR_SWEEP_BLOCK_VALID (may be NULL)
+ * @return enum hydrasdr_sweep_block_status, or HYDRASDR_ERROR_INVALID_PARAM if block is NULL
+ */
+extern ADDAPI int ADDCALL hydrasdr_sweep_parse_block(const uint16_t* block, hydrasdr_sweep_block_info_t* info);
+
+/** @} */ // end of sweep_api group
 
 #ifdef __cplusplus
 } // __cplusplus defined.
