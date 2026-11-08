@@ -21,5 +21,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 This licence covers the files in this repository that aren't under
-firmware/rfone/, host/hydrasdr-host/ or app/assets/fonts/. Those keep their
+firmware/rfone/ (apart from m0/sweep.c and m0/sweep.h, which are MIT),
+host/hydrasdr-host/ or app/assets/fonts/. Those keep their
 own licences; see README.md.

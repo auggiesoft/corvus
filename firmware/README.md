@@ -10,8 +10,9 @@ to. That's what lets Corvus Sweep stitch a 24–1800 MHz spectrum about five tim
 | Airspy R2 | — | planned |
 
 `rfone/` is an import of the upstream RFOne firmware (GPL-2.0-or-later, see `rfone/LICENSE`) with
-the sweep mode on top. `git log -- firmware/rfone` shows the unmodified import first, then every
-change. Normal (non-sweep) operation is unchanged, so the board still works with the stock host tools
+the sweep mode on top. The new sweep files (`rfone/m0/sweep.c`, `rfone/m0/sweep.h`) are MIT; the
+built firmware is GPL-2.0-or-later as a whole. `git log -- firmware/rfone` shows the unmodified
+import first, then every change. Normal (non-sweep) operation is unchanged, so the board still works with the stock host tools
 and other software.
 
 ## Versions

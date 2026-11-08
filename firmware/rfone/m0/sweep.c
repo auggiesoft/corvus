@@ -3,10 +3,9 @@
  *
  * Corvus firmware sweep mode, built on the RFOne firmware (based on the HackRF project).
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
+ * SPDX-License-Identifier: MIT
+ * This file is MIT-licensed (see LICENSE at the top of the Corvus repository). The firmware it is
+ * built into is GPL-2.0-or-later as a whole.
  */
 
 #include <stdint.h>

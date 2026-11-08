@@ -51,7 +51,7 @@ With an RFOne:
 
 | Part | Licence |
 |---|---|
-| `firmware/rfone/` | GPL-2.0-or-later (`firmware/rfone/LICENSE`); libopencm3 inside it is LGPL-3.0-or-later |
+| `firmware/rfone/` | GPL-2.0-or-later (`firmware/rfone/LICENSE`), except the new sweep files `m0/sweep.c` and `m0/sweep.h`, which are MIT; libopencm3 inside it is LGPL-3.0-or-later. The built firmware is GPL-2.0-or-later as a whole |
 | `host/hydrasdr-host/` | libhydrasdr: MIT, with `hydrasdr.c`/`hydrasdr.h` BSD-3-Clause (`libhydrasdr/LICENSE.md`); tools: GPL-2.0 (`hydrasdr-tools/LICENSE.md`) |
 | `app/assets/fonts/` | SIL Open Font License 1.1 (`app/assets/fonts/`) |
 | everything else (`app/`, `tools/`, the build scripts, the docs) | MIT ([`LICENSE`](LICENSE)) |
