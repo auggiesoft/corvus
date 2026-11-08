@@ -7,7 +7,7 @@ to. That's what lets Corvus Sweep stitch a 24–1800 MHz spectrum about five tim
 | Board | Source | Status |
 |---|---|---|
 | HydraSDR RFOne | `rfone/`: the RFOne firmware v1.0.2, plus sweep mode | `v1.0.2-sweep5`, in daily use on one board |
-| Airspy R2 (and Mini) | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode | `v1.0.0-rc10-6-8-gcf1a374-sweep5`, first hardware tests in progress; Mini untested |
+| Airspy R2 (and Mini) | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode | `v1.0.0-rc10-6-8-gcf1a374-sweep5`, tested on one R2 (below); Mini untested |
 
 `rfone/` is an import of the upstream RFOne firmware (GPL-2.0-or-later, see `rfone/LICENSE`) with
 the sweep mode on top. The new sweep files (`rfone/m0/sweep.c`, `rfone/m0/sweep.h`) are MIT; the
@@ -127,3 +127,10 @@ then `-w corvus-fw-…-airspy.bin`), then unplug and replug it to boot the new i
 erases only the first 64 KB, so the calibration record at 0x20000 survives. Recovery is jumper P5 at
 1-2 (Boot USB0) and NXP DFU; back to 2-3 afterwards. To go back to stock, flash the upstream release
 image; our toolchain rebuilds rc10 and rc10-6 byte for byte.
+
+**First R2 flash (2026-11-08, from rc10):** booted and reports the new version; the calibration page is
+unchanged; normal streaming with the stock `airspy_rx` holds 20.000 MSPS real, unpacked and packed.
+Sweeping 24–1800 MHz in 8 MHz steps at 10 MSPS: 808–832 steps/s, 6.5 GHz/s, 3.65 full passes/s in
+VCO-continuous order (692 steps/s ascending), with no torn blocks, gaps, misfiled blocks or lock
+timeouts. A host SIGKILLed mid-sweep doesn't lock out the next open, even with the stock libairspy.
+FM stations land on their channel centres. `../host/tests/test_airspy_sweep_api.py` passes.

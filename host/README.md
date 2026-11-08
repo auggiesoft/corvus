@@ -103,4 +103,7 @@ else is unchanged and the version still reports 1.0.10.
 - Rate: the R2 sweeps at its 10 MSPS setting. Under RAW, `airspy_set_samplerate(10000000)` (or index 0)
   selects it: ADC 20 MHz real, IF 5 MHz.
 - `git log -- host/airspyone-host` shows the unmodified import first, then the change.
+- Test: `uv run --no-project --with numpy python host/tests/test_airspy_sweep_api.py --serial <hex>` (error
+  paths, tuner requests refused mid-sweep, stop and restart, 40 rapid plan switches with every block on its
+  plan's grid). Passes on an R2 with the Corvus firmware.
 
