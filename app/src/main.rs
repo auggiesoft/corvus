@@ -1,5 +1,5 @@
-//! Corvus Sweep: a live, seamlessly stitched spectrum for an RFOne running the Corvus sweep
-//! firmware (v1.0.2-sweepN), through libhydrasdr with the Corvus sweep API.
+//! Corvus Sweep: a live, seamlessly stitched spectrum for an RFOne or Airspy R2 running the Corvus
+//! sweep firmware ("...-sweepN"), through the board's library with the Corvus sweep API.
 
 mod app;
 mod dsp;
@@ -27,7 +27,7 @@ unsafe extern "C" {
 }
 
 /// Ctrl-C / kill: let the app close the device properly; if it can't within 1.5 s (e.g. the window
-/// is not being drawn), stop the sweep directly so the RFOne isn't left sweeping.
+/// is not being drawn), stop the sweep directly so the board isn't left sweeping.
 fn install_signal_handlers() {
     unsafe {
         for sig in [1, 2, 15] {
@@ -53,11 +53,13 @@ fn install_signal_handlers() {
 const USAGE: &str = "\
 corvus-sweep [options]
 
-  --sim                 run the built-in simulator instead of the RFOne
-  --lib PATH            libhydrasdr with the sweep API (default: env CORVUS_LIB, then
-                        the repo's host/build/out/linux build, then the system loader)
+  --board rfone|airspy  which board (default: env CORVUS_BOARD, else rfone); airspy is
+                        the Airspy R2: 10 MSPS only, one antenna input
+  --sim                 run the built-in simulator instead of the board
+  --lib PATH            the board's library with the sweep API (default: env CORVUS_LIB,
+                        then the repo's host/build/out build, then the system loader)
   --serial HEX          open the board with this serial (default: env CORVUS_SERIAL,
-                        else the first RFOne found)
+                        else the first one found)
   --range START:STOP    sweep range in MHz, e.g. 88:108
   --order vco|asc       visiting order (vco needs firmware sweep4+)
   --fresh               ignore saved settings
@@ -75,7 +77,9 @@ corvus-sweep [options]
 fn main() -> eframe::Result {
     install_signal_handlers();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn,eframe=warn,egui_wgpu=warn")).init();
-    let mut opts = app::Options { sim: false, lib: hydra::default_lib_path(), serial: hydra::default_serial(), screenshot: None, overrides: Vec::new() };
+    let mut opts = app::Options { sim: false, lib: PathBuf::new(), serial: hydra::default_serial(), screenshot: None, overrides: Vec::new() };
+    let mut board = hydra::env_board().unwrap_or(hydra::Board::RFOne);
+    let mut lib: Option<PathBuf> = None;
     let mut fresh = false;
     let mut after = 4.0f32;
     let mut shot: Option<PathBuf> = None;
@@ -86,7 +90,8 @@ fn main() -> eframe::Result {
         let mut val = |name: &str| args.next().unwrap_or_else(|| die(&format!("{name} needs a value")));
         match a.as_str() {
             "--sim" => opts.sim = true,
-            "--lib" => opts.lib = PathBuf::from(val("--lib")),
+            "--lib" => lib = Some(PathBuf::from(val("--lib"))),
+            "--board" => board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy")),
             "--serial" => {
                 let v = val("--serial");
                 opts.serial = u64::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or_else(|_| die("bad --serial"));
@@ -144,6 +149,8 @@ fn main() -> eframe::Result {
             _ => die(&format!("unknown option {a}")),
         }
     }
+    hydra::set_board(board);
+    opts.lib = lib.unwrap_or_else(|| hydra::default_lib_path(board));
     if fresh {
         opts.overrides.insert(0, Box::new(|c| *c = app::Config::default()));
     }

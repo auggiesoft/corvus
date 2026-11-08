@@ -99,11 +99,22 @@ impl Config {
     /// Change the sample rate, moving the step to the new rate's default if it was on the old
     /// default or isn't offered at the new rate.
     pub fn set_rate(&mut self, rate: Rate) {
+        let rate = board_rate(rate);
         let old = self.rate;
         self.rate = rate;
         let offered = rate.steps().iter().any(|&(v, _)| (v - self.step_mhz).abs() < 1e-9);
         if (self.step_mhz - old.default_step_mhz()).abs() < 1e-9 || !offered {
             self.step_mhz = rate.default_step_mhz();
+        }
+    }
+
+    /// Fit saved or profile settings to the board: the R2 has no 12 MSPS setting and one antenna input.
+    pub fn fit_board(&mut self) {
+        if self.rate != board_rate(self.rate) {
+            self.set_rate(Rate::M10);
+        }
+        if !crate::hydra::board().has_ports() {
+            self.port = 0;
         }
     }
 
@@ -212,9 +223,14 @@ impl Profile {
         PROFILES.iter().find(|p| p.name.eq_ignore_ascii_case(name))
     }
 
+    /// The profile's rate and step on this board: on the R2 (10 MSPS only) a 10 MHz step becomes 8 MHz,
+    /// the widest step that stays flat at 10 MSPS.
+    fn target(&self) -> (Rate, f64) {
+        fit_rate_step(self.rate, self.step_mhz, crate::hydra::board().has_12msps())
+    }
+
     pub fn apply(&self, c: &mut Config) {
-        c.rate = self.rate;
-        c.step_mhz = self.step_mhz;
+        (c.rate, c.step_mhz) = self.target();
         c.order = Order::VcoContinuous;
         c.dwell = self.dwell;
         c.lock_reads = self.lock_reads;
@@ -229,8 +245,9 @@ impl Profile {
     }
 
     fn matches(&self, c: &Config) -> bool {
-        c.rate == self.rate
-            && (c.step_mhz - self.step_mhz).abs() < 1e-9
+        let (rate, step_mhz) = self.target();
+        c.rate == rate
+            && (c.step_mhz - step_mhz).abs() < 1e-9
             && c.order == Order::VcoContinuous
             && c.dwell == self.dwell
             && c.lock_reads == self.lock_reads
@@ -390,6 +407,7 @@ impl App {
         for o in &opts.overrides {
             o(&mut cfg);
         }
+        cfg.fit_board();
         if !NFFTS.contains(&cfg.nfft) {
             cfg.nfft = 2048;
         }
@@ -581,7 +599,7 @@ impl App {
             self.engine.set_persist_eq(true);
             self.engine.note_restart();
             self.running = true;
-            self.toast("RFOne connected", false);
+            self.toast(format!("{} connected", crate::hydra::board().name()), false);
         }
     }
 
@@ -623,7 +641,7 @@ impl App {
             ui.label(RichText::new("AUGGIESOFT").font(theme::label_font(15.0)).extra_letter_spacing(15.0 * 0.14).color(HOUSE));
             ui.add_space(8.0);
             ui.label(RichText::new("Corvus Sweep").size(theme::MD).color(INK));
-            ui.label(RichText::new("RFOne firmware sweep, stitched live").size(theme::SM).color(INK2));
+            ui.label(RichText::new(format!("{} firmware sweep, stitched live", crate::hydra::board().name())).size(theme::SM).color(INK2));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("?").on_hover_text("Keyboard shortcuts (? or F1)").clicked() {
                     self.show_keys = !self.show_keys;
@@ -665,7 +683,7 @@ impl App {
         let s = &self.stats;
         if let Src::Offline(e) = &self.src {
             let e = if e.is_empty() { "not connected".to_string() } else { e.clone() };
-            out.push(Cond { level: Level::Alarm, text: format!("The RFOne isn't open: {e}."), acts: vec![(Act::Retry, "Try again"), (Act::Sim, "Run the simulator")] });
+            out.push(Cond { level: Level::Alarm, text: format!("The {} isn't open: {e}.", crate::hydra::board().name()), acts: vec![(Act::Retry, "Try again"), (Act::Sim, "Run the simulator")] });
         }
         if let Some(e) = &self.error {
             out.push(Cond { level: Level::Alarm, text: format!("The radio didn't take the last setting: {e}."), acts: vec![(Act::Dismiss, "Dismiss")] });
@@ -690,7 +708,7 @@ impl App {
             out.push(Cond { level: Level::Info, text: "Paused. The last sweep stays on screen.".into(), acts: vec![(Act::Resume, "Run")] });
         }
         if let Src::Sim(_) = self.src {
-            out.push(Cond { level: Level::Info, text: "Simulator: a synthetic band plan with the firmware's timing.".into(), acts: vec![(Act::Retry, "Connect the RFOne")] });
+            out.push(Cond { level: Level::Info, text: "Simulator: a synthetic band plan with the firmware's timing.".into(), acts: vec![(Act::Retry, connect_label())] });
         }
         let (_, slow) = self.applied.divider_transitions();
         if slow > 0 && self.applied.order == Order::VcoContinuous {
@@ -903,8 +921,15 @@ impl App {
                 theme::more(ui, "engine-more", "Rate, order, dwell and lock check", |ui| {
                     let mut rate = self.cfg.rate;
                     let rate_hint = "10 MSPS: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.\n12 MSPS: 24 MSPS real, tuner filter wide open, steps up to 10 MHz, about a third more GHz/s.";
-                    if theme::row_hint(ui, "Rate", rate_hint, |ui| theme::segmented(ui, &mut rate, &[(Rate::M10, "10 MSPS"), (Rate::M12, "12 MSPS")])) {
-                        self.cfg.set_rate(rate);
+                    if crate::hydra::board().has_12msps() {
+                        if theme::row_hint(ui, "Rate", rate_hint, |ui| theme::segmented(ui, &mut rate, &[(Rate::M10, "10 MSPS"), (Rate::M12, "12 MSPS")])) {
+                            self.cfg.set_rate(rate);
+                        }
+                    } else {
+                        theme::row_hint(ui, "Rate", "The Airspy R2's fastest setting: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.", |ui| {
+                            ui.label(RichText::new("10 MSPS").size(theme::SM).color(INK));
+                            false
+                        });
                     }
                     theme::row_hint(
                         ui,
@@ -921,7 +946,9 @@ impl App {
             ui.add_space(gap);
             theme::card(ui, |ui| {
                 theme::section(ui, "Receiver");
-                theme::row(ui, "Port", |ui| theme::segmented(ui, &mut self.cfg.port, &[(0, "ANT"), (1, "CABLE1"), (2, "CABLE2")]));
+                if crate::hydra::board().has_ports() {
+                    theme::row(ui, "Port", |ui| theme::segmented(ui, &mut self.cfg.port, &[(0, "ANT"), (1, "CABLE1"), (2, "CABLE2")]));
+                }
                 let mut mode = match self.cfg.gain {
                     Gain::Linearity(_) => 0,
                     Gain::Sensitivity(_) => 1,
@@ -1028,9 +1055,9 @@ impl App {
     fn footer(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
             let src = match &self.src {
-                Src::Device(d) => format!("{} · {} · {} · rev {}", d.version, if self.serial == 0 { "first RFOne".to_string() } else { format!("{:016X}", self.serial) }, d.lib_path.display(), d.fw_revision),
+                Src::Device(d) => format!("{} · {} · {} · rev {}", d.version, if self.serial == 0 { format!("first {}", crate::hydra::board().name()) } else { format!("{:016X}", self.serial) }, d.lib_path.display(), d.fw_revision),
                 Src::Sim(_) => "Simulator".to_string(),
-                Src::Offline(_) => "RFOne not open".to_string(),
+                Src::Offline(_) => format!("{} not open", crate::hydra::board().name()),
             };
             ui.label(RichText::new(src).size(theme::XS + 1.0).color(INK2));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1554,7 +1581,7 @@ impl App {
         let r = Rect::from_center_size(spec.center(), vec2(spec.width().min(620.0), 150.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
         theme::card(&mut child, |ui| {
-            ui.label(RichText::new("The RFOne isn't open").size(theme::LG).color(INK));
+            ui.label(RichText::new(format!("The {} isn't open", crate::hydra::board().name())).size(theme::LG).color(INK));
             ui.label(RichText::new("Check that it's plugged in and that no other program is using it, then try again.").size(theme::SM).color(INK));
             if !err.is_empty() {
                 ui.label(RichText::new(err).size(theme::XS + 1.0).color(INK2));
@@ -1683,7 +1710,7 @@ impl App {
                     self.cfg.bump_step(if key == Key::OpenBracket { -1 } else { 1 });
                     self.toast(format!("Step {} MHz", fmt_trim(self.cfg.step_mhz, 1)), false);
                 }
-                Key::M => {
+                Key::M if crate::hydra::board().has_12msps() => {
                     self.cfg.set_rate(if self.cfg.rate == Rate::M10 { Rate::M12 } else { Rate::M10 });
                     self.toast(format!("{} MSPS, {} MHz steps", self.cfg.rate.msps(), fmt_trim(self.cfg.step_mhz, 1)), false);
                 }
@@ -1898,6 +1925,7 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
     for o in &opts.overrides {
         o(&mut cfg);
     }
+    cfg.fit_board();
     let plan = cfg.plan();
     let engine = Engine::new(plan.clone(), cfg.dsp(), !opts.sim);
     let src = if opts.sim { Src::Sim(Sim::start(engine.sink(), plan.clone(), cfg.rx())) } else { open_device(&opts.lib, opts.serial, &engine, &plan, cfg.rx()) };
@@ -2217,6 +2245,30 @@ fn fmt_trim(v: f64, dec: usize) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
 }
 
+/// A rate and step for a board with or without the 12 MSPS setting: without it, 10 MSPS, keeping the step
+/// if 10 MSPS offers it and otherwise using 10 MSPS's default (8 MHz).
+fn fit_rate_step(rate: Rate, step_mhz: f64, has_12msps: bool) -> (Rate, f64) {
+    let fitted = if has_12msps { rate } else { Rate::M10 };
+    if fitted == rate || fitted.steps().iter().any(|&(v, _)| (v - step_mhz).abs() < 1e-9) {
+        (fitted, step_mhz)
+    } else {
+        (fitted, fitted.default_step_mhz())
+    }
+}
+
+/// The board's rate for a requested one: the R2 runs 10 MSPS only.
+fn board_rate(rate: Rate) -> Rate {
+    if crate::hydra::board().has_12msps() { rate } else { Rate::M10 }
+}
+
+/// "Connect the RFOne" / "Connect the Airspy R2" (a static string for the condition's button).
+fn connect_label() -> &'static str {
+    match crate::hydra::board() {
+        crate::hydra::Board::RFOne => "Connect the RFOne",
+        crate::hydra::Board::Airspy => "Connect the Airspy R2",
+    }
+}
+
 /// Where exports go: the repo's captures/ when it exists (gitignored), else $XDG_DATA_HOME/corvus-sweep/captures.
 fn captures_dir() -> PathBuf {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../captures");
@@ -2301,6 +2353,17 @@ mod tests {
         c.bump_step(1);
         c.bump_step(1);
         assert_eq!(c.step_mhz, 9.0);
+    }
+
+    #[test]
+    fn profiles_fit_a_board_without_12msps() {
+        // Fastest and Bursts use 10 MHz steps at 12 MSPS: on the R2 they become 8 MHz at 10 MSPS;
+        // Quality and Weak keep their 8 MHz steps.
+        let fitted: Vec<(Rate, f64)> = PROFILES.iter().map(|p| fit_rate_step(p.rate, p.step_mhz, false)).collect();
+        assert_eq!(fitted, vec![(Rate::M10, 8.0), (Rate::M10, 8.0), (Rate::M10, 8.0), (Rate::M10, 8.0)]);
+        for p in PROFILES {
+            assert_eq!(fit_rate_step(p.rate, p.step_mhz, true), (p.rate, p.step_mhz));
+        }
     }
 
     #[test]

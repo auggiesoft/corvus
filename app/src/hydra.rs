@@ -1,5 +1,6 @@
-//! libhydrasdr (our patched build with the sweep API) loaded at run time, and the RFOne driven in
-//! firmware sweep mode. See ../host/README.md and the `sweep_api` group in hydrasdr.h.
+//! The board's library with the Corvus sweep API (libhydrasdr for the RFOne, libairspy for the Airspy R2),
+//! loaded at run time, and the board driven in firmware sweep mode. See ../host/README.md. The two
+//! libraries share one API shape under different prefixes, and the same tags and sweep parameters.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,88 @@ use crate::plan::{Plan, Rate};
 
 pub const TAG_WORDS: usize = 8;
 const SAMPLE_RAW: c_int = 5;
+
+/// Which board Corvus Sweep drives. Both run the same Corvus sweep protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Board {
+    RFOne,
+    /// Airspy R2 (the same firmware image also runs on the Mini, untested).
+    Airspy,
+}
+
+impl Board {
+    pub fn parse(s: &str) -> Option<Board> {
+        match s.to_ascii_lowercase().as_str() {
+            "rfone" => Some(Board::RFOne),
+            "airspy" | "r2" => Some(Board::Airspy),
+            _ => None,
+        }
+    }
+
+    /// Name for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Board::RFOne => "RFOne",
+            Board::Airspy => "Airspy R2",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Board::RFOne => "hydrasdr_",
+            Board::Airspy => "airspy_",
+        }
+    }
+
+    /// The RFOne has ANT, CABLE1 and CABLE2; the R2 has one antenna input.
+    pub fn has_ports(self) -> bool {
+        self == Board::RFOne
+    }
+
+    /// The R2's fastest setting is 10 MSPS.
+    pub fn has_12msps(self) -> bool {
+        self == Board::RFOne
+    }
+
+    /// The library this repo builds for the board (host/build/build.sh).
+    fn repo_lib(self) -> &'static str {
+        match self {
+            Board::RFOne => "../host/build/out/linux/libhydrasdr.so.1.1.4",
+            Board::Airspy => "../host/build/out/airspy-linux/libairspy.so.1.0.10",
+        }
+    }
+
+    fn system_lib(self) -> &'static str {
+        match self {
+            Board::RFOne => "libhydrasdr.so.1",
+            Board::Airspy => "libairspy.so.0",
+        }
+    }
+
+    /// Prefix for files that hold what was learned from this board (its passband differs).
+    pub fn cache_prefix(self) -> &'static str {
+        match self {
+            Board::RFOne => "",
+            Board::Airspy => "airspy-",
+        }
+    }
+}
+
+static BOARD: std::sync::OnceLock<Board> = std::sync::OnceLock::new();
+
+/// The board chosen at startup (`--board`, CORVUS_BOARD); the RFOne unless set.
+pub fn board() -> Board {
+    *BOARD.get().unwrap_or(&Board::RFOne)
+}
+
+pub fn set_board(b: Board) {
+    let _ = BOARD.set(b);
+}
+
+/// CORVUS_BOARD if it names a board.
+pub fn env_board() -> Option<Board> {
+    std::env::var("CORVUS_BOARD").ok().and_then(|v| Board::parse(&v))
+}
 
 type Dev = c_void;
 type RxCb = unsafe extern "C" fn(*mut Transfer) -> c_int;
@@ -116,7 +199,7 @@ pub struct RxSettings {
     pub gain: Gain,
 }
 
-/// Serial to open: CORVUS_SERIAL (hex) if set, else 0, which opens the first RFOne found.
+/// Serial to open: CORVUS_SERIAL (hex) if set, else 0, which opens the first board found.
 pub fn default_serial() -> u64 {
     std::env::var("CORVUS_SERIAL")
         .ok()
@@ -124,16 +207,16 @@ pub fn default_serial() -> u64 {
         .unwrap_or(0)
 }
 
-/// Default library: CORVUS_LIB, else this repo's build (host/build/build.sh linux), else the loader's.
-pub fn default_lib_path() -> PathBuf {
+/// Default library: CORVUS_LIB, else this repo's build for the board (host/build/build.sh), else the loader's.
+pub fn default_lib_path(board: Board) -> PathBuf {
     if let Ok(p) = std::env::var("CORVUS_LIB") {
         return PathBuf::from(p);
     }
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../host/build/out/linux/libhydrasdr.so.1.1.4");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join(board.repo_lib());
     if repo.exists() {
         return repo.canonicalize().unwrap_or(repo);
     }
-    PathBuf::from("libhydrasdr.so.1")
+    PathBuf::from(board.system_lib())
 }
 
 struct Api {
@@ -144,7 +227,8 @@ struct Api {
     set_samplerate: unsafe extern "C" fn(*mut Dev, u32) -> c_int,
     set_sample_type: unsafe extern "C" fn(*mut Dev, c_int) -> c_int,
     set_packing: unsafe extern "C" fn(*mut Dev, u8) -> c_int,
-    set_rf_port: unsafe extern "C" fn(*mut Dev, c_int) -> c_int,
+    /// RFOne only.
+    set_rf_port: Option<unsafe extern "C" fn(*mut Dev, c_int) -> c_int>,
     set_linearity_gain: unsafe extern "C" fn(*mut Dev, u8) -> c_int,
     set_sensitivity_gain: unsafe extern "C" fn(*mut Dev, u8) -> c_int,
     set_lna_gain: unsafe extern "C" fn(*mut Dev, u8) -> c_int,
@@ -162,15 +246,17 @@ struct Api {
 }
 
 impl Api {
-    fn load(path: &Path) -> Result<Api, String> {
+    fn load(path: &Path, board: Board) -> Result<Api, String> {
         let lib = unsafe { Library::new(path) }.map_err(|e| format!("cannot load {}: {e}", path.display()))?;
+        let prefix = board.prefix();
         macro_rules! sym {
             ($name:literal) => {
-                *unsafe { lib.get(concat!("hydrasdr_", $name, "\0").as_bytes()) }.map_err(|_| {
+                *unsafe { lib.get(format!("{prefix}{}\0", $name).as_bytes()) }.map_err(|_| {
                     format!(
-                        "{} has no hydrasdr_{} — it is not the Corvus sweep library (build it with host/build/build.sh, see host/README.md)",
+                        "{} has no {prefix}{} — it is not the Corvus sweep library for the {} (build it with host/build/build.sh, see host/README.md)",
                         path.display(),
-                        $name
+                        $name,
+                        board.name()
                     )
                 })?
             };
@@ -182,7 +268,7 @@ impl Api {
             set_samplerate: sym!("set_samplerate"),
             set_sample_type: sym!("set_sample_type"),
             set_packing: sym!("set_packing"),
-            set_rf_port: sym!("set_rf_port"),
+            set_rf_port: if board.has_ports() { Some(sym!("set_rf_port")) } else { None },
             set_linearity_gain: sym!("set_linearity_gain"),
             set_sensitivity_gain: sym!("set_sensitivity_gain"),
             set_lna_gain: sym!("set_lna_gain"),
@@ -261,6 +347,7 @@ pub struct Device {
     pub version: String,
     pub fw_revision: i32,
     pub lib_path: PathBuf,
+    board: Board,
     plan: Option<Plan>,
     rx: RxSettings,
     rate: Rate,
@@ -272,11 +359,12 @@ unsafe impl Send for Device {}
 
 impl Device {
     pub fn open(lib_path: &Path, serial: u64, sink: Sink, rx: RxSettings, rate: Rate) -> Result<Device, String> {
-        let api = Api::load(lib_path)?;
+        let board = board();
+        let api = Api::load(lib_path, board)?;
         let mut dev = std::ptr::null_mut();
         let rc = unsafe { (api.open_sn)(&mut dev, serial) };
         if rc != 0 {
-            let which = if serial == 0 { "the RFOne".to_string() } else { format!("RFOne {serial:#018X}") };
+            let which = if serial == 0 { format!("the {}", board.name()) } else { format!("{} {serial:#018X}", board.name()) };
             return Err(api.err(&format!("open {which} (unplugged, or busy in another program?)"), rc));
         }
         let mut buf = [0 as c_char; 255];
@@ -291,13 +379,14 @@ impl Device {
             version,
             fw_revision,
             lib_path: lib_path.to_path_buf(),
+            board,
             plan: None,
             rx,
             rate,
             streaming: false,
         };
         if supported != 1 {
-            return Err(format!("firmware \"{}\" has no sweep mode (needs v1.0.2-sweepN, see firmware/README.md)", d.version));
+            return Err(format!("firmware \"{}\" has no sweep mode (needs the Corvus firmware, \"...-sweepN\"; see firmware/README.md)", d.version));
         }
         d.configure()?;
         *EMERGENCY.lock() = Some(Emergency { sweep_stop: d.api.sweep_stop, stop_rx: d.api.stop_rx, dev: d.dev as usize });
@@ -322,8 +411,14 @@ impl Device {
     /// Under RAW (and the REAL types) a rate given by value is the real ADC rate: 20 or 24 MSPS.
     /// Asking for "12000000" under RAW selects the firmware's 6 MSPS IQ setting (12 MSPS real); only
     /// 10000000 happens to work either way, because it matches an IQ rate-table index.
+    ///
+    /// libairspy's table holds the R2's 10 MSPS setting as 10000000, which selects it under RAW too.
     fn apply_rate(&self) -> Result<(), String> {
-        let (hz, m) = (self.rate.adc_hz() as u32, self.rate.msps());
+        let hz = match self.board {
+            Board::RFOne => self.rate.adc_hz() as u32,
+            Board::Airspy => 10_000_000,
+        };
+        let m = self.rate.msps();
         unsafe { self.check(&format!("set_samplerate {m} MSPS ({hz} real)"), (self.api.set_samplerate)(self.dev, hz)) }
     }
 
@@ -331,7 +426,9 @@ impl Device {
         let a = &self.api;
         let d = self.dev;
         unsafe {
-            self.check("set_rf_port", (a.set_rf_port)(d, self.rx.port as c_int))?;
+            if let Some(set_rf_port) = a.set_rf_port {
+                self.check("set_rf_port", set_rf_port(d, self.rx.port as c_int))?;
+            }
             match self.rx.gain {
                 Gain::Linearity(g) => self.check("set_linearity_gain", (a.set_linearity_gain)(d, g)),
                 Gain::Sensitivity(g) => self.check("set_sensitivity_gain", (a.set_sensitivity_gain)(d, g)),
@@ -367,7 +464,7 @@ impl Device {
         self.start_stream()?;
         let p = SweepParams::from(plan);
         let rc = unsafe { (self.api.sweep_start)(self.dev, &p) };
-        self.check("hydrasdr_sweep_start", rc)?;
+        self.check("sweep_start", rc)?;
         self.plan = Some(plan.clone());
         Ok(())
     }

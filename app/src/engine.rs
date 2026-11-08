@@ -908,7 +908,7 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
         Rate::M10 => format!("passband-eq-{nfft}.f32"),
         Rate::M12 => format!("passband-eq-12msps-{nfft}.f32"),
     };
-    base.join("corvus-sweep").join(name)
+    base.join("corvus-sweep").join(format!("{}{name}", crate::hydra::board().cache_prefix()))
 }
 
 /// Every learned passband in the cache, counted as 10 passes so new data can still move it.
