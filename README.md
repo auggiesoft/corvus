@@ -49,6 +49,9 @@ With an RFOne:
 
 ## Licensing
 
+Corvus's own code is MIT ([`LICENSE`](LICENSE)). That file covers everything in this repository except the
+parts below that keep their own licences:
+
 | Part | Licence |
 |---|---|
 | `firmware/rfone/` | GPL-2.0-or-later (`firmware/rfone/LICENSE`), except the new sweep files `m0/sweep.c` and `m0/sweep.h`, which are MIT; libopencm3 inside it is LGPL-3.0-or-later. The built firmware is GPL-2.0-or-later as a whole |

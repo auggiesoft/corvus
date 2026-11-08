@@ -19,8 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-This licence covers the files in this repository that aren't under
-firmware/rfone/ (apart from m0/sweep.c and m0/sweep.h, which are MIT),
-host/hydrasdr-host/ or app/assets/fonts/. Those keep their
-own licences; see README.md.
