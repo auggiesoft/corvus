@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Build host/hydrasdr-host (libhydrasdr with the Corvus sweep API, plus the tools) for Linux and/or Windows.
-#   host/build/build.sh [linux|windows|all]          (default: all)
-# Artefacts: host/build/out/linux/ (libhydrasdr.so*, tools) and host/build/out/windows/ (DLLs, exes).
+# Build the host libraries with the Corvus sweep API, plus their tools.
+#   host/build/build.sh [linux|windows|airspy-linux|all]          (default: all)
+#   linux, windows: host/hydrasdr-host (libhydrasdr, for the RFOne) -> host/build/out/linux/, out/windows/
+#   airspy-linux:   host/airspyone-host (libairspy, for the Airspy R2) -> host/build/out/airspy-linux/
 set -euo pipefail
 B=$(cd "$(dirname "$0")" && pwd)
-SRC=$B/../hydrasdr-host
 WHAT=${1:-all}
 
-build() { # <target> <image> <dockerfile> <configure+build commands>
-  local target=$1 image=$2 df=$3 cmds=$4 work=$B/work/$1 out=$B/out/$1
+build() { # <target> <source dir> <image> <dockerfile> <configure+build commands>
+  local target=$1 SRC=$2 image=$3 df=$4 cmds=$5 work=$B/work/$1 out=$B/out/$1
   docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" -f "$B/$df" "$B" >/dev/null
   case "$work" in "$B"/work/?*) rm -rf "$work" ;; *) exit 1 ;; esac
   mkdir -p "$work"
@@ -22,7 +22,7 @@ build() { # <target> <image> <dockerfile> <configure+build commands>
 }
 
 if [ "$WHAT" = linux ] || [ "$WHAT" = all ]; then
-  build linux corvus-host-linux Dockerfile.linux '
+  build linux "$B/../hydrasdr-host" corvus-host-linux Dockerfile.linux '
     cmake -S . -B b -DCMAKE_BUILD_TYPE=Release -DINSTALL_UDEV_RULES=OFF
     cmake --build b -j"$(nproc)"
     mkdir -p stage
@@ -33,7 +33,7 @@ if [ "$WHAT" = linux ] || [ "$WHAT" = all ]; then
 fi
 if [ "$WHAT" = windows ] || [ "$WHAT" = all ]; then
   M=/usr/x86_64-w64-mingw32/sys-root/mingw
-  build windows corvus-host-mingw Dockerfile.mingw "
+  build windows "$B/../hydrasdr-host" corvus-host-mingw Dockerfile.mingw "
     mingw64-cmake -S . -B b -DCMAKE_BUILD_TYPE=Release -DINSTALL_UDEV_RULES=OFF -DLIBUSB_DLL=$M/bin/libusb-1.0.dll
     cmake --build b -j\"\$(nproc)\"
     mkdir -p stage
@@ -45,4 +45,14 @@ if [ "$WHAT" = windows ] || [ "$WHAT" = all ]; then
     cp stage/libhydrasdr.dll stage/hydrasdr.dll   # MSVC release name, which most apps load
     x86_64-w64-mingw32-objdump -p stage/libhydrasdr.dll | grep -E 'DLL Name' > stage/libhydrasdr.dll.imports"
   (cd "$B/out/windows" && sha256sum *.dll | tee SHA256SUMS)
+fi
+if [ "$WHAT" = airspy-linux ] || [ "$WHAT" = all ]; then
+  build airspy-linux "$B/../airspyone-host" corvus-host-linux Dockerfile.linux '
+    cmake -S . -B b -DCMAKE_BUILD_TYPE=Release -DINSTALL_UDEV_RULES=OFF
+    cmake --build b -j"$(nproc)"
+    mkdir -p stage
+    cp -a b/libairspy/src/libairspy.so* stage/
+    find b/airspy-tools -maxdepth 2 -type f -executable -name "airspy_*" -exec cp {} stage/ \;
+    cp libairspy/src/airspy.h libairspy/src/airspy_commands.h stage/'
+  (cd "$B/out/airspy-linux" && sha256sum libairspy.so.*.* | tee SHA256SUMS)
 fi

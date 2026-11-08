@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Build the Corvus firmware for one board inside the GCC 4.7-2013q3 container.
-#   firmware/build/build.sh [board]        boards: rfone (default)
+#   firmware/build/build.sh [board]        boards: rfone (default), airspy (Airspy R2 and Mini)
 # Output: firmware/build/out/<board>/corvus-fw-<version>-<board>.bin, plus the .elf, .map and log.
 set -euo pipefail
 B=$(cd "$(dirname "$0")" && pwd)
 BOARD=${1:-rfone}
 SRC=$B/../$BOARD
-[ -f "$SRC/Makefile" ] || { echo "unknown board: $BOARD (have: rfone)" >&2; exit 1; }
+case "$BOARD" in
+  rfone)  IMG=fw_bin/hydrasdr_rfone_fw; HDR=m0/m0.hdr ;;
+  airspy) IMG=airspy_rom_to_ram/airspy_rom_to_ram; HDR=airspy_m0/airspy_m0.hdr ;;
+  *) echo "unknown board: $BOARD (have: rfone, airspy)" >&2; exit 1 ;;
+esac
 WORK=$B/work/$BOARD
 OUT=$B/out/$BOARD
 IMAGE=corvus-fw-gcc47
@@ -28,12 +32,12 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$WORK":/src -w /src "$IMAGE" bash -ec
   make -C libopencm3 -j"$(nproc)" > libopencm3-build.log 2>&1 || { tail -30 libopencm3-build.log; exit 1; }
   make -j"$(nproc)" > fw-build.log 2>&1 || { tail -40 fw-build.log; exit 1; }
 '
-VER=$(sed -n 's/.*_GIT_TAG "\(.*\)".*/\1/p' "$SRC/m0/m0.hdr")
+VER=$(tr -d '\r' < "$SRC/$HDR" | sed -n 's/.*_GIT_TAG "\(.*\)".*/\1/p')
 NAME=corvus-fw-$VER-$BOARD
 rm -rf "$OUT"; mkdir -p "$OUT"
-cp "$WORK"/fw_bin/hydrasdr_rfone_fw.bin "$OUT/$NAME.bin"
-cp "$WORK"/fw_bin/hydrasdr_rfone_fw.elf "$OUT/$NAME.elf"
-cp "$WORK"/fw_bin/hydrasdr_rfone_fw.map "$OUT/$NAME.map"
+cp "$WORK/$IMG.bin" "$OUT/$NAME.bin"
+cp "$WORK/$IMG.elf" "$OUT/$NAME.elf"
+cp "$WORK/$IMG.map" "$OUT/$NAME.map"
 cp "$WORK"/fw-build.log "$OUT"/
 (cd "$OUT" && sha256sum "$NAME.bin" | tee SHA256SUMS)
 echo "$(stat -c %s "$OUT/$NAME.bin") bytes -> $OUT/$NAME.bin"
