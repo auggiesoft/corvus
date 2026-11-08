@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_configure: debian/libhydrasdr1.udev
+	dh_auto_configure --buildsystem=cmake --
+
+debian/libhydrasdr1.udev: hydrasdr-tools/51-hydrasdr.rules
+	cp -p hydrasdr-tools/51-hydrasdr.rules debian/libhydrasdr1.udev
+

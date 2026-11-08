@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: HydraSDR Host Tools
+Upstream-Contact: Benjamin Vernoux <bvernoux@hydrasdr.com>
+Source: https://github.com/hydrasdr/hydrasdr-host
+
+Files: *
+Copyright: 2025 Benjamin Vernoux <bvernoux@hydrasdr.com>
+License: Custom-HydraSDR
+ This software is licensed exclusively for HydraSDR products and related development.
+ Unauthorized use, modification, or distribution for non-HydraSDR products is prohibited.
+ All rights reserved.

@@ -1,0 +1,55 @@
+Source: hydrasdr-host
+Section: comm
+Priority: optional
+Maintainer: Benjamin Vernoux <bvernoux@hydrasdr.com>
+Rules-Requires-Root: no
+Build-Depends:
+ debhelper (>= 11.0.0),
+ cmake,
+ pkg-config,
+ libusb-1.0-0-dev,
+Standards-Version: 4.5.0
+Homepage: https://hydrasdr.com
+
+Package: libhydrasdr-dev
+Section: libdevel
+Architecture: any
+Pre-Depends: ${misc:Pre-Depends}
+Depends: libhydrasdr1 (= ${binary:Version}),
+         libusb-1.0-0-dev,
+         ${misc:Depends}
+Multi-Arch: same
+Description: HydraSDR Host Tools and Libraries (Debian/Ubuntu)
+ Host tools and shared libraries for HydraSDR software-defined radio.
+ Provides command-line utilities and development libraries for interfacing
+ with HydraSDR software-defined radio hardware.
+ .
+ This package contains development files.
+
+Package: libhydrasdr1
+Section: libs
+Architecture: any
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Multi-Arch: same
+Description: HydraSDR Host Tools and Libraries (Debian/Ubuntu)
+ Host tools and shared libraries for HydraSDR software-defined radio.
+ Provides command-line utilities and development libraries for interfacing
+ with HydraSDR software-defined radio hardware.
+ .
+ This package contains the shared library.
+
+Package: hydrasdr-host
+Architecture: any
+Depends: ${misc:Depends},
+ ${shlibs:Depends},
+ libusb-1.0-0 (>= 1.0.20),
+ libhydrasdr1 (= ${binary:Version}),
+Description: HydraSDR Host Tools and Libraries (Debian/Ubuntu)
+ Host tools and shared libraries for HydraSDR software-defined radio.
+ Provides command-line utilities and development libraries for interfacing
+ with HydraSDR software-defined radio hardware.
+ .
+ This package includes:
+  - Command-line tools (hydrasdr_info, hydrasdr_lib_version, etc.)
+
