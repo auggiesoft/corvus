@@ -20,9 +20,14 @@ cargo run --release -- --serial 0123456789ABCDEF   # a particular board
 cargo run --release -- --range 400:470 --order asc
 cargo run --release -- --msps 10                 # the older 10 MSPS setting (8 MHz steps)
 cargo run --release -- --headless 10 --csv /tmp/spectrum.csv   # no window: rates, seam ripple, CSV
+../host/build/build.sh airspy-linux && cargo run --release -- --board airspy   # an Airspy R2
 ```
 
-Other options: `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
+`--board airspy` (or `CORVUS_BOARD=airspy`) drives an Airspy R2 running the Corvus firmware through
+libairspy. The R2 runs 10 MSPS only and has one antenna input, so the rate and port controls go away
+and profiles with 10 MHz steps use 8 MHz. Its learned passband is cached separately from the RFOne's.
+
+Other options: `--board rfone|airspy` (or `CORVUS_BOARD`), `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
 `--msps 10|12`, `--step MHZ`, `--bin-khz K`, `--profile NAME`, `--fresh` (ignore saved settings);
 `--help` lists them all. Settings persist between runs via eframe storage
 (`~/.local/share/corvus-sweep/`). The learned passband correction is stored in

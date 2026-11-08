@@ -1,4 +1,7 @@
-# Host library: libhydrasdr with the sweep API
+# Host libraries: libhydrasdr and libairspy with the sweep API
+
+Two libraries, one API: libhydrasdr for the RFOne (below) and libairspy for the Airspy R2 (at the
+end). Both add the same five functions under their own prefix, with the same parameters and tags.
 
 `hydrasdr-host/` is an import of the upstream host library and tools (libhydrasdr 1.1.4,
 BSD-3-Clause, see `hydrasdr-host/libhydrasdr/LICENSE.md`) with five functions added for the Corvus
@@ -86,3 +89,18 @@ uv run --no-project python host/tests/test_stale_sweep.py --serial <hex>
   behaviour mid-sweep.
 - `test_stale_sweep.py`: SIGKILLs a sweeping child process, then opens the board with the system
   library and with this one. On sweep5 both open.
+
+## libairspy (Airspy R2)
+
+`airspyone-host/` is an import of the upstream Airspy host library and tools (libairspy 1.0.10,
+BSD-3-Clause) with the same API added under the `airspy_` prefix: `airspy_sweep_supported`,
+`airspy_sweep_fw_revision`, `airspy_sweep_start`, `airspy_sweep_stop`, `airspy_sweep_parse_block`,
+`airspy_sweep_params_t` and `airspy_sweep_block_info_t` (same layouts as the libhydrasdr ones), plus
+`AIRSPY_ERROR_UNSUPPORTED` (-12). `airspy_open*` sends SWEEP_STOP to sweep firmware first. Everything
+else is unchanged and the version still reports 1.0.10.
+
+- Build: `host/build/build.sh airspy-linux` -> `build/out/airspy-linux/` (`libairspy.so.1.0.10`, tools, headers).
+- Rate: the R2 sweeps at its 10 MSPS setting. Under RAW, `airspy_set_samplerate(10000000)` (or index 0)
+  selects it: ADC 20 MHz real, IF 5 MHz.
+- `git log -- host/airspyone-host` shows the unmodified import first, then the change.
+

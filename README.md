@@ -1,6 +1,7 @@
 # Corvus
 
-Firmware sweep mode and a live wideband spectrum analyser for the HydraSDR RFOne.
+Firmware sweep mode and a live wideband spectrum analyser for the HydraSDR RFOne, now being ported
+to the Airspy R2.
 
 The board retunes itself and streams only blocks captured after the tuner's PLL has locked, each
 tagged with the step it belongs to. On the host, Corvus Sweep stitches those steps into one seamless
@@ -16,8 +17,8 @@ spectrum: **24–1800 MHz about five times a second (8.6 GHz/s), lock-verified, 
 
 | Directory | |
 |---|---|
-| [`firmware/`](firmware/) | the Corvus firmware: sweep mode on top of the RFOne firmware v1.0.2. Protocol, building, flashing |
-| [`host/`](host/) | libhydrasdr with the sweep API added (a drop-in superset), Linux and Windows builds, on-device tests |
+| [`firmware/`](firmware/) | the Corvus firmware: sweep mode on top of the RFOne firmware v1.0.2 and the Airspy R2/Mini firmware. Protocol, building, flashing |
+| [`host/`](host/) | libhydrasdr and libairspy with the sweep API added (drop-in supersets), builds, on-device tests |
 | [`app/`](app/) | **Corvus Sweep**, the spectrum analyser (Rust, egui) |
 | [`tools/`](tools/) | `corvus_sweep.py`, a command-line sweep client (rates, integrity, CSV) |
 | [`docs/`](docs/) | [measurements](docs/measurements.md): settling, PLL lock, visiting order, 12 MSPS, restarts |
@@ -45,7 +46,9 @@ With an RFOne:
   unchanged, and the factory calibration survives flashing.
 - The Windows library builds but hasn't been tested on hardware, and the app hasn't been built for
   Windows.
-- Planned: the same sweep mode for the Airspy R2, as another firmware target with the same protocol.
+- Airspy R2: the firmware, libairspy and Corvus Sweep (`--board airspy`) build and run on the simulator;
+  first hardware tests are in progress. The R2 runs at 10 MSPS (no 12 MSPS setting), about 3.5 full
+  passes a second. The same image should run on the Airspy Mini, untested.
 
 ## Licensing
 
@@ -55,7 +58,9 @@ parts below that keep their own licences:
 | Part | Licence |
 |---|---|
 | `firmware/rfone/` | GPL-2.0-or-later (`firmware/rfone/LICENSE`), except the new sweep files `m0/sweep.c` and `m0/sweep.h`, which are MIT; libopencm3 inside it is LGPL-3.0-or-later. The built firmware is GPL-2.0-or-later as a whole |
+| `firmware/airspy/` | GPL-2.0-or-later (`firmware/airspy/LICENSE`), except the new sweep files `airspy_m0/sweep.c` and `airspy_m0/sweep.h`, which are MIT; libopencm3 inside it is LGPL-3.0-or-later |
 | `host/hydrasdr-host/` | libhydrasdr: MIT, with `hydrasdr.c`/`hydrasdr.h` BSD-3-Clause (`libhydrasdr/LICENSE.md`); tools: GPL-2.0 (`hydrasdr-tools/LICENSE.md`) |
+| `host/airspyone-host/` | libairspy: BSD-3-Clause (file headers); tools: see their headers |
 | `app/assets/fonts/` | SIL Open Font License 1.1 (`app/assets/fonts/`) |
 | everything else (`app/`, `tools/`, the build scripts, the docs) | MIT ([`LICENSE`](LICENSE)) |
 

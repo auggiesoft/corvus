@@ -7,13 +7,17 @@ to. That's what lets Corvus Sweep stitch a 24–1800 MHz spectrum about five tim
 | Board | Source | Status |
 |---|---|---|
 | HydraSDR RFOne | `rfone/`: the RFOne firmware v1.0.2, plus sweep mode | `v1.0.2-sweep5`, in daily use on one board |
-| Airspy R2 | — | planned |
+| Airspy R2 (and Mini) | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode | `v1.0.0-rc10-6-8-gcf1a374-sweep5`, first hardware tests in progress; Mini untested |
 
 `rfone/` is an import of the upstream RFOne firmware (GPL-2.0-or-later, see `rfone/LICENSE`) with
 the sweep mode on top. The new sweep files (`rfone/m0/sweep.c`, `rfone/m0/sweep.h`) are MIT; the
 built firmware is GPL-2.0-or-later as a whole. `git log -- firmware/rfone` shows the unmodified
-import first, then every change. Normal (non-sweep) operation is unchanged, so the board still works with the stock host tools
-and other software.
+import first, then every change. `airspy/` is built the same way on the Airspy firmware, which the
+RFOne firmware descends from, so the port is nearly line for line. Normal (non-sweep) operation is
+unchanged on both, so the boards still work with the stock host tools and other software.
+
+Both boards speak the same protocol below. Differences: the R2 has no 12 MSPS setting (10 MSPS is its
+fastest) and one antenna input, and its host library is libairspy (`../host/airspyone-host/`).
 
 ## Versions
 
@@ -98,7 +102,10 @@ official release image, and this tree builds `corvus-fw-v1.0.2-sweep5-rfone.bin`
 ## Flashing
 
 **Unofficial firmware, at your own risk.** A bad flash can leave the board needing DFU recovery,
-which means opening the case. Read the upstream flashing guides in `rfone/` first.
+which means opening the case. Read the upstream flashing guides first (in `rfone/`, or the Airspy
+firmware wiki for the R2).
+
+RFOne:
 
 1. Back up what's on the board, and keep the file:
    `hydrasdr_spiflash -s <serial> -r backup.bin -l 1048576`
@@ -114,3 +121,9 @@ upstream host tools. Always pass `-s <serial>`: without it some tools act on eve
 
 To go back to stock, flash the upstream v1.0.2 release image (or build the tag with the same
 toolchain) the same way.
+
+Airspy R2: the same steps with the airspy tools (`airspy_spiflash -s <serial> -r backup.bin -l 1048576`,
+then `-w corvus-fw-…-airspy.bin`), then unplug and replug it to boot the new image. `airspy_spiflash -w`
+erases only the first 64 KB, so the calibration record at 0x20000 survives. Recovery is jumper P5 at
+1-2 (Boot USB0) and NXP DFU; back to 2-3 afterwards. To go back to stock, flash the upstream release
+image; our toolchain rebuilds rc10 and rc10-6 byte for byte.
