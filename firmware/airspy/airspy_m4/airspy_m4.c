@@ -1,6 +1,7 @@
 /*
  * Copyright 2013-2016 Benjamin Vernoux <bvernoux@airspy.com>
  * Copyright 2015 Ian Gilmour <ian@sdrsharp.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of AirSpy.
  *
@@ -78,6 +79,7 @@ volatile int use_packing = 0;
 volatile uint32_t *usb_bulk_buffer_offset = &cm4_data_share;
 volatile uint32_t *usb_bulk_buffer_length = ((&cm4_data_share)+1);
 volatile uint32_t *last_offset_m0 = ((&cm4_data_share)+2);
+volatile uint32_t *dma_block_count = ((&cm4_data_share)+3); /* read by M0 sweep mode */
 
 uint8_t* const usb_bulk_buffer = (uint8_t*)USB_BULK_BUFFER_START;
 
@@ -180,6 +182,7 @@ static __inline__ void clr_usb_buffer_offset(void)
   
   last_offset_m4 = 0;
   *last_offset_m0 = 0;
+  *dma_block_count = 0;
 }
 
 static __inline__ uint32_t get_start_stop_adchs(void)
@@ -336,6 +339,8 @@ void dma_isr(void)
     else
     {
         set_usb_buffer_offset( inc_mask_usb_buffer_offset(get_usb_buffer_offset(), USB_DATA_TRANSFER_SIZE_BYTE) );
+        /* After the offset, so the M0 never sees a new count with the old offset */
+        (*dma_block_count)++;
         signal_sev();
     }
   }

@@ -3,6 +3,7 @@
  *
  * Copyright 2013 Youssef Touil <youssef@airspy.com>
  * Copyright 2014-2016 Benjamin Vernoux <bvernoux@airspy.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -371,6 +372,31 @@ void airspy_r820t_write_single(r820t_priv_t *priv, uint8_t reg, uint8_t val)
   priv->regs[reg - REG_SHADOW_START] = val;
 }
 
+/* write n consecutive registers starting at reg in one transaction, skipped if all cached values match */
+static void r820t_write_burst(r820t_priv_t *priv, uint8_t reg, const uint8_t *val, uint8_t n)
+{
+  uint8_t i;
+  uint8_t same = 1;
+
+  for (i = 0; i < n; i++)
+    if (priv->regs[reg - REG_SHADOW_START + i] != val[i])
+      same = 0;
+  if (same)
+    return;
+
+  if(r820t_is_power_enabled() == true)
+  {
+    i2c1_tx_start();
+    i2c1_tx_byte(R820T_I2C_ADDR | I2C_WRITE);
+    i2c1_tx_byte(reg);
+    for (i = 0; i < n; i++)
+      i2c1_tx_byte(val[i]);
+    i2c1_stop();
+  }
+  for (i = 0; i < n; i++)
+    priv->regs[reg - REG_SHADOW_START + i] = val[i];
+}
+
 /* read single register */
 uint8_t airspy_r820t_read_single(r820t_priv_t *priv, uint8_t reg)
 {
@@ -542,13 +568,13 @@ int r820t_set_pll(r820t_priv_t *priv, uint32_t freq)
   if(rc < 0)
     return rc;
 
-  /* Set the integer part of the PLL */
-  rc = r820t_write_reg(priv, 0x14, (uint8_t) (ni + (si << 6)));
-  if(rc < 0)
-    return rc;
-
   if (sdm == 0)
   {
+    /* Set the integer part of the PLL */
+    rc = r820t_write_reg(priv, 0x14, (uint8_t) (ni + (si << 6)));
+    if(rc < 0)
+      return rc;
+
     /* Disable SDM */
     rc = r820t_write_reg_mask(priv, 0x12, 0x08, 0x08);
     if(rc < 0)
@@ -556,14 +582,15 @@ int r820t_set_pll(r820t_priv_t *priv, uint32_t freq)
   }
   else
   {
-	/* Write SDM */
-    rc = r820t_write_reg(priv, 0x15, (uint8_t)(sdm & 0xff));
-    if (rc < 0)
-      return rc;
-
-    rc = r820t_write_reg(priv, 0x16, (uint8_t)(sdm >> 8));
-    if (rc < 0)
-      return rc;
+    /* Integer part (0x14) and SDM (0x15, 0x16): same values and order as three single writes,
+     * but one I2C transaction (~0.13 ms less per retune; matters for firmware sweep mode) */
+    {
+      uint8_t pll[3];
+      pll[0] = (uint8_t) (ni + (si << 6));
+      pll[1] = (uint8_t)(sdm & 0xff);
+      pll[2] = (uint8_t)(sdm >> 8);
+      r820t_write_burst(priv, 0x14, pll, 3);
+    }
 
     /* Enable SDM */
     rc = r820t_write_reg_mask(priv, 0x12, 0x00, 0x08);

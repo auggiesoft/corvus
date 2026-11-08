@@ -1,5 +1,6 @@
 /*
  * Copyright 2013-2016 Benjamin Vernoux <bvernoux@airspy.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of AirSpy.
  *
@@ -68,6 +69,10 @@ typedef enum
   AIRSPY_SET_PACKING                = 26,
   AIRSPY_SPIFLASH_ERASE_SECTOR      = AIRSPY_CMD_MAX
 } airspy_vendor_request;
+
+/* Sweep mode (Corvus extension, see airspy_m0/sweep.h). Same numbers on every Corvus board. */
+#define AIRSPY_SWEEP_START (0x70) /* OUT data stage: sweep_params_t (16 bytes) */
+#define AIRSPY_SWEEP_STOP  (0x71)
 
 typedef enum
 {

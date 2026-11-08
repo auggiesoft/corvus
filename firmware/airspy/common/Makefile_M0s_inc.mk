@@ -132,8 +132,9 @@ FORCE:
 .PHONY: FORCE images clean
 
 # Anything that depends on FORCE will be considered out-of-date
-%.hdr: FORCE
-	echo Creating $@
-	python ../scripts/airspy_fw-version.py ./$@
+# Corvus: the version headers are committed static files (airspy_m0/airspy_m0.hdr, airspy_m0s/airspy_m0s.hdr),
+# so the build needs no Python or git. The sweep host library recognises Corvus firmware by "-sweepN" in it.
+%.hdr:
+	@echo "$@ is missing: it is a committed static file in Corvus" && false
 
 -include $(OBJ:.o=.d)

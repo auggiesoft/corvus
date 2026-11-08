@@ -1,5 +1,6 @@
 /*
  * Copyright 2012 Jared Boone
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of AirSpy (based on HackRF project).
  *
@@ -35,7 +36,7 @@
 usb_device_t* usb_device_usb0 = 0;
 
 //__attribute__ ((section(".bss_aligned")))
-usb_queue_head_t usb_qh[12] ATTR_ALIGNED(2048);
+usb_queue_head_t usb_qh[12] ATTR_ALIGNED(2048) __attribute__ ((section(".usb_qh")));
 
 #define USB_QH_INDEX(endpoint_address) (((endpoint_address & 0xF) * 2) + ((endpoint_address >> 7) & 1))
 
@@ -483,6 +484,14 @@ void usb_device_init(
 
     // Set interrupt threshold interval to 0
     USB0_USBCMD_D &= ~USB0_USBCMD_D_ITC_MASK;
+
+    // usb_qh lives in a NOLOAD section (not zeroed by startup code): clear it first
+    {
+      uint32_t i;
+      volatile uint32_t* p = (volatile uint32_t*)usb_qh;
+      for (i = 0; i < sizeof(usb_qh) / 4; i++)
+        p[i] = 0;
+    }
 
     // Configure endpoint list address
     USB0_ENDPOINTLISTADDR = (uint32_t)usb_qh;

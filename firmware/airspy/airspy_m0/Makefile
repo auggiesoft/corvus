@@ -2,6 +2,7 @@
 #
 # Copyright 2012 Jared Boone <jared@sharebrained.com>
 # Copyright 2013-2016 Benjamin Vernoux <bvernoux@airspy.com>
+# Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
 #
 # This file is part of AirSpy (based on HackRF project).
 #
@@ -25,6 +26,7 @@ BINARY = airspy_m0
 
 SRC = $(BINARY).c\
 	airspy_rx.c \
+	sweep.c \
 	airspy_usb_req.c \
 	usb_descriptor.c \
 	usb_device.c \

@@ -4,6 +4,7 @@
  * Copyright 2012 Michael Ossmann <mike@ossmann.com>
  * Copyright 2012 Jared Boone <jared@sharebrained.com>
  * Copyright 2013-2016 Benjamin Vernoux <bvernoux@airspy.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This library is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -33,7 +34,11 @@ MEMORY
 	ram_ahb1_spare    (rwx) : ORIGIN = 0x20001000, LENGTH =  3K
 	ram_ahb1_m4_share (rwx) : ORIGIN = 0x20001C00, LENGTH =  1K
 	ram_ahb1_adchs (rwx)    : ORIGIN = 0x20002000, LENGTH =  4K
-	ram_ahb1_m0_share (rwx) : ORIGIN = 0x20003000, LENGTH =  4K
+	ram_ahb1_m0_share (rwx) : ORIGIN = 0x20003000, LENGTH =  2K
+	/* Sweep build: upper half of the M0 share bank holds the 2KB-aligned USB endpoint queue
+	 * heads, which otherwise force .bss in ram_ahb2 onto a 2KB boundary and leave no room
+	 * for new M0 code. Ends exactly where the USB bulk buffer starts (0x20004000). */
+	ram_ahb1_usb_qh (rwx)   : ORIGIN = 0x20003800, LENGTH =  2K
 
 	/* Removed 32K of AHB SRAM for USB buffer. Straddles two blocks of RAM
 	 * to get performance benefit of having two USB buffers addressable
@@ -54,6 +59,14 @@ cm0s_exec_baseaddr = ORIGIN(ram_local_m0sub);	/* Used by M4 to load code from M4
 
 conf_data_share = ORIGIN(ram_ahb1_spare);	/* M4/M0 conf data shared */
 conf_data_share_size = LENGTH(ram_ahb1_spare);	/* M4/M0 conf data shared size */
+
+/* USB endpoint queue heads (common/usb.c). NOLOAD: not part of the M0 image, zeroed in usb_device_init(). */
+SECTIONS
+{
+	.usb_qh (NOLOAD) : {
+		KEEP(*(.usb_qh))
+	} >ram_ahb1_usb_qh
+}
 
 /* Include the common ld script. */
 INCLUDE libopencm3_lpc43xx_m0.ld

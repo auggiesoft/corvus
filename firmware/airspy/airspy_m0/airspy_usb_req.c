@@ -1,6 +1,7 @@
 /*
  * Copyright 2012 Jared Boone
  * Copyright 2013-2016 Benjamin Vernoux <bvernoux@airspy.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of AirSpy (based on HackRF project).
  *
@@ -48,6 +49,7 @@
 #include "r820t.h"
 
 #include "airspy_conf.h"
+#include "sweep.h"
 
 #define ADDR_ALIGN_32BITS (3)
 
@@ -952,10 +954,78 @@ void airspy_usb_req_init(void)
   vendor_request_handler[AIRSPY_SPIFLASH_ERASE_SECTOR] = usb_vendor_request_erase_sector_spiflash;
 }
 
+usb_request_status_t usb_vendor_request_sweep_start(
+usb_endpoint_t* const endpoint,
+const usb_transfer_stage_t stage)
+{
+  if (stage == USB_TRANSFER_STAGE_SETUP)
+  {
+    if (endpoint->setup.length != sizeof(sweep_params_t))
+      return USB_REQUEST_STATUS_STALL;
+    sweep_stop();
+    usb_transfer_schedule_block(endpoint->out, &sweep_params_rx, sizeof(sweep_params_t));
+    return USB_REQUEST_STATUS_OK;
+  } else if (stage == USB_TRANSFER_STAGE_DATA)
+  {
+    /* Only start when streaming and the parameters make sense; otherwise just ack. */
+    if (get_receiver_mode() == RECEIVER_MODE_RX && sweep_params_rx.n_steps > 0 && sweep_params_rx.dwell_blocks > 0)
+      sweep_start();
+    usb_transfer_schedule_ack(endpoint->in);
+    return USB_REQUEST_STATUS_OK;
+  }
+  return USB_REQUEST_STATUS_OK;
+}
+
+usb_request_status_t usb_vendor_request_sweep_stop(
+usb_endpoint_t* const endpoint,
+const usb_transfer_stage_t stage)
+{
+  if (stage == USB_TRANSFER_STAGE_SETUP)
+  {
+    sweep_stop();
+    usb_transfer_schedule_ack(endpoint->in);
+  }
+  return USB_REQUEST_STATUS_OK;
+}
+
+/* Requests that touch the R820T over I2C (or the sample path) would race the M0's own retunes. */
+static int blocked_during_sweep(uint8_t request)
+{
+  switch (request)
+  {
+    case AIRSPY_R820T_WRITE:
+    case AIRSPY_R820T_READ:
+    case AIRSPY_SET_SAMPLERATE:
+    case AIRSPY_SET_FREQ:
+    case AIRSPY_SET_LNA_GAIN:
+    case AIRSPY_SET_MIXER_GAIN:
+    case AIRSPY_SET_VGA_GAIN:
+    case AIRSPY_SET_LNA_AGC:
+    case AIRSPY_SET_MIXER_AGC:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 usb_request_status_t usb_vendor_request(usb_endpoint_t* const endpoint, const usb_transfer_stage_t stage)
 {
   usb_request_status_t status = USB_REQUEST_STATUS_STALL;
-  
+
+  if( endpoint->setup.request == AIRSPY_SWEEP_START )
+    return usb_vendor_request_sweep_start(endpoint, stage);
+  if( endpoint->setup.request == AIRSPY_SWEEP_STOP )
+    return usb_vendor_request_sweep_stop(endpoint, stage);
+  /*
+   * Every libairspy open sends SET_PACKING during device init. A sweep still running then was left by a host
+   * that died without SWEEP_STOP (a live client keeps the interface claimed), so end it rather than STALL
+   * the new client's open. Sweep clients never change packing mid-sweep (sweep mode requires it off).
+   */
+  if( endpoint->setup.request == AIRSPY_SET_PACKING && stage == USB_TRANSFER_STAGE_SETUP && sweep_is_active() )
+    sweep_stop();
+  if( sweep_is_active() && blocked_during_sweep(endpoint->setup.request) )
+    return (stage == USB_TRANSFER_STAGE_SETUP) ? USB_REQUEST_STATUS_STALL : USB_REQUEST_STATUS_OK;
+
   if( endpoint->setup.request <= AIRSPY_CMD_MAX )
   {
     usb_request_handler_fn handler = vendor_request_handler[endpoint->setup.request];
