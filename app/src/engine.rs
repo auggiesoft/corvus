@@ -100,6 +100,8 @@ pub struct Live {
     pub stats: Stats,
     clear_peak: bool,
     reset_eq: bool,
+    /// Load and save the learned passband in the cache: on for the radio, off for the simulator and tests.
+    persist_eq: bool,
 }
 
 impl Live {
@@ -125,6 +127,7 @@ impl Live {
             stats: Stats::default(),
             clear_peak: false,
             reset_eq: false,
+            persist_eq: false,
         };
         l.relayout();
         l
@@ -310,8 +313,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(plan: Plan, settings: DspSettings) -> Engine {
-        let live = Arc::new(Mutex::new(Live::new(plan, settings)));
+    /// `persist_eq`: load and save the learned passband in the cache. Off for the simulator and tests, so their
+    /// synthetic passband never replaces the one learned from the radio.
+    pub fn new(plan: Plan, settings: DspSettings, persist_eq: bool) -> Engine {
+        let mut l = Live::new(plan, settings);
+        l.persist_eq = persist_eq;
+        let live = Arc::new(Mutex::new(l));
         let (tx, rx) = sync_channel(512);
         let stop = Arc::new(AtomicBool::new(false));
         let host_drops = Arc::new(AtomicU64::new(0));
@@ -347,6 +354,12 @@ impl Engine {
     /// The sweep was restarted (gain/port change, resume): the step sequence starts over.
     pub fn note_restart(&self) {
         self.live.lock().restarts += 1;
+    }
+
+    /// Switch passband persistence when the source changes (radio: on, simulator: off). The worker saves what the
+    /// radio taught before going off, and reloads from the cache when coming back on.
+    pub fn set_persist_eq(&self, on: bool) {
+        self.live.lock().persist_eq = on;
     }
 
     pub fn clear_peak(&self) {
@@ -442,6 +455,7 @@ struct Worker {
     last_sweep: Option<u32>,
     /// Learned passband shape per (rate, FFT size), on that grid, with the passes behind it.
     eq_store: HashMap<(Rate, usize), (Vec<f32>, u32)>,
+    persist_eq: bool,
     eq_t: f32,
     eq_saved_t: f32,
     row_acc: Option<Vec<f32>>,
@@ -455,18 +469,11 @@ struct Worker {
 
 impl Worker {
     fn new(live: Arc<Mutex<Live>>, rx: Receiver<Vec<u16>>, stop: Arc<AtomicBool>, host_drops: Arc<AtomicU64>, epoch: Instant) -> Worker {
-        let (plan, settings) = {
+        let (plan, settings, persist_eq) = {
             let l = live.lock();
-            (l.plan.clone(), l.settings)
+            (l.plan.clone(), l.settings, l.persist_eq)
         };
-        let mut eq_store = HashMap::new();
-        for rate in [Rate::M10, Rate::M12] {
-            for nfft in dsp::NFFTS {
-                if let Some(v) = load_eq(rate, nfft) {
-                    eq_store.insert((rate, nfft), (v, 10));
-                }
-            }
-        }
+        let eq_store = if persist_eq { load_eq_store() } else { HashMap::new() };
         Worker {
             dsp: Dsp::new(settings.nfft, plan.rate),
             order: OrderModel::new(&plan),
@@ -493,6 +500,7 @@ impl Worker {
             last_key: None,
             last_sweep: None,
             eq_store,
+            persist_eq,
             eq_t: 0.0,
             eq_saved_t: 0.0,
             row_acc: None,
@@ -533,10 +541,20 @@ impl Worker {
             self.restarts = l.restarts;
             self.reset_sequence(true);
         }
+        if l.persist_eq != self.persist_eq {
+            if self.persist_eq {
+                self.save_eq();
+            }
+            self.persist_eq = l.persist_eq;
+            self.eq_store = if self.persist_eq { load_eq_store() } else { HashMap::new() };
+            self.publish_eq(&mut l);
+        }
         if l.reset_eq {
             l.reset_eq = false;
             self.eq_store.remove(&(l.plan.rate, l.settings.nfft));
-            let _ = std::fs::remove_file(eq_path(l.plan.rate, l.settings.nfft));
+            if self.persist_eq {
+                let _ = std::fs::remove_file(eq_path(l.plan.rate, l.settings.nfft));
+            }
             self.publish_eq(&mut l);
         }
         if l.clear_peak {
@@ -825,6 +843,9 @@ impl Worker {
     }
 
     fn save_eq(&self) {
+        if !self.persist_eq {
+            return;
+        }
         for ((rate, nfft), (eq, passes)) in &self.eq_store {
             if *passes > 0 && eq.iter().any(|v| !v.is_nan()) {
                 let path = eq_path(*rate, *nfft);
@@ -890,6 +911,19 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
     base.join("corvus-sweep").join(name)
 }
 
+/// Every learned passband in the cache, counted as 10 passes so new data can still move it.
+fn load_eq_store() -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
+    let mut store = HashMap::new();
+    for rate in [Rate::M10, Rate::M12] {
+        for nfft in dsp::NFFTS {
+            if let Some(v) = load_eq(rate, nfft) {
+                store.insert((rate, nfft), (v, 10));
+            }
+        }
+    }
+    store
+}
+
 fn load_eq(rate: Rate, nfft: usize) -> Option<Vec<f32>> {
     let bytes = std::fs::read(eq_path(rate, nfft)).ok()?;
     let v: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
@@ -916,7 +950,7 @@ mod tests {
     #[test]
     fn worker_stitches_steps_and_counts_passes() {
         let plan = Plan::new(400.0, 440.0, 8.0, 1, 0, 2, Order::Ascending, Rate::M10);
-        let eng = Engine::new(plan.clone(), DspSettings { nfft: 2048, avg_alpha: 0.0, eq_on: false, wf_rate: 1000.0 });
+        let eng = Engine::new(plan.clone(), DspSettings { nfft: 2048, avg_alpha: 0.0, eq_on: false, wf_rate: 1000.0 }, false);
         let sink = eng.sink();
         let mut cnt = 0;
         for sweep in 1..=3u32 {
@@ -949,7 +983,7 @@ mod tests {
         let fastest = Plan::new(24.0, 1800.0, 10.0, 1, 0, 2, Order::VcoContinuous, Rate::M12);
         let quality = Plan::new(24.0, 1800.0, 8.0, 4, 1, 3, Order::VcoContinuous, Rate::M12);
         let bursts = Plan::new(24.0, 1800.0, 10.0, 4, 0, 2, Order::VcoContinuous, Rate::M12);
-        let eng = Engine::new(fastest.clone(), DspSettings { nfft: 2048, avg_alpha: 0.0, eq_on: false, wf_rate: 20.0 });
+        let eng = Engine::new(fastest.clone(), DspSettings { nfft: 2048, avg_alpha: 0.0, eq_on: false, wf_rate: 20.0 }, false);
         let sim = Sim::start(eng.sink(), fastest.clone(), RxSettings { port: 0, gain: Gain::Linearity(10) });
         std::thread::sleep(Duration::from_millis(500));
         for p in [&quality, &fastest, &bursts, &fastest, &quality, &bursts] {

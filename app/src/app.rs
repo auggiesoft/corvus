@@ -403,7 +403,7 @@ impl App {
             cfg.fps = 60;
         }
         let plan = cfg.plan();
-        let engine = Engine::new(plan.clone(), cfg.dsp());
+        let engine = Engine::new(plan.clone(), cfg.dsp(), !opts.sim);
         let rx = cfg.rx();
         let src = if opts.sim {
             Src::Sim(Sim::start(engine.sink(), plan.clone(), rx))
@@ -578,6 +578,7 @@ impl App {
         self.src = Src::Offline(String::new());
         self.src = open_device(&self.lib, self.serial, &self.engine, &self.applied, self.applied_rx);
         if let Src::Device(_) = self.src {
+            self.engine.set_persist_eq(true);
             self.engine.note_restart();
             self.running = true;
             self.toast("RFOne connected", false);
@@ -585,6 +586,7 @@ impl App {
     }
 
     fn use_sim(&mut self) {
+        self.engine.set_persist_eq(false);
         self.src = Src::Sim(Sim::start(self.engine.sink(), self.applied.clone(), self.applied_rx));
         self.engine.note_restart();
         self.running = true;
@@ -1897,7 +1899,7 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
         o(&mut cfg);
     }
     let plan = cfg.plan();
-    let engine = Engine::new(plan.clone(), cfg.dsp());
+    let engine = Engine::new(plan.clone(), cfg.dsp(), !opts.sim);
     let src = if opts.sim { Src::Sim(Sim::start(engine.sink(), plan.clone(), cfg.rx())) } else { open_device(&opts.lib, opts.serial, &engine, &plan, cfg.rx()) };
     match &src {
         Src::Offline(e) => return Err(e.clone()),
