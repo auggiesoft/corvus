@@ -1,0 +1,17 @@
+# Rust
+target/
+
+# build scratch, downloads and outputs
+firmware/build/dl/
+firmware/build/work/
+firmware/build/out/
+host/build/work/
+host/build/out/
+
+# CSV exports and snapshots written by Corvus Sweep when run from the repo
+captures/
+
+# python
+.venv/
+__pycache__/
+*.pyc

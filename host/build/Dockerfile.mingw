@@ -1,0 +1,6 @@
+# libhydrasdr Windows x64 cross-build with MinGW-w64. Upstream CI builds with MSVC; MinGW is a
+# supported path in upstream CMake (static winpthread, libgcc). libusb comes from Fedora's
+# mingw64-libusbx package instead of a downloaded binary.
+FROM fedora:42
+RUN dnf install -y -q mingw64-gcc mingw64-libusbx mingw64-winpthreads-static cmake make \
+ && dnf clean all

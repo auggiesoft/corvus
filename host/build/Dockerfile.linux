@@ -1,0 +1,5 @@
+# libhydrasdr (with the Corvus sweep API) Linux build, mirroring upstream CI's ubuntu-24.04 job deps.
+FROM ubuntu:24.04
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends build-essential cmake pkg-config libusb-1.0-0-dev \
+ && rm -rf /var/lib/apt/lists/*
