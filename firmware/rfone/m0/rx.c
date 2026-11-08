@@ -1,6 +1,7 @@
 /*
  * Copyright 2012 Jared Boone
  * Copyright 2013-2024 Benjamin Vernoux <bvernoux@hydrasdr.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of HydraSDR (based on HackRF project).
  *
@@ -30,6 +31,7 @@
 #include "usb_req.h"
 #include "hydrasdr_commands.h"
 #include "r82x.h"
+#include "sweep.h"
 
 extern usb_endpoint_t usb_endpoint_bulk_in;
 
@@ -37,6 +39,7 @@ static volatile receiver_mode_t receiver_mode = RECEIVER_MODE_OFF;
 
 void set_receiver_mode(const receiver_mode_t new_receiver_mode)
 {
+  sweep_stop();
   usb_streaming_disable();
 
   if( new_receiver_mode == RECEIVER_MODE_RX )

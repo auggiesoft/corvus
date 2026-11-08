@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2024 Benjamin Vernoux <bvernoux@hydrasdr.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of HydraSDR.
  *
@@ -69,6 +70,11 @@ typedef enum
 	HYDRASDR_SPIFLASH_ERASE_SECTOR      = 27,
 	HYDRASDR_SET_RF_PORT                = HYDRASDR_CMD_MAX
 } hydrasdr_vendor_request;
+
+/* Sweep mode (custom extension, see m0/sweep.h). Kept clear of the 29..33 range the host
+ * library already uses for newer upstream commands. */
+#define HYDRASDR_SWEEP_START (0x70) /* OUT data stage: sweep_params_t (12 bytes) */
+#define HYDRASDR_SWEEP_STOP  (0x71)
 
 typedef enum
 {

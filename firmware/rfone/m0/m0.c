@@ -2,6 +2,7 @@
  * Copyright 2012 Jared Boone
  * Copyright 2015 Ian Gilmour <ian@sdrsharp.com>
  * Copyright 2013-2024 Benjamin Vernoux <bvernoux@hydrasdr.com>
+ * Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
  *
  * This file is part of HydraSDR (based on AirSpy/HackRF project).
  *
@@ -49,6 +50,7 @@
 #include "hydrasdr_commands.h"
 #include "rx.h"
 #include "r82x.h"
+#include "sweep.h"
 #include "m0.hdr"
 
 extern uint32_t cm4_data_share; /* defined in linker script */
@@ -59,6 +61,7 @@ volatile unsigned int phase = 0;
 volatile uint32_t *usb_bulk_buffer_offset = (&cm4_data_share);
 volatile uint32_t *usb_bulk_buffer_length = ((&cm4_data_share)+1);
 volatile uint32_t *last_offset_m0 = ((&cm4_data_share)+2);
+volatile uint32_t *dma_block_count = ((&cm4_data_share)+3); /* incremented by M4 per completed DMA block */
 
 volatile mcore_t *start_adchs = (mcore_t *)(&cm0_data_share);
 volatile mcore_t *set_samplerate = (mcore_t *)((&cm0_data_share)+1);
@@ -232,6 +235,12 @@ int main(void)
   while(true)
   {
     signal_wfe();
+
+    if(sweep_is_active())
+    {
+      sweep_poll();
+      continue;
+    }
 
     uint32_t offset = get_usb_buffer_offset();
     uint32_t length = get_usb_buffer_length();

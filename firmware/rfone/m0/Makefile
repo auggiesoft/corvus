@@ -2,6 +2,7 @@
 #
 # Copyright 2012 Jared Boone <jared@sharebrained.com>
 # Copyright 2013-2024 Benjamin Vernoux <bvernoux@hydrasdr.com>
+# Modified 2026 by Auggie <auggie@auggiesoft.com> for Corvus (firmware sweep mode).
 #
 # This file is part of HydraSDR (based on HackRF project).
 #
@@ -25,6 +26,7 @@ BINARY = m0
 
 SRC = m0.c\
 	rx.c \
+	sweep.c \
 	usb_req.c \
 	usb_descriptor.c \
 	usb_device.c \
