@@ -329,7 +329,7 @@ impl Engine {
     }
 
     pub fn sink(&self) -> Sink {
-        Sink { tx: self.tx.clone(), host_drops: self.host_drops.clone() }
+        Sink { tx: self.tx.clone(), host_drops: self.host_drops.clone(), host: None }
     }
 
     pub fn now(&self) -> f32 {
@@ -614,7 +614,8 @@ impl Worker {
                 Block::Valid(t) => t,
             };
             let p = &self.plan;
-            let want = p.f0.wrapping_add(p.step_hz.wrapping_mul(t.step as u32));
+            // u32 like the tags (the HackRF's 6 GHz wraps; both sides wrap the same way)
+            let want = (p.f0 as u32).wrapping_add(p.step_hz.wrapping_mul(t.step as u32));
             let fits = t.step < p.n_steps && t.freq_hz == want;
             if self.settling && self.settle_dropped < 256 && !(fits && t.block == 0 && self.order.seq.first() == Some(&t.step)) {
                 self.settle_dropped += 1;
@@ -639,13 +640,15 @@ impl Worker {
                 self.acc.iter_mut().for_each(|a| *a = 0.0);
                 self.acc_n = 0;
                 self.acc_done = false;
-                self.acc_lock = t.lock_polls;
+                self.acc_lock = if self.plan.rate.complex() { 0 } else { t.lock_polls };
                 self.acc_dma = t.dma_count;
             }
             if self.acc_done {
                 continue;
             }
-            self.dsp.power(w, self.range.clone(), &mut self.scratch);
+            // HackRF blocks carry their slice (below or above the LO) in the lock field; see hackrf.rs
+            let side = if self.plan.rate.complex() { (t.lock_polls & 1) as u8 } else { 0 };
+            self.dsp.power(w, self.range.clone(), &mut self.scratch, side);
             for (a, s) in self.acc.iter_mut().zip(&self.scratch) {
                 *a += s;
             }
@@ -908,6 +911,7 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
         Rate::M10 => format!("passband-eq-{nfft}.f32"),
         Rate::M12 => format!("passband-eq-12msps-{nfft}.f32"),
         Rate::M6 => format!("passband-eq-6msps-{nfft}.f32"),
+        Rate::H20 => format!("passband-eq-20msps-iq-{nfft}.f32"),
     };
     base.join("corvus-sweep").join(format!("{}{name}", crate::hydra::board().cache_prefix()))
 }
@@ -915,7 +919,7 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
 /// Every learned passband in the cache, counted as 10 passes so new data can still move it.
 fn load_eq_store() -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
     let mut store = HashMap::new();
-    for rate in [Rate::M10, Rate::M12, Rate::M6] {
+    for rate in [Rate::M10, Rate::M12, Rate::M6, Rate::H20] {
         for nfft in dsp::NFFTS {
             if let Some(v) = load_eq(rate, nfft) {
                 store.insert((rate, nfft), (v, 10));
@@ -999,6 +1003,27 @@ mod tests {
         }
         let l = eng.live.lock();
         assert!(l.stats.steps > 500, "the sweep kept running ({} steps)", l.stats.steps);
+        assert_eq!((l.stats.gaps, l.stats.misfiled, l.stats.torn), (0, 0, 0));
+    }
+
+    #[test]
+    fn hackrf_interleaved_slices_stitch_without_gaps() {
+        use crate::hydra::{Gain, RxSettings};
+        use crate::sim::Sim;
+        // 1-6000 MHz crosses 4.29 GHz, where the 32-bit tag frequencies wrap
+        let wide = Plan::new(1.0, 6000.0, 5.0, 1, 0, 0, Order::Interleaved, Rate::H20);
+        let narrow = Plan::new(2400.0, 2500.0, 5.0, 2, 0, 0, Order::Interleaved, Rate::H20);
+        let eng = Engine::new(wide.clone(), DspSettings { nfft: 1024, avg_alpha: 0.0, eq_on: false, wf_rate: 20.0 }, false);
+        let sim = Sim::start(eng.sink(), wide.clone(), RxSettings { port: 0, gain: Gain::Linearity(10) });
+        std::thread::sleep(Duration::from_millis(1200));
+        for p in [&narrow, &wide] {
+            eng.set_plan(p.clone());
+            sim.sweep(p);
+            std::thread::sleep(Duration::from_millis(900));
+        }
+        let l = eng.live.lock();
+        assert!(l.stats.steps > 1500, "the sweep kept running ({} steps)", l.stats.steps);
+        assert!(l.stats.passes >= 1, "a 1-6000 MHz pass completed");
         assert_eq!((l.stats.gaps, l.stats.misfiled, l.stats.torn), (0, 0, 0));
     }
 }

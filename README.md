@@ -1,7 +1,7 @@
 # Corvus
 
 Firmware sweep mode and a live wideband spectrum analyser for the HydraSDR RFOne, the Airspy R2 and
-the Airspy Mini.
+the Airspy Mini, and the same analyser for the HackRF One on its stock firmware.
 
 The board retunes itself and streams only blocks captured after the tuner's PLL has locked, each
 tagged with the step it belongs to. On the host, Corvus Sweep stitches those steps into one seamless
@@ -13,10 +13,16 @@ spectrum: on the RFOne, **24–1800 MHz about five times a second (8.6 GHz/s), l
 | HydraSDR RFOne | `firmware/rfone/`, `v1.0.2-sweep5` | 12 MSPS (or 10) | up to 10 MHz | 8.6 GHz/s, ~5 passes/s | `--board rfone` (default) |
 | Airspy R2 | `firmware/airspy/`, `…-sweep5` | 10 MSPS | up to 9 MHz | 6.5 GHz/s, ~3.65 passes/s | `--board airspy` |
 | Airspy Mini | the same image as the R2 | 6 MSPS | up to 4 MHz | 2.9 GHz/s, ~1.6 passes/s | `--board mini` |
+| HackRF One | **stock** (its own sweep mode, no flashing) | 20 MSPS IQ | 5 MHz slices | 8.1 GHz/s, ~4.6 passes/s (1–6000 MHz: 1.36) | `--board hackrf` |
 
-All three speak the same sweep protocol, and the same API is added to their host libraries
-(libhydrasdr for the RFOne, libairspy for the Airspys). The R2/Mini image detects which board it's on
-at boot. For comparison, the Mini's stock firmware driven from the PC managed 0.2–0.4 GHz/s.
+The three Corvus boards speak the same sweep protocol, and the same API is added to their host
+libraries (libhydrasdr for the RFOne, libairspy for the Airspys). The R2/Mini image detects which board
+it's on at boot. The HackRF already has a firmware sweep, so Corvus Sweep drives it through the
+system libhackrf as it is, from 1 MHz to 6 GHz.
+
+**Stock firmware works too, just slower.** On an RFOne or Airspy without the Corvus firmware, Corvus
+Sweep retunes the board from the PC step by step: about 30–60 steps a second (0.1–0.6 GHz/s), roughly
+15–20× slower than the firmware sweep, with the same display and integrity checks.
 
 ![Corvus Sweep on the full 24–1800 MHz range, running on its simulator](docs/corvus-sweep.png)
 
@@ -49,12 +55,15 @@ cargo run --release -- --sim
 
 With a board (everything builds in Docker):
 
-| | RFOne | Airspy R2 or Mini |
-|---|---|---|
-| 1. Build the library | `host/build/build.sh linux` | `host/build/build.sh airspy-linux` |
-| 2. Build the firmware | `firmware/build/build.sh rfone` | `firmware/build/build.sh airspy` |
-| 3. Flash it | [firmware/README.md](firmware/README.md#flashing) | the same section, with the airspy tools |
-| 4. Run Corvus Sweep (in `app/`) | `cargo run --release` | `cargo run --release -- --board airspy` (R2) or `--board mini` |
+| | RFOne | Airspy R2 or Mini | HackRF One |
+|---|---|---|---|
+| 1. Build the library | `host/build/build.sh linux` | `host/build/build.sh airspy-linux` | install libhackrf (your distribution's `hackrf` package) |
+| 2. Build the firmware | `firmware/build/build.sh rfone` | `firmware/build/build.sh airspy` | not needed: stock firmware |
+| 3. Flash it | [firmware/README.md](firmware/README.md#flashing) | the same section, with the airspy tools | not needed |
+| 4. Run Corvus Sweep (in `app/`) | `cargo run --release` | `cargo run --release -- --board airspy` (R2) or `--board mini` | `cargo run --release -- --board hackrf` |
+
+Steps 2–3 are optional for the RFOne and the Airspys: on stock firmware Corvus Sweep falls back to the
+slower PC-driven sweep.
 
 **Back up the board's flash before step 3**, and keep the file. The firmware README has the commands,
 and how to recover a board if a flash goes wrong (that means opening the case).

@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The R82x boards' tuning range (the HackRF's is wider: see `Rate::f_range`).
 pub const F_MIN_HZ: f64 = 24e6;
 pub const F_MAX_HZ: f64 = 1800e6;
 /// Samples per DMA block, the unit of the firmware's block counter.
@@ -22,6 +23,9 @@ pub enum Rate {
     /// Airspy Mini: 12 MSPS real, IF 3 MHz, 683 µs blocks. Flat ±2 dB over −2.7…+2.2 MHz (measured on one
     /// Mini with a carrier); a carrier 3.25–4 MHz out folds back at about −20 dB.
     M6,
+    /// HackRF One: 20 MSPS complex (8-bit IQ) in its stock firmware sweep. Each tune yields two 5 MHz
+    /// slices, 7.5 MHz either side of its LO's 0 Hz, which the app treats as two steps of a 5 MHz grid.
+    H20,
 }
 
 impl Rate {
@@ -31,16 +35,34 @@ impl Rate {
             Rate::M10 => 10,
             Rate::M12 => 12,
             Rate::M6 => 6,
+            Rate::H20 => 20,
         }
     }
 
+    /// Sample rate of the raw block: real ADC samples for the R82x boards, complex IQ for the HackRF.
     pub fn adc_hz(self) -> f64 {
-        2e6 * self.msps() as f64
+        match self {
+            Rate::H20 => 20e6,
+            _ => 2e6 * self.msps() as f64,
+        }
     }
 
-    /// R82x IF; LO = RF + IF.
+    /// Complex (IQ) samples rather than real ones.
+    pub fn complex(self) -> bool {
+        self == Rate::H20
+    }
+
+    /// R82x IF; LO = RF + IF. Zero for the HackRF (zero-IF, complex).
     pub fn if_hz(self) -> f64 {
-        self.adc_hz() / 4.0
+        if self.complex() { 0.0 } else { self.adc_hz() / 4.0 }
+    }
+
+    /// The tuning range sweeps can use.
+    pub fn f_range(self) -> (f64, f64) {
+        match self {
+            Rate::H20 => (1e6, 6000e6),
+            _ => (F_MIN_HZ, F_MAX_HZ),
+        }
     }
 
     /// One DMA block: the tick of the device's block counter.
@@ -54,6 +76,7 @@ impl Rate {
             Rate::M10 => 9.3e6,
             Rate::M12 => 10.0e6,
             Rate::M6 => 4.4e6,
+            Rate::H20 => 5.0e6,
         }
     }
 
@@ -63,6 +86,7 @@ impl Rate {
             Rate::M10 => &[(4.0, "4"), (6.0, "6"), (8.0, "8"), (9.0, "9 MHz")],
             Rate::M12 => &[(4.0, "4"), (6.0, "6"), (8.0, "8"), (10.0, "10 MHz")],
             Rate::M6 => &[(2.0, "2"), (3.0, "3"), (4.0, "4 MHz")],
+            Rate::H20 => &[(5.0, "5 MHz")],
         }
     }
 
@@ -71,6 +95,7 @@ impl Rate {
             Rate::M10 => 8.0,
             Rate::M12 => 10.0,
             Rate::M6 => 4.0,
+            Rate::H20 => 5.0,
         }
     }
 }
@@ -81,6 +106,9 @@ pub enum Order {
     /// Firmware sweep4+ flag 0x01: steps grouped by tuner VCO divider, odd groups walked backwards,
     /// every pass reversed. Avoids ~10 ms per divider switch and the wrap.
     VcoContinuous,
+    /// The HackRF's stock sweep: tunes 5 MHz then 15 MHz past each 20 MHz base, each tune giving the
+    /// slices below and above its LO, so the 5 MHz steps arrive as 0, 2, 1, 3, 4, 6, 5, 7, ...
+    Interleaved,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +117,7 @@ pub struct Plan {
     pub start_hz: f64,
     pub stop_hz: f64,
     /// Centre of step 0, centre spacing, number of steps (what the firmware gets).
-    pub f0: u32,
+    pub f0: u64,
     pub step_hz: u32,
     pub n_steps: u16,
     /// Width of each step's slice in the stitched spectrum (= step, or the span for a one-step plan).
@@ -105,11 +133,15 @@ pub struct Plan {
 impl Plan {
     #[allow(clippy::too_many_arguments)]
     pub fn new(start_mhz: f64, stop_mhz: f64, step_mhz: f64, dwell: u8, skip: u8, lock_reads: u8, order: Order, rate: Rate) -> Plan {
+        if rate == Rate::H20 {
+            return Plan::hackrf(start_mhz, stop_mhz, dwell);
+        }
+        let (fmin, fmax) = rate.f_range();
         let step = (step_mhz.clamp(1.0, rate.max_window_hz() / 1e6) * 1e6).round();
-        let mut start = (start_mhz * 1e6).clamp(F_MIN_HZ, F_MAX_HZ - 0.2e6);
-        let mut stop = (stop_mhz * 1e6).clamp(F_MIN_HZ + 0.2e6, F_MAX_HZ);
+        let mut start = (start_mhz * 1e6).clamp(fmin, fmax - 0.2e6);
+        let mut stop = (stop_mhz * 1e6).clamp(fmin + 0.2e6, fmax);
         if stop < start + 0.2e6 {
-            stop = (start + 0.2e6).min(F_MAX_HZ);
+            stop = (start + 0.2e6).min(fmax);
             start = stop - 0.2e6;
         }
         let span = stop - start;
@@ -121,14 +153,14 @@ impl Plan {
         };
         // Keep every centre inside the tuner's range; the stitched cover may then start a little lower.
         let last = f0 + (n as f64 - 1.0) * step;
-        if last > F_MAX_HZ {
-            f0 -= last - F_MAX_HZ;
+        if last > fmax {
+            f0 -= last - fmax;
         }
-        f0 = f0.max(F_MIN_HZ);
+        f0 = f0.max(fmin);
         Plan {
             start_hz: start,
             stop_hz: stop,
-            f0: f0.round() as u32,
+            f0: f0.round() as u64,
             step_hz: step as u32,
             n_steps: n.min(u16::MAX as usize) as u16,
             window_hz: window,
@@ -138,6 +170,31 @@ impl Plan {
             lock_timeout: 200,
             order,
             rate,
+        }
+    }
+
+    /// The HackRF's stock sweep grid: whole MHz (the firmware's granularity), 20 MHz bases from the start,
+    /// each covered by two tunes and four 5 MHz slices, so the cover runs from the start to the end of the
+    /// last base (the firmware finishes a base before wrapping).
+    fn hackrf(start_mhz: f64, stop_mhz: f64, dwell: u8) -> Plan {
+        let (fmin, fmax) = Rate::H20.f_range();
+        let lo = (start_mhz.floor() * 1e6).clamp(fmin, fmax - 20e6);
+        let hi = (stop_mhz.ceil() * 1e6).clamp(lo + 20e6, fmax);
+        // usb_api_sweep.c: after a base's second tune (base + 5 MHz) it wraps once that + 20 MHz >= stop
+        let bases = (((hi - lo - 25e6) / 20e6 - 1e-9).ceil().max(0.0)) as usize + 1;
+        Plan {
+            start_hz: lo,
+            stop_hz: hi,
+            f0: (lo + 2.5e6) as u64,
+            step_hz: 5_000_000,
+            n_steps: (4 * bases).min(u16::MAX as usize) as u16,
+            window_hz: 5e6,
+            dwell: dwell.max(1),
+            skip: 0,
+            lock_reads: 0,
+            lock_timeout: 0,
+            order: Order::Interleaved,
+            rate: Rate::H20,
         }
     }
 
@@ -151,6 +208,9 @@ impl Plan {
 
     /// The tuner VCO divider the firmware uses for this step.
     pub fn divider(&self, step: usize) -> u8 {
+        if self.rate.complex() {
+            return 6;
+        }
         vco_divider(self.centre(step), self.rate.if_hz())
     }
 
@@ -162,7 +222,7 @@ impl Plan {
 
     pub fn flags(&self) -> u8 {
         match self.order {
-            Order::Ascending => 0,
+            Order::Ascending | Order::Interleaved => 0,
             Order::VcoContinuous => 0x01,
         }
     }
@@ -171,6 +231,12 @@ impl Plan {
     pub fn sequence(&self) -> Vec<u16> {
         let n = self.n();
         let mut seq: Vec<u16> = (0..n as u16).collect();
+        if self.order == Order::Interleaved {
+            for g in seq.chunks_exact_mut(4) {
+                g.swap(1, 2);
+            }
+            return seq;
+        }
         if self.order == Order::VcoContinuous {
             let mut runs: Vec<(u8, Vec<u16>)> = Vec::new();
             for i in 0..n {
@@ -210,6 +276,9 @@ impl Plan {
     /// Divider changes between consecutively visited steps in one pass, including the wrap in
     /// ascending order: (fast joins, slow crossings). See docs/measurements.md, "Visiting order".
     pub fn divider_transitions(&self) -> (usize, usize) {
+        if self.rate.complex() {
+            return (0, 0);
+        }
         let seq = self.sequence();
         let mut pairs: Vec<(u16, u16)> = seq.windows(2).map(|w| (w[0], w[1])).collect();
         if self.order == Order::Ascending && seq.len() > 1 {
@@ -244,6 +313,9 @@ pub fn vco_divider(rf_hz: f64, if_hz: f64) -> u8 {
 
 /// RF frequencies (Hz) where the tuner switches VCO divider inside 24–1800 MHz (they move with the IF).
 pub fn divider_switches(rate: Rate) -> Vec<f64> {
+    if rate.complex() {
+        return Vec::new();
+    }
     let fi = rate.if_hz();
     let mut out = Vec::new();
     let mut prev = vco_divider(F_MIN_HZ, fi);

@@ -5,7 +5,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 
 use libloading::Library;
@@ -24,6 +24,8 @@ pub enum Board {
     Airspy,
     /// Airspy Mini: the same firmware image as the R2, which picks the Mini's settings at boot.
     Mini,
+    /// HackRF One, with its stock firmware sweep (libhackrf): 1 MHz to 6 GHz.
+    HackRF,
 }
 
 impl Board {
@@ -32,6 +34,7 @@ impl Board {
             "rfone" => Some(Board::RFOne),
             "airspy" | "r2" => Some(Board::Airspy),
             "mini" | "airspy-mini" => Some(Board::Mini),
+            "hackrf" => Some(Board::HackRF),
             _ => None,
         }
     }
@@ -42,6 +45,7 @@ impl Board {
             Board::RFOne => "RFOne",
             Board::Airspy => "Airspy R2",
             Board::Mini => "Airspy Mini",
+            Board::HackRF => "HackRF One",
         }
     }
 
@@ -49,6 +53,7 @@ impl Board {
         match self {
             Board::RFOne => "hydrasdr_",
             Board::Airspy | Board::Mini => "airspy_",
+            Board::HackRF => "hackrf_",
         }
     }
 
@@ -63,6 +68,7 @@ impl Board {
             Board::RFOne => &[Rate::M12, Rate::M10],
             Board::Airspy => &[Rate::M10],
             Board::Mini => &[Rate::M6],
+            Board::HackRF => &[Rate::H20],
         }
     }
 
@@ -71,6 +77,7 @@ impl Board {
         match self {
             Board::RFOne => "libhydrasdr.so.1.1.4",
             Board::Airspy | Board::Mini => "libairspy.so.1.0.10",
+            Board::HackRF => "libhackrf.so.0",
         }
     }
 
@@ -78,6 +85,7 @@ impl Board {
         let dir = match self {
             Board::RFOne => "linux",
             Board::Airspy | Board::Mini => "airspy-linux",
+            Board::HackRF => "hackrf-linux", // not built here: the system libhackrf is used
         };
         format!("../host/build/out/{dir}/{}", self.lib_file())
     }
@@ -86,6 +94,7 @@ impl Board {
         match self {
             Board::RFOne => "libhydrasdr.so.1",
             Board::Airspy | Board::Mini => "libairspy.so.0",
+            Board::HackRF => "libhackrf.so.0",
         }
     }
 
@@ -95,6 +104,7 @@ impl Board {
             Board::RFOne => "",
             Board::Airspy => "airspy-",
             Board::Mini => "airspy-mini-",
+            Board::HackRF => "hackrf-",
         }
     }
 }
@@ -144,7 +154,7 @@ pub struct SweepParams {
 impl From<&Plan> for SweepParams {
     fn from(p: &Plan) -> Self {
         SweepParams {
-            f_start_hz: p.f0,
+            f_start_hz: p.f0 as u32,
             f_step_hz: p.step_hz,
             n_steps: p.n_steps,
             skip_blocks: p.skip,
@@ -230,10 +240,10 @@ pub fn default_lib_path(board: Board) -> PathBuf {
     if let Ok(p) = std::env::var("CORVUS_LIB") {
         return PathBuf::from(p);
     }
-    if let Some(beside) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(board.lib_file()))) {
-        if beside.exists() {
-            return beside;
-        }
+    if let Some(beside) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(board.lib_file())))
+        && beside.exists()
+    {
+        return beside;
     }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join(board.repo_lib());
     if repo.exists() {
@@ -262,10 +272,12 @@ struct Api {
     start_rx: unsafe extern "C" fn(*mut Dev, RxCb, *mut c_void) -> c_int,
     stop_rx: unsafe extern "C" fn(*mut Dev) -> c_int,
     error_name: unsafe extern "C" fn(c_int) -> *const c_char,
-    sweep_supported: unsafe extern "C" fn(*mut Dev) -> c_int,
-    sweep_fw_revision: unsafe extern "C" fn(*mut Dev) -> c_int,
-    sweep_start: unsafe extern "C" fn(*mut Dev, *const SweepParams) -> c_int,
-    sweep_stop: unsafe extern "C" fn(*mut Dev) -> c_int,
+    /// The Corvus sweep API: absent from a stock library (then the sweep is PC-driven).
+    sweep_supported: Option<unsafe extern "C" fn(*mut Dev) -> c_int>,
+    sweep_fw_revision: Option<unsafe extern "C" fn(*mut Dev) -> c_int>,
+    sweep_start: Option<unsafe extern "C" fn(*mut Dev, *const SweepParams) -> c_int>,
+    sweep_stop: Option<unsafe extern "C" fn(*mut Dev) -> c_int>,
+    set_freq: Option<SetFreq>,
 }
 
 impl Api {
@@ -282,6 +294,11 @@ impl Api {
                         board.name()
                     )
                 })?
+            };
+        }
+        macro_rules! opt {
+            ($name:literal) => {
+                unsafe { lib.get(format!("{prefix}{}\0", $name).as_bytes()) }.ok().map(|f| *f)
             };
         }
         Ok(Api {
@@ -302,10 +319,14 @@ impl Api {
             start_rx: sym!("start_rx"),
             stop_rx: sym!("stop_rx"),
             error_name: sym!("error_name"),
-            sweep_supported: sym!("sweep_supported"),
-            sweep_fw_revision: sym!("sweep_fw_revision"),
-            sweep_start: sym!("sweep_start"),
-            sweep_stop: sym!("sweep_stop"),
+            sweep_supported: opt!("sweep_supported"),
+            sweep_fw_revision: opt!("sweep_fw_revision"),
+            sweep_start: opt!("sweep_start"),
+            sweep_stop: opt!("sweep_stop"),
+            set_freq: match board {
+                Board::RFOne => opt!("set_freq").map(SetFreq::U64),
+                _ => opt!("set_freq").map(SetFreq::U32),
+            },
             _lib: lib,
         })
     }
@@ -316,10 +337,12 @@ impl Api {
     }
 }
 
-/// What the RX callback needs: where to send blocks, and a counter for buffers it had to drop.
+/// What the RX callback needs: where to send blocks, a counter for buffers it had to drop, and (for a
+/// PC-driven sweep) the sweeper it tags blocks for.
 pub struct Sink {
     pub tx: SyncSender<Vec<u16>>,
     pub host_drops: Arc<AtomicU64>,
+    pub host: Option<Arc<HostShared>>,
 }
 
 impl Sink {
@@ -331,27 +354,105 @@ impl Sink {
 }
 
 unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
-    // SAFETY: libhydrasdr passes a valid transfer whose ctx is the Sink we gave start_rx, which
+    // SAFETY: the library passes a valid transfer whose ctx is the Sink we gave start_rx, which
     // outlives streaming (stop_rx runs before it is freed).
     unsafe {
         let t = &*t;
         let sink = &*(t.ctx as *const Sink);
         let n = t.sample_count.max(0) as usize;
         let samples = std::slice::from_raw_parts(t.samples as *const u16, n);
-        sink.push(samples.to_vec());
+        match &sink.host {
+            Some(h) => h.on_transfer(samples, sink),
+            None => sink.push(samples.to_vec()),
+        }
     }
     0
 }
 
-/// What a signal handler needs to stop a sweep when the UI can't shut down cleanly: a host that
-/// dies mid-sweep leaves the firmware sweeping, and then hydrasdr_open fails until SWEEP_STOP.
-struct Emergency {
-    sweep_stop: unsafe extern "C" fn(*mut Dev) -> c_int,
-    stop_rx: unsafe extern "C" fn(*mut Dev) -> c_int,
-    dev: usize,
+/// A PC-driven sweep for boards whose firmware has no sweep mode (stock RFOne and Airspy firmware), or
+/// when forced (`--host-sweep`). The sweeper thread retunes with set_freq and then arms the RX callback,
+/// which tags the first whole blocks of the second USB transfer that starts afterwards (the one in flight
+/// may hold samples from before the retune, the next one samples buffered in the board before it) as the
+/// firmware would and passes them on; everything else is dropped. Same tags and visiting order as the
+/// firmware, so the engine can't tell the difference, only that it's slower (a step costs ~2-3 transfers
+/// of 131072 samples, 6.5 ms each at 20 MSPS real).
+pub struct HostShared {
+    state: parking_lot::Mutex<HostState>,
+    cv: parking_lot::Condvar,
+    transfers: AtomicU64,
 }
 
-static EMERGENCY: parking_lot::Mutex<Option<Emergency>> = parking_lot::Mutex::new(None);
+#[derive(Default)]
+struct HostState {
+    armed: bool,
+    accept_from: u64,
+    step: u16,
+    freq_hz: u32,
+    sweep: u32,
+    block: u16,
+    left: u16,
+}
+
+/// Whole transfers skipped after a retune before blocks are taken (see `HostShared`).
+const HOST_SETTLE_TRANSFERS: u64 = 2;
+
+impl HostShared {
+    fn new() -> HostShared {
+        HostShared { state: parking_lot::Mutex::new(HostState::default()), cv: parking_lot::Condvar::new(), transfers: AtomicU64::new(0) }
+    }
+
+    fn on_transfer(&self, samples: &[u16], sink: &Sink) {
+        let idx = self.transfers.fetch_add(1, Ordering::AcqRel);
+        let mut st = self.state.lock();
+        if !st.armed || idx < st.accept_from {
+            return;
+        }
+        let per = (samples.len() / BLOCK_WORDS) as u64;
+        for (i, chunk) in samples.chunks_exact(BLOCK_WORDS).enumerate() {
+            if st.left == 0 {
+                break;
+            }
+            let mut w = chunk.to_vec();
+            let dma = (idx * per + i as u64) as u32;
+            tag_block(&mut w, &Tag { step: st.step, block: st.block, sweep: st.sweep, freq_hz: st.freq_hz, dma_count: dma, lock_polls: 0, lock_timed_out: false });
+            sink.push(w);
+            st.block += 1;
+            st.left -= 1;
+        }
+        if st.left == 0 {
+            st.armed = false;
+            self.cv.notify_all();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetFreq {
+    U64(unsafe extern "C" fn(*mut Dev, u64) -> c_int),
+    U32(unsafe extern "C" fn(*mut Dev, u32) -> c_int),
+}
+
+struct HostSweeper {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// Whether a PC-driven sweep is forced even on sweep firmware (`--host-sweep`, for testing).
+static FORCE_HOST: AtomicBool = AtomicBool::new(false);
+
+pub fn set_force_host_sweep(on: bool) {
+    FORCE_HOST.store(on, Ordering::Relaxed);
+}
+
+/// What a signal handler needs to stop a sweep when the UI can't shut down cleanly: a host that
+/// dies mid-sweep leaves the firmware sweeping, and then hydrasdr_open fails until SWEEP_STOP.
+pub(crate) struct Emergency {
+    pub(crate) sweep_stop: unsafe extern "C" fn(*mut Dev) -> c_int,
+    pub(crate) stop_rx: unsafe extern "C" fn(*mut Dev) -> c_int,
+    pub(crate) dev: usize,
+}
+
+pub(crate) static EMERGENCY: parking_lot::Mutex<Option<Emergency>> = parking_lot::Mutex::new(None);
 
 /// Stop the sweep and the stream of the open device, if any (for signal handlers).
 pub fn emergency_stop() {
@@ -363,7 +464,76 @@ pub fn emergency_stop() {
     }
 }
 
-pub struct Device {
+/// The open board: an R82x board (RFOne or Airspy; firmware or PC-driven sweep) or a HackRF.
+pub enum Device {
+    R82x(R82xDevice),
+    HackRF(crate::hackrf::HackrfDevice),
+}
+
+impl Device {
+    pub fn open(lib_path: &Path, serial: u64, sink: Sink, rx: RxSettings, rate: Rate) -> Result<Device, String> {
+        match board() {
+            Board::HackRF => crate::hackrf::HackrfDevice::open(lib_path, serial, sink, rx).map(Device::HackRF),
+            _ => R82xDevice::open(lib_path, serial, sink, rx, rate).map(Device::R82x),
+        }
+    }
+
+    pub fn version(&self) -> &str {
+        match self {
+            Device::R82x(d) => &d.version,
+            Device::HackRF(d) => &d.version,
+        }
+    }
+
+    pub fn fw_revision(&self) -> i32 {
+        match self {
+            Device::R82x(d) => d.fw_revision,
+            Device::HackRF(_) => 0,
+        }
+    }
+
+    pub fn lib_path(&self) -> &Path {
+        match self {
+            Device::R82x(d) => &d.lib_path,
+            Device::HackRF(d) => &d.lib_path,
+        }
+    }
+
+    /// The PC retunes each step (stock firmware, or forced): much slower than a firmware sweep.
+    pub fn host_driven(&self) -> bool {
+        matches!(self, Device::R82x(d) if d.set_freq.is_some() && d.host_mode)
+    }
+
+    pub fn sweep(&mut self, plan: &Plan) -> Result<(), String> {
+        match self {
+            Device::R82x(d) => d.sweep(plan),
+            Device::HackRF(d) => d.sweep(plan),
+        }
+    }
+
+    pub fn set_rx(&mut self, rx: RxSettings) -> Result<(), String> {
+        match self {
+            Device::R82x(d) => d.set_rx(rx),
+            Device::HackRF(d) => d.set_rx(rx),
+        }
+    }
+
+    pub fn pause(&mut self) {
+        match self {
+            Device::R82x(d) => d.pause(),
+            Device::HackRF(d) => d.pause(),
+        }
+    }
+
+    pub fn resume(&mut self) -> Result<(), String> {
+        match self {
+            Device::R82x(d) => d.resume(),
+            Device::HackRF(d) => d.resume(),
+        }
+    }
+}
+
+pub struct R82xDevice {
     api: Api,
     dev: *mut Dev,
     sink: *mut Sink,
@@ -375,13 +545,21 @@ pub struct Device {
     rx: RxSettings,
     rate: Rate,
     streaming: bool,
+    /// PC-driven sweep (no sweep firmware, or forced).
+    host_mode: bool,
+    set_freq: Option<SetFreq>,
+    host: Option<Arc<HostShared>>,
+    sweeper: Option<HostSweeper>,
+    /// Pass counter of the PC-driven sweep: like the firmware's, it never resets.
+    host_sweep_no: Arc<AtomicU64>,
 }
 
-// SAFETY: the handle is only used from the thread that owns the Device (the UI thread).
-unsafe impl Send for Device {}
+// SAFETY: the handle is only used from the thread that owns the Device (the UI thread), and by the
+// PC-driven sweeper thread for set_freq, which the device stops before anything else touches the stream.
+unsafe impl Send for R82xDevice {}
 
-impl Device {
-    pub fn open(lib_path: &Path, serial: u64, sink: Sink, rx: RxSettings, rate: Rate) -> Result<Device, String> {
+impl R82xDevice {
+    pub fn open(lib_path: &Path, serial: u64, mut sink: Sink, rx: RxSettings, rate: Rate) -> Result<R82xDevice, String> {
         let board = board();
         let api = Api::load(lib_path, board)?;
         let mut dev = std::ptr::null_mut();
@@ -393,9 +571,13 @@ impl Device {
         let mut buf = [0 as c_char; 255];
         unsafe { (api.version_string_read)(dev, buf.as_mut_ptr(), 255) };
         let version = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
-        let supported = unsafe { (api.sweep_supported)(dev) };
-        let fw_revision = unsafe { (api.sweep_fw_revision)(dev) };
-        let mut d = Device {
+        let supported = api.sweep_supported.map(|f| unsafe { f(dev) }).unwrap_or(0);
+        let fw_revision = api.sweep_fw_revision.map(|f| unsafe { f(dev) }).unwrap_or(0);
+        let set_freq = api.set_freq;
+        let host_mode = supported != 1 || FORCE_HOST.load(Ordering::Relaxed);
+        let host = if host_mode { Some(Arc::new(HostShared::new())) } else { None };
+        sink.host = host.clone();
+        let mut d = R82xDevice {
             api,
             dev,
             sink: Box::into_raw(Box::new(sink)),
@@ -407,12 +589,18 @@ impl Device {
             rx,
             rate,
             streaming: false,
+            host_mode,
+            set_freq,
+            host,
+            sweeper: None,
+            host_sweep_no: Arc::new(AtomicU64::new(0)),
         };
-        if supported != 1 {
-            return Err(format!("firmware \"{}\" has no sweep mode (needs the Corvus firmware, \"...-sweepN\"; see firmware/README.md)", d.version));
+        if host_mode && d.set_freq.is_none() {
+            return Err(format!("firmware \"{}\" has no sweep mode and the library has no set_freq", d.version));
         }
         d.configure()?;
-        *EMERGENCY.lock() = Some(Emergency { sweep_stop: d.api.sweep_stop, stop_rx: d.api.stop_rx, dev: d.dev as usize });
+        let (stop_a, stop_b) = (d.api.sweep_stop.unwrap_or(d.api.stop_rx), d.api.stop_rx);
+        *EMERGENCY.lock() = Some(Emergency { sweep_stop: stop_a, stop_rx: stop_b, dev: d.dev as usize });
         Ok(d)
     }
 
@@ -440,7 +628,7 @@ impl Device {
     fn apply_rate(&self) -> Result<(), String> {
         let hz = match self.board {
             Board::RFOne => self.rate.adc_hz() as u32,
-            Board::Airspy | Board::Mini => self.rate.msps() * 1_000_000,
+            _ => self.rate.msps() * 1_000_000,
         };
         let m = self.rate.msps();
         unsafe { self.check(&format!("set_samplerate {m} MSPS ({hz} real)"), (self.api.set_samplerate)(self.dev, hz)) }
@@ -476,9 +664,33 @@ impl Device {
         Ok(())
     }
 
-    /// Start streaming if needed and (re)start the sweep with this plan. A running sweep is replaced
-    /// without a stop.
+    fn stop_sweeper(&mut self) {
+        if let Some(s) = self.sweeper.take() {
+            s.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = &self.host {
+                let mut st = h.state.lock();
+                st.armed = false;
+                h.cv.notify_all();
+            }
+            let _ = s.thread.join();
+        }
+    }
+
+    fn start_sweeper(&mut self, plan: &Plan) {
+        let (Some(set_freq), Some(host)) = (self.set_freq, self.host.clone()) else { return };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (plan, dev, stop2, sweep_no) = (plan.clone(), self.dev as usize, stop.clone(), self.host_sweep_no.clone());
+        let thread = std::thread::Builder::new()
+            .name("corvus-host-sweep".into())
+            .spawn(move || host_sweep(set_freq, dev, plan, host, stop2, sweep_no))
+            .expect("spawn host sweeper");
+        self.sweeper = Some(HostSweeper { stop, thread });
+    }
+
+    /// Start streaming if needed and (re)start the sweep with this plan. A running firmware sweep is
+    /// replaced without a stop.
     pub fn sweep(&mut self, plan: &Plan) -> Result<(), String> {
+        self.stop_sweeper();
         if plan.rate != self.rate {
             // the rate request is refused mid-sweep: stop everything, change it, start again
             self.pause();
@@ -486,19 +698,29 @@ impl Device {
             self.apply_rate()?;
         }
         self.start_stream()?;
-        let p = SweepParams::from(plan);
-        let rc = unsafe { (self.api.sweep_start)(self.dev, &p) };
-        self.check("sweep_start", rc)?;
+        if self.host_mode {
+            self.start_sweeper(plan);
+        } else {
+            let p = SweepParams::from(plan);
+            let f = self.api.sweep_start.ok_or("the library has no sweep_start")?;
+            let rc = unsafe { f(self.dev, &p) };
+            self.check("sweep_start", rc)?;
+        }
         self.plan = Some(plan.clone());
         Ok(())
     }
 
-    /// Tuner, gain and port requests are STALLed while sweeping: stop, change, restart.
+    /// Tuner, gain and port requests are STALLed while the firmware sweeps: stop, change, restart. In a
+    /// PC-driven sweep the sweeper is stopped instead, so its set_freq calls never interleave.
     pub fn set_rx(&mut self, rx: RxSettings) -> Result<(), String> {
         self.rx = rx;
         let sweeping = self.streaming && self.plan.is_some();
         if sweeping {
-            unsafe { (self.api.sweep_stop)(self.dev) };
+            if self.host_mode {
+                self.stop_sweeper();
+            } else if let Some(f) = self.api.sweep_stop {
+                unsafe { f(self.dev) };
+            }
         }
         let r = self.apply_rx();
         if sweeping {
@@ -510,9 +732,12 @@ impl Device {
 
     /// Stop the sweep and the stream (otherwise normal mode keeps streaming 40–48 MB/s of raw samples).
     pub fn pause(&mut self) {
+        self.stop_sweeper();
         if self.streaming {
             unsafe {
-                (self.api.sweep_stop)(self.dev);
+                if let (false, Some(f)) = (self.host_mode, self.api.sweep_stop) {
+                    f(self.dev);
+                }
                 (self.api.stop_rx)(self.dev);
             }
             self.streaming = false;
@@ -527,7 +752,50 @@ impl Device {
     }
 }
 
-impl Drop for Device {
+/// The PC-driven sweep loop: the firmware's visiting order (VCO-continuous passes alternate direction),
+/// the pass counter bumped on every start and every pass.
+fn host_sweep(set_freq: SetFreq, dev: usize, plan: Plan, host: Arc<HostShared>, stop: Arc<AtomicBool>, sweep_no: Arc<AtomicU64>) {
+    let seq = plan.sequence();
+    let vco = plan.order == crate::plan::Order::VcoContinuous;
+    let mut forward = true;
+    let mut sweep = sweep_no.fetch_add(1, Ordering::Relaxed) as u32 + 1;
+    while !stop.load(Ordering::Relaxed) {
+        let pass: Vec<u16> = if forward || !vco { seq.clone() } else { seq.iter().rev().copied().collect() };
+        for &step in &pass {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let centre = plan.centre(step as usize) as u64;
+            unsafe {
+                match set_freq {
+                    SetFreq::U64(f) => f(dev as *mut Dev, centre),
+                    SetFreq::U32(f) => f(dev as *mut Dev, centre as u32),
+                };
+            }
+            {
+                let mut st = host.state.lock();
+                *st = HostState {
+                    armed: true,
+                    accept_from: host.transfers.load(Ordering::Acquire) + HOST_SETTLE_TRANSFERS,
+                    step,
+                    freq_hz: centre as u32,
+                    sweep,
+                    block: 0,
+                    left: plan.dwell as u16,
+                };
+                while st.armed && !stop.load(Ordering::Relaxed) {
+                    host.cv.wait_for(&mut st, std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        if vco {
+            forward = !forward;
+        }
+        sweep = sweep_no.fetch_add(1, Ordering::Relaxed) as u32 + 1;
+    }
+}
+
+impl Drop for R82xDevice {
     fn drop(&mut self) {
         EMERGENCY.lock().take();
         self.pause();

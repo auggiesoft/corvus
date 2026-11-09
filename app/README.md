@@ -28,7 +28,20 @@ libairspy. The R2 runs 10 MSPS only and has one antenna input, so the rate and p
 and profiles with 10 MHz steps use 8 MHz. `--board mini` drives an Airspy Mini: 6 MSPS (12 MHz ADC,
 3 MHz IF), steps of 2–4 MHz, profiles at 4 MHz. Each board's learned passband is cached separately.
 
-Other options: `--board rfone|airspy|mini` (or `CORVUS_BOARD`), `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
+`--board hackrf` drives a HackRF One on its **stock** firmware, through the system libhackrf and the
+same firmware sweep `hackrf_sweep` uses: 20 MSPS complex, tunes 5 and 15 MHz past each 20 MHz base,
+each tune giving the 5 MHz slice below its LO and the one above. The app treats the slices as steps of
+a 5 MHz grid (visited 0, 2, 1, 3, 4, ...), so stitching, peaks, the waterfall and integrity work as for
+the other boards, from 1 MHz to 6 GHz. While it's open, the PortaPack's screen (if one is fitted) is
+turned off, because it redraws the frequency on every retune; the RF amp and the antenna port power
+stay off. Gain presets and the manual sliders map onto the HackRF's LNA (0–40 dB) and VGA (0–62 dB).
+
+**Stock RFOne and Airspy firmware** (no Corvus sweep mode) gets a PC-driven sweep automatically: the
+app retunes with `set_freq`, skips two USB transfers for settling, and tags the next blocks itself, in
+the same order and format as the firmware. It runs at 30–60 steps a second, which the status bar
+explains. `--host-sweep` forces it on Corvus firmware too, for comparison.
+
+Other options: `--board rfone|airspy|mini|hackrf` (or `CORVUS_BOARD`), `--host-sweep`, `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
 `--msps 10|12`, `--step MHZ`, `--bin-khz K`, `--profile NAME`, `--fresh` (ignore saved settings);
 `--help` lists them all. Settings persist between runs via eframe storage
 (`~/.local/share/corvus-sweep/`). The learned passband correction is stored in

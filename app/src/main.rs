@@ -4,6 +4,7 @@
 mod app;
 mod dsp;
 mod engine;
+mod hackrf;
 mod hydra;
 mod plan;
 mod sim;
@@ -53,8 +54,11 @@ fn install_signal_handlers() {
 const USAGE: &str = "\
 corvus-sweep [options]
 
-  --board rfone|airspy|mini  which board (default: env CORVUS_BOARD, else rfone): airspy
-                        is the Airspy R2 (10 MSPS), mini the Airspy Mini (6 MSPS)
+  --board rfone|airspy|mini|hackrf  which board (default: env CORVUS_BOARD, else rfone):
+                        airspy is the Airspy R2 (10 MSPS), mini the Airspy Mini (6 MSPS),
+                        hackrf a HackRF One (stock firmware sweep, 1 MHz to 6 GHz)
+  --host-sweep          RFOne/Airspy: let the PC retune each step even on Corvus firmware
+                        (what stock firmware gets automatically; much slower)
   --sim                 run the built-in simulator instead of the board
   --lib PATH            the board's library with the sweep API (default: env CORVUS_LIB,
                         then one next to this program, then the repo's host/build/out
@@ -91,8 +95,9 @@ fn main() -> eframe::Result {
         let mut val = |name: &str| args.next().unwrap_or_else(|| die(&format!("{name} needs a value")));
         match a.as_str() {
             "--sim" => opts.sim = true,
+            "--host-sweep" => hydra::set_force_host_sweep(true),
             "--lib" => lib = Some(PathBuf::from(val("--lib"))),
-            "--board" => board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini")),
+            "--board" => board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini|hackrf")),
             "--serial" => {
                 let v = val("--serial");
                 opts.serial = u64::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or_else(|_| die("bad --serial"));

@@ -107,6 +107,7 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
     let mut pos = 0usize;
     let mut pass = 0u32;
     let mut prev_rf: Option<f64> = None;
+    let mut tune_dma: u32 = 0;
     let mut batch: Vec<u16> = Vec::with_capacity(BLOCK_WORDS * 16);
     while !stop.load(Ordering::Relaxed) {
         {
@@ -143,6 +144,10 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         let idx = if vco && pass % 2 == 1 { seq[seq.len() - 1 - pos] } else { seq[pos] };
         pos += 1;
         let rf = plan.centre(idx as usize);
+        // HackRF: steps 4g, 4g+1 are slices below a tune's LO, 4g+2, 4g+3 the ones above; the two slices of
+        // a tune share its block (sides 0 and 1), and each tune costs 2 discarded blocks.
+        let complex = plan.rate.complex();
+        let side: u16 = if complex && idx % 4 >= 2 { 1 } else { 0 };
         // hop cost: 2 blocks of retune + lock at either rate (measured), more in the low band, ~10 ms
         // across a divider switch between neighbours, ~0.5 ms for a VCO-continuous join, ~8 ms for
         // the wrap. The fixed costs are in 409.6 µs blocks, converted to this rate's block.
@@ -150,7 +155,10 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         let fi = plan.rate.if_hz();
         let mut over = 2 + plan.skip as u32; // retune, the block in flight, then settle blocks
         let mut polls = rng.range(2, 8) as u16;
-        if let Some(p) = prev_rf {
+        if complex {
+            over = if side == 0 { 2 } else { 0 };
+            polls = side;
+        } else if let Some(p) = prev_rf {
             if rf < 60e6 {
                 over += blk(rng.range(3, 6));
                 polls += 15;
@@ -173,14 +181,25 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         }
         prev_rf = Some(rf);
         dma = dma.wrapping_add(over);
-        let t = dma as f64 * plan.rate.block_s();
+        if side == 0 {
+            tune_dma = dma;
+        }
+        let t = tune_dma as f64 * plan.rate.block_s();
         for b in 0..plan.dwell {
             let start = batch.len();
             batch.resize(start + BLOCK_WORDS, 0);
-            synth(&mut batch[start..], rf, plan.rate, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
-            let tag = Tag { step: idx, block: b as u16, sweep, freq_hz: rf as u32, dma_count: dma, lock_polls: polls, lock_timed_out: false };
+            if complex {
+                let lo = if side == 0 { rf + crate::dsp::HACKRF_SLICE_HZ } else { rf - crate::dsp::HACKRF_SLICE_HZ };
+                synth_iq(&mut batch[start..], lo, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
+            } else {
+                synth(&mut batch[start..], rf, plan.rate, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
+            }
+            // u64 then u32: the tags wrap above 4.29 GHz like the engine expects (an f64 cast would saturate)
+            let tag = Tag { step: idx, block: b as u16, sweep, freq_hz: rf as u64 as u32, dma_count: tune_dma.wrapping_add(b as u32), lock_polls: polls, lock_timed_out: false };
             tag_block(&mut batch[start..], &tag);
-            dma = dma.wrapping_add(1);
+            if side == 0 {
+                dma = dma.wrapping_add(1);
+            }
         }
         let due = Duration::from_secs_f64(dma as f64 * plan.rate.block_s());
         let el = base.elapsed();
@@ -288,6 +307,12 @@ fn band_plan() -> Vec<Sig> {
         add(1617.0 + k as f64 * 1.9, 40.0, -78.0, Shape::Bump, Some((0.09 * (k + 3) as f64, 0.2, k as f64 * 0.1)));
     }
     add(1296.2, 8.0, -86.0, Shape::Bump, None);
+    // above the R82x boards' range, for the HackRF: PCS, 2.4 GHz WiFi bursts, 5.8 GHz
+    add(1960.0, 5000.0, -70.0, Shape::Flat(None), None);
+    for (k, f) in [2412.0, 2437.0, 2462.0].iter().enumerate() {
+        add(*f, 18000.0, -62.0 - 4.0 * k as f32, Shape::Flat(None), Some((0.11 + 0.05 * k as f64, 0.35, 0.3 * k as f64)));
+    }
+    add(5785.0, 18000.0, -74.0, Shape::Flat(None), Some((0.2, 0.5, 0.1)));
     v
 }
 
@@ -378,5 +403,77 @@ fn synth(out: &mut [u16], rf: f64, rate: Rate, t: f64, rx: &RxSettings, bands: &
     ifft.process_with_scratch(spec, scratch);
     for (o, c) in out.iter_mut().zip(spec.iter()) {
         *o = (2048.0 + c.re).round().clamp(0.0, 4095.0) as u16;
+    }
+}
+
+/// The HackRF's 15 MHz baseband filter around its LO (flat to about ±6.5 MHz) and its DC spike.
+fn hackrf_passband_db(off: f64) -> f32 {
+    let a = off.abs();
+    let mut db = 0.3 * (off / 1.7e6).sin() - 0.4 * (a / 7.5e6).powi(6);
+    if a > 6.8e6 {
+        db -= (a - 6.8e6) / 0.25e6 * 3.0;
+    }
+    db as f32
+}
+
+/// One HackRF block: 8-bit IQ around `lo` (I in the low byte, Q in the high byte).
+#[allow(clippy::too_many_arguments)]
+fn synth_iq(out: &mut [u16], lo: f64, t: f64, rx: &RxSettings, bands: &[Sig], spec: &mut [Complex32], scratch: &mut [Complex32], ifft: &dyn rustfft::Fft<f32>, rng: &mut Rng) {
+    let n = BLOCK_WORDS;
+    let df = 20e6 / n as f64;
+    let g = gain_db(&rx.gain);
+    let floor = 10f32.powf((-88.0 + g * 0.6) / 10.0);
+    let adc_floor = 10f32.powf(-52.0 / 10.0) / n as f32; // 8-bit quantisation spread over the bins
+    let active: Vec<(&Sig, f32)> = bands
+        .iter()
+        .filter(|s| (s.f - lo).abs() < 10.2e6 + s.reach())
+        .filter_map(|s| {
+            let on = match s.burst {
+                None => true,
+                Some((p, duty, ph)) => (t / p + ph).fract() < duty,
+            };
+            let fade = 1.2 * ((t * 0.6 + s.f * 1e-7).sin() as f32);
+            on.then(|| (s, 10f32.powf((s.db + g + fade) / 10.0)))
+        })
+        .collect();
+    for (k, c) in spec.iter_mut().enumerate() {
+        let off = if k < n / 2 { k as f64 } else { k as f64 - n as f64 } * df;
+        let f = lo + off;
+        let mut p = floor;
+        for (s, lin) in &active {
+            let d = f - s.f;
+            match s.shape {
+                Shape::Bump => {
+                    let sigma = (s.bw / 4.0).max(df * 0.6);
+                    let z = d / sigma;
+                    if z.abs() < 4.0 {
+                        p += lin * (-0.5 * z * z).exp() as f32;
+                    }
+                }
+                Shape::Flat(pilot) => {
+                    let h = s.bw / 2.0;
+                    if d.abs() < h {
+                        p += lin * ((h - d.abs()) / (s.bw * 0.02)).min(1.0) as f32;
+                    }
+                    if let Some(po) = pilot
+                        && (d - (-h + po)).abs() < df
+                    {
+                        p += lin * 40.0;
+                    }
+                }
+            }
+        }
+        if off.abs() < df * 1.5 {
+            p += floor * 300.0; // the DC spike
+        }
+        let p = p * 10f32.powf(hackrf_passband_db(off) / 10.0) + adc_floor;
+        let a = 128.0 * (p / 3.0).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
+        *c = Complex32::new(a * rng.gauss(), a * rng.gauss());
+    }
+    ifft.process_with_scratch(spec, scratch);
+    for (o, c) in out.iter_mut().zip(spec.iter()) {
+        let i = c.re.round().clamp(-127.0, 127.0) as i8;
+        let q = c.im.round().clamp(-127.0, 127.0) as i8;
+        *o = (i as u8 as u16) | ((q as u8 as u16) << 8);
     }
 }

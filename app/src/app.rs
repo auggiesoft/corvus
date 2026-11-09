@@ -123,9 +123,9 @@ impl Config {
     fn keep_span(&mut self, start0: f64, stop0: f64) {
         let span = (stop0 - start0).max(0.2);
         if self.start_mhz != start0 && self.start_mhz > self.stop_mhz - 0.2 {
-            self.stop_mhz = (self.start_mhz + span).min(plan::F_MAX_HZ / 1e6);
+            self.stop_mhz = (self.start_mhz + span).min(self.rate.f_range().1 / 1e6);
         } else if self.stop_mhz != stop0 && self.stop_mhz < self.start_mhz + 0.2 {
-            self.start_mhz = (self.stop_mhz - span).max(plan::F_MIN_HZ / 1e6);
+            self.start_mhz = (self.stop_mhz - span).max(self.rate.f_range().0 / 1e6);
         }
     }
 
@@ -701,7 +701,17 @@ impl App {
                 acts: vec![],
             });
         }
-        if self.applied.lock_reads == 0 {
+        if self.host_driven() {
+            out.push(Cond {
+                level: Level::Info,
+                text: format!(
+                    "The {} has stock firmware, so the PC retunes it step by step (tens of steps a second). The Corvus firmware sweeps on the board, about ten times faster: see firmware/README.md.",
+                    crate::hydra::board().name()
+                ),
+                acts: vec![],
+            });
+        }
+        if self.applied.lock_reads == 0 && !self.applied.rate.complex() && !self.host_driven() {
             out.push(Cond { level: Level::Caution, text: "The PLL lock check is off: about 1 in 5 steps come out wrong, by up to 22 dB.".into(), acts: vec![(Act::LockOn, "Turn it on")] });
         }
         if !self.running {
@@ -720,6 +730,11 @@ impl App {
         }
         out.sort_by_key(|c| std::cmp::Reverse(c.level));
         out
+    }
+
+    /// The PC retunes each step (stock firmware, or `--host-sweep`).
+    fn host_driven(&self) -> bool {
+        matches!(&self.src, Src::Device(d) if d.host_driven())
     }
 
     fn issues_recent(&self) -> bool {
@@ -806,8 +821,13 @@ impl App {
             match p.order {
                 Order::VcoContinuous => Card { label: "Visit order", value: "VCO".into(), unit: "continuous", sub: format!("{fast} fast joins · {slow} slow per pass"), flag: false, spark: false },
                 Order::Ascending => Card { label: "Visit order", value: "Ascending".into(), unit: "", sub: format!("{slow} slow crossings per pass"), flag: false, spark: false },
+                Order::Interleaved => Card { label: "Visit order", value: "Interleaved".into(), unit: "", sub: "two 5 MHz slices per tune".into(), flag: false, spark: false },
             },
-            if p.lock_reads == 0 {
+            if p.rate.complex() {
+                Card { label: "Settling", value: "Fixed".into(), unit: "", sub: "the HackRF firmware waits 0.8 ms per tune".into(), flag: false, spark: false }
+            } else if self.host_driven() {
+                Card { label: "Settling", value: "PC-timed".into(), unit: "", sub: "2 USB transfers skipped per step".into(), flag: false, spark: false }
+            } else if p.lock_reads == 0 {
                 Card { label: "PLL lock", value: "Off".into(), unit: "", sub: "steps aren't lock-checked".into(), flag: true, spark: false }
             } else {
                 Card { label: "PLL lock", value: format!("{}", s.lock_median), unit: "polls", sub: format!("max {} · {} timeouts", s.lock_max, s.lock_timeouts), flag: false, spark: false }
@@ -841,16 +861,17 @@ impl App {
                 // Typed values apply on Enter, Tab or clicking away (Esc cancels), not per keystroke.
                 let (s0, e0) = (self.cfg.start_mhz, self.cfg.stop_mhz);
                 let focus = std::mem::take(&mut self.focus_start);
+                let (fmin, fmax) = (self.cfg.rate.f_range().0 / 1e6, self.cfg.rate.f_range().1 / 1e6);
                 theme::row(ui, "Start", |ui| {
                     if focus {
                         let id = ui.next_auto_id();
                         ui.memory_mut(|m| m.request_focus(id));
                     }
-                    ui.add(freq_field(&mut self.cfg.start_mhz, 24.0..=1799.8)).on_hover_text("G to type a range");
+                    ui.add(freq_field(&mut self.cfg.start_mhz, fmin..=fmax - 0.2)).on_hover_text("G to type a range");
                     ui.label(RichText::new("MHz").size(theme::SM).color(INK2));
                 });
                 theme::row(ui, "Stop", |ui| {
-                    ui.add(freq_field(&mut self.cfg.stop_mhz, 24.2..=1800.0));
+                    ui.add(freq_field(&mut self.cfg.stop_mhz, fmin + 0.2..=fmax));
                     ui.label(RichText::new("MHz").size(theme::SM).color(INK2));
                 });
                 self.cfg.keep_span(s0, e0);
@@ -881,7 +902,8 @@ impl App {
                         self.set_range(a, b);
                     }
                     if ui.button("Full range").on_hover_text("F").clicked() {
-                        self.set_range(plan::F_MIN_HZ, plan::F_MAX_HZ);
+                        let (a, b) = self.cfg.rate.f_range();
+                        self.set_range(a, b);
                     }
                     if let Some((a, b)) = self.prev_range
                         && theme::restore_button(ui, &format!("{}–{} MHz", fmt_trim(a / 1e6, 3), fmt_trim(b / 1e6, 3))).on_hover_text("Back to the previous range (Backspace)").clicked()
@@ -926,28 +948,42 @@ impl App {
                             self.cfg.set_rate(rate);
                         }
                     } else {
-                        let only = format!(
-                            "The {}'s fastest setting: {:.0} MSPS real, IF {:.0} MHz, steps up to {} MHz.",
-                            crate::hydra::board().name(),
-                            self.cfg.rate.adc_hz() / 1e6,
-                            self.cfg.rate.if_hz() / 1e6,
-                            fmt_trim(self.cfg.rate.max_window_hz() / 1e6, 1)
-                        );
+                        let only = if self.cfg.rate.complex() {
+                            "The HackRF firmware's sweep rate: 20 MSPS complex (8-bit IQ). Each tune gives two 5 MHz slices, either side of the tuner's DC.".to_string()
+                        } else {
+                            format!(
+                                "The {}'s fastest setting: {:.0} MSPS real, IF {:.0} MHz, steps up to {} MHz.",
+                                crate::hydra::board().name(),
+                                self.cfg.rate.adc_hz() / 1e6,
+                                self.cfg.rate.if_hz() / 1e6,
+                                fmt_trim(self.cfg.rate.max_window_hz() / 1e6, 1)
+                            )
+                        };
                         theme::row_hint(ui, "Rate", &only, |ui| {
                             ui.label(RichText::new(format!("{} MSPS", self.cfg.rate.msps())).size(theme::SM).color(INK));
                             false
                         });
                     }
-                    theme::row_hint(
-                        ui,
-                        "Order",
-                        "VCO-continuous groups steps by the tuner's VCO divider, so divider switches cost about 0.5 ms instead of 10 ms.\nAscending goes low to high: each divider switch costs about 10 ms, plus 8 ms to wrap.",
-                        |ui| theme::segmented(ui, &mut self.cfg.order, &[(Order::VcoContinuous, "VCO-continuous"), (Order::Ascending, "Ascending")]),
-                    );
+                    let complex = self.cfg.rate.complex();
+                    let host = self.host_driven();
+                    if !complex {
+                        theme::row_hint(
+                            ui,
+                            "Order",
+                            "VCO-continuous groups steps by the tuner's VCO divider, so divider switches cost about 0.5 ms instead of 10 ms.\nAscending goes low to high: each divider switch costs about 10 ms, plus 8 ms to wrap.",
+                            |ui| theme::segmented(ui, &mut self.cfg.order, &[(Order::VcoContinuous, "VCO-continuous"), (Order::Ascending, "Ascending")]),
+                        );
+                    }
                     theme::slider_u8(ui, "Dwell", &mut self.cfg.dwell, &Slide::int(1.0, 8.0, 1.0, "blk"));
-                    theme::slider_u8(ui, "Lock reads", &mut self.cfg.lock_reads, &Slide::int(0.0, 3.0, 2.0, ""));
-                    theme::slider_u8(ui, "Settle", &mut self.cfg.skip, &Slide::int(0.0, 8.0, 0.0, "blk"));
-                    theme::caption(ui, &format!("Dwell averages more blocks per step (less noise, slower). Settle discards extra {:.0} µs blocks after lock.", self.cfg.rate.block_s() * 1e6));
+                    if !complex && !host {
+                        theme::slider_u8(ui, "Lock reads", &mut self.cfg.lock_reads, &Slide::int(0.0, 3.0, 2.0, ""));
+                        theme::slider_u8(ui, "Settle", &mut self.cfg.skip, &Slide::int(0.0, 8.0, 0.0, "blk"));
+                        theme::caption(ui, &format!("Dwell averages more blocks per step (less noise, slower). Settle discards extra {:.0} µs blocks after lock.", self.cfg.rate.block_s() * 1e6));
+                    } else if complex {
+                        theme::caption(ui, "Dwell averages more blocks per tune. The HackRF's firmware sets its own settling (two blocks per tune).");
+                    } else {
+                        theme::caption(ui, "Dwell averages more blocks per step. With stock firmware the PC times the settling.");
+                    }
                 });
             });
             ui.add_space(gap);
@@ -1062,7 +1098,7 @@ impl App {
     fn footer(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
             let src = match &self.src {
-                Src::Device(d) => format!("{} · {} · {} · rev {}", d.version, if self.serial == 0 { format!("first {}", crate::hydra::board().name()) } else { format!("{:016X}", self.serial) }, d.lib_path.display(), d.fw_revision),
+                Src::Device(d) => format!("{} · {} · {} · rev {}", d.version(), if self.serial == 0 { format!("first {}", crate::hydra::board().name()) } else { format!("{:016X}", self.serial) }, d.lib_path().display(), d.fw_revision()),
                 Src::Sim(_) => "Simulator".to_string(),
                 Src::Offline(_) => format!("{} not open", crate::hydra::board().name()),
             };
@@ -1450,7 +1486,7 @@ impl App {
                 if band > 0 {
                     p.line_segment([pos2(x0, r.top()), pos2(x0, r.bottom())], Stroke::new(1.0, INK3));
                 }
-                if x1 - x0 > 64.0 {
+                if x1 - x0 > 64.0 && !plan.rate.complex() {
                     labels.push((x0, format!("VCO ÷{}", 1u32 << (d + 1))));
                 }
             }
@@ -1666,7 +1702,8 @@ impl App {
     fn shift_range(&mut self, dir: f64) {
         let (a, b) = (self.applied.start_hz, self.applied.stop_hz);
         let span = b - a;
-        let lo = (a + dir * span).clamp(plan::F_MIN_HZ, plan::F_MAX_HZ - span);
+        let (fmin, fmax) = self.cfg.rate.f_range();
+        let lo = (a + dir * span).clamp(fmin, fmax - span);
         self.set_range(lo, lo + span);
     }
 
@@ -1705,7 +1742,10 @@ impl App {
                 // range
                 Key::G => self.focus_start = true,
                 Key::Backspace => self.back_range(),
-                Key::F => self.set_range(plan::F_MIN_HZ, plan::F_MAX_HZ),
+                Key::F => {
+                    let (a, b) = self.cfg.rate.f_range();
+                    self.set_range(a, b)
+                }
                 Key::S => {
                     let (a, b) = self.view;
                     if b - a < self.applied.stop_hz - self.applied.start_hz - 1e3 {
@@ -1938,7 +1978,7 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
     let src = if opts.sim { Src::Sim(Sim::start(engine.sink(), plan.clone(), cfg.rx())) } else { open_device(&opts.lib, opts.serial, &engine, &plan, cfg.rx()) };
     match &src {
         Src::Offline(e) => return Err(e.clone()),
-        Src::Device(d) => println!("{} via {}", d.version, d.lib_path.display()),
+        Src::Device(d) => println!("{} via {}", d.version(), d.lib_path().display()),
         Src::Sim(_) => println!("simulator"),
     }
     println!(
@@ -1977,7 +2017,7 @@ fn open_device(lib: &std::path::Path, serial: u64, engine: &Engine, plan: &Plan,
     match Device::open(lib, serial, engine.sink(), rx, plan.rate) {
         Ok(mut d) => match d.sweep(plan) {
             Ok(()) => {
-                log::info!("{} via {}", d.version, d.lib_path.display());
+                log::info!("{} via {}", d.version(), d.lib_path().display());
                 Src::Device(d)
             }
             Err(e) => Src::Offline(e),
@@ -2275,6 +2315,7 @@ fn connect_label() -> &'static str {
         crate::hydra::Board::RFOne => "Connect the RFOne",
         crate::hydra::Board::Airspy => "Connect the Airspy R2",
         crate::hydra::Board::Mini => "Connect the Airspy Mini",
+        crate::hydra::Board::HackRF => "Connect the HackRF",
     }
 }
 

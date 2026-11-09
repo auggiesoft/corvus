@@ -161,6 +161,25 @@ faster boards need.
 For comparison, the stock firmware driven from the PC (retune, then wait out the 11 ms USB transfer in
 flight and, for clean data, one more) made 44–85 steps/s: 0.2–0.4 GHz/s, one pass every 4–8 s.
 
+## HackRF One
+
+One HackRF One with a PortaPack, stock firmware 2026.01.3, measured with instrumented builds of the same
+source (a cycle counter around the retune, written into each block's header).
+
+- **The stock sweep is a fixed timetable:** capture one 16 KB block (409.6 µs at 20 MSPS), then discard
+  two while it retunes. That's 1.223 ms per tune in every band, ~818 tunes a second; extra dwell blocks
+  cost three blocks each. `hackrf_sweep`'s pattern keeps ~10 MHz per tune: ~8.2 GHz/s.
+- **A PortaPack makes each retune ~4× slower:** the firmware redraws the frequency on its screen at every
+  step. The retune itself takes ~400 µs with the screen on and ~105 µs (50 µs between 2170 and 2740 MHz)
+  with it off (`hackrf_set_ui_enable(0)`). It doesn't change the timetable, but Corvus Sweep turns the
+  screen off anyway.
+- **Settling, not retuning, sets the pace:** the signal is right only ~600–700 µs after the retune
+  command, so the stock two-block discard is about right. The mixer's lock bit reads "locked" too early
+  to trust. With one discarded block, spectra differ from the two-block ones by up to 24 dB at the start
+  of the block, fading over ~300 µs.
+- **The MAX2837 is the slow synthesizer:** holding it at a fixed IF and moving only the RFFC5072 mixer
+  settles in ~510 µs; moving only the MAX2837 leaves a long tail.
+
 ## Restarts
 
 Changing gain or port mid-sweep means SWEEP_STOP, the setting, then SWEEP_START, because the firmware
