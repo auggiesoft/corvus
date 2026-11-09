@@ -1,6 +1,7 @@
-//! The board's library with the Corvus sweep API (libhydrasdr for the RFOne, libairspy for the Airspy R2),
-//! loaded at run time, and the board driven in firmware sweep mode. See ../host/README.md. The two
-//! libraries share one API shape under different prefixes, and the same tags and sweep parameters.
+//! The R82x boards (RFOne, Airspy R2/Mini) driven in firmware sweep mode (or PC-driven on stock firmware),
+//! through the built-in USB driver (`usbdev`, the default) or the board's C library with the Corvus sweep
+//! API (libhydrasdr, libairspy; loaded at run time, see ../host/README.md). The two libraries share one API
+//! shape under different prefixes, and the same tags and sweep parameters.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,9 @@ impl Board {
     /// The library file this repo builds for the board (host/build/build.sh), and where it lands.
     fn lib_file(self) -> &'static str {
         match self {
+            Board::RFOne if cfg!(windows) => "libhydrasdr.dll",
+            Board::Airspy | Board::Mini if cfg!(windows) => "libairspy.dll",
+            Board::HackRF if cfg!(windows) => "hackrf.dll",
             Board::RFOne => "libhydrasdr.so.1.1.4",
             Board::Airspy | Board::Mini => "libairspy.so.1.0.10",
             Board::HackRF => "libhackrf.so.0",
@@ -82,16 +86,18 @@ impl Board {
     }
 
     fn repo_lib(self) -> String {
+        let os = if cfg!(windows) { "windows" } else { "linux" };
         let dir = match self {
-            Board::RFOne => "linux",
-            Board::Airspy | Board::Mini => "airspy-linux",
-            Board::HackRF => "hackrf-linux", // not built here: the system libhackrf is used
+            Board::RFOne => os.to_string(),
+            Board::Airspy | Board::Mini => format!("airspy-{os}"),
+            Board::HackRF => format!("hackrf-{os}"), // not built here: the system libhackrf is used
         };
         format!("../host/build/out/{dir}/{}", self.lib_file())
     }
 
     fn system_lib(self) -> &'static str {
         match self {
+            _ if cfg!(windows) => self.lib_file(),
             Board::RFOne => "libhydrasdr.so.1",
             Board::Airspy | Board::Mini => "libairspy.so.0",
             Board::HackRF => "libhackrf.so.0",
@@ -109,15 +115,31 @@ impl Board {
     }
 }
 
-static BOARD: std::sync::OnceLock<Board> = std::sync::OnceLock::new();
+static BOARD: parking_lot::RwLock<Board> = parking_lot::const_rwlock(Board::RFOne);
 
 /// The board chosen at startup (`--board`, CORVUS_BOARD); the RFOne unless set.
 pub fn board() -> Board {
-    *BOARD.get().unwrap_or(&Board::RFOne)
+    *BOARD.read()
 }
 
+/// Switch boards (at startup, or from the device picker with no device open).
 pub fn set_board(b: Board) {
-    let _ = BOARD.set(b);
+    *BOARD.write() = b;
+}
+
+/// A board found on USB (nothing is opened). Airspy R2 and Mini share an ID, so they show
+/// as Airspy until one is opened and its firmware says which.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    pub board: Board,
+    pub serial: u64,
+    /// "Airspy (R2 or Mini)" until known.
+    pub label: String,
+}
+
+/// Boards on USB, by vendor/product ID and serial string (any platform).
+pub fn list_devices() -> Vec<Found> {
+    crate::usbdev::list()
 }
 
 /// CORVUS_BOARD if it names a board.
@@ -444,24 +466,42 @@ pub fn set_force_host_sweep(on: bool) {
     FORCE_HOST.store(on, Ordering::Relaxed);
 }
 
-/// What a signal handler needs to stop a sweep when the UI can't shut down cleanly: a host that
-/// dies mid-sweep leaves the firmware sweeping, and then hydrasdr_open fails until SWEEP_STOP.
-pub(crate) struct Emergency {
-    pub(crate) sweep_stop: unsafe extern "C" fn(*mut Dev) -> c_int,
-    pub(crate) stop_rx: unsafe extern "C" fn(*mut Dev) -> c_int,
-    pub(crate) dev: usize,
-}
+/// What a signal handler runs to stop the open board's sweep and stream when the UI can't shut down
+/// cleanly: a host that dies mid-sweep leaves the firmware sweeping, and the next open fails until
+/// SWEEP_STOP.
+pub(crate) type Emergency = Box<dyn Fn() + Send>;
 
 pub(crate) static EMERGENCY: parking_lot::Mutex<Option<Emergency>> = parking_lot::Mutex::new(None);
 
 /// Stop the sweep and the stream of the open device, if any (for signal handlers).
 pub fn emergency_stop() {
-    if let Some(e) = EMERGENCY.lock().take() {
-        unsafe {
-            (e.sweep_stop)(e.dev as *mut Dev);
-            (e.stop_rx)(e.dev as *mut Dev);
-        }
+    if let Some(f) = EMERGENCY.lock().take() {
+        f();
     }
+}
+
+/// How a board is reached: its C library (libhydrasdr, libairspy, libhackrf), or the built-in USB driver
+/// (`usbdev`), which needs no library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsbMode {
+    /// The built-in driver (the default).
+    Native,
+    /// The board's C library (`--usb lib`).
+    Lib,
+}
+
+static USB_MODE: parking_lot::Mutex<UsbMode> = parking_lot::const_mutex(UsbMode::Native);
+
+pub fn set_usb_mode(m: UsbMode) {
+    *USB_MODE.lock() = m;
+}
+
+/// What `Device::lib_path` shows when no library is involved.
+pub const NATIVE_LIB: &str = "built-in USB driver";
+
+/// Whether to use the built-in driver for this board (every board has one).
+pub(crate) fn native_for(_board: Board, _lib_path: &Path) -> bool {
+    *USB_MODE.lock() == UsbMode::Native
 }
 
 /// The open board: an R82x board (RFOne or Airspy; firmware or PC-driven sweep) or a HackRF.
@@ -533,10 +573,21 @@ impl Device {
     }
 }
 
+/// Retune from the PC-driven sweeper thread.
+type FreqFn = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// How the R82x board is driven: through its library, or the built-in USB driver.
+enum Io {
+    Lib { api: Api, dev: *mut Dev, sink: *mut Sink },
+    Native { usb: crate::usbdev::R82x, sink: Arc<Sink> },
+}
+
+fn rc_check(api: &Api, what: &str, rc: c_int) -> Result<(), String> {
+    if rc == 0 { Ok(()) } else { Err(api.err(what, rc)) }
+}
+
 pub struct R82xDevice {
-    api: Api,
-    dev: *mut Dev,
-    sink: *mut Sink,
+    io: Io,
     pub version: String,
     pub fw_revision: i32,
     pub lib_path: PathBuf,
@@ -547,43 +598,85 @@ pub struct R82xDevice {
     streaming: bool,
     /// PC-driven sweep (no sweep firmware, or forced).
     host_mode: bool,
-    set_freq: Option<SetFreq>,
+    set_freq: Option<FreqFn>,
     host: Option<Arc<HostShared>>,
     sweeper: Option<HostSweeper>,
     /// Pass counter of the PC-driven sweep: like the firmware's, it never resets.
     host_sweep_no: Arc<AtomicU64>,
 }
 
-// SAFETY: the handle is only used from the thread that owns the Device (the UI thread), and by the
+// SAFETY: a library handle is only used from the thread that owns the Device (the UI thread), and by the
 // PC-driven sweeper thread for set_freq, which the device stops before anything else touches the stream.
 unsafe impl Send for R82xDevice {}
+
+/// The board as first opened, before the sink is attached.
+enum Opened {
+    Lib(Api, *mut Dev),
+    Native(crate::usbdev::R82x),
+}
 
 impl R82xDevice {
     pub fn open(lib_path: &Path, serial: u64, mut sink: Sink, rx: RxSettings, rate: Rate) -> Result<R82xDevice, String> {
         let board = board();
-        let api = Api::load(lib_path, board)?;
-        let mut dev = std::ptr::null_mut();
-        let rc = unsafe { (api.open_sn)(&mut dev, serial) };
-        if rc != 0 {
-            let which = if serial == 0 { format!("the {}", board.name()) } else { format!("{} {serial:#018X}", board.name()) };
-            return Err(api.err(&format!("open {which} (unplugged, or busy in another program?)"), rc));
-        }
-        let mut buf = [0 as c_char; 255];
-        unsafe { (api.version_string_read)(dev, buf.as_mut_ptr(), 255) };
-        let version = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
-        let supported = api.sweep_supported.map(|f| unsafe { f(dev) }).unwrap_or(0);
-        let fw_revision = api.sweep_fw_revision.map(|f| unsafe { f(dev) }).unwrap_or(0);
-        let set_freq = api.set_freq;
-        let host_mode = supported != 1 || FORCE_HOST.load(Ordering::Relaxed);
+        let opened = if native_for(board, lib_path) {
+            let kind = if board == Board::RFOne { crate::usbdev::Kind::RFOne } else { crate::usbdev::Kind::Airspy };
+            Opened::Native(crate::usbdev::R82x::open(kind, serial)?)
+        } else {
+            let api = Api::load(lib_path, board)?;
+            let mut dev = std::ptr::null_mut();
+            let rc = unsafe { (api.open_sn)(&mut dev, serial) };
+            if rc != 0 {
+                let which = if serial == 0 { format!("the {}", board.name()) } else { format!("{} {serial:#018X}", board.name()) };
+                return Err(api.err(&format!("open {which} (unplugged, or busy in another program?)"), rc));
+            }
+            Opened::Lib(api, dev)
+        };
+        let (version, fw_revision, set_freq, shown_path) = match &opened {
+            Opened::Native(usb) => {
+                let f = usb.setter();
+                let set: FreqFn = Arc::new(move |hz| {
+                    let _ = f.set(hz);
+                });
+                (usb.version.clone(), usb.sweep_revision(), Some(set), PathBuf::from(NATIVE_LIB))
+            }
+            Opened::Lib(api, dev) => {
+                let mut buf = [0 as c_char; 255];
+                unsafe { (api.version_string_read)(*dev, buf.as_mut_ptr(), 255) };
+                let version = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+                let supported = api.sweep_supported.map(|f| unsafe { f(*dev) }).unwrap_or(0);
+                let rev = if supported == 1 { api.sweep_fw_revision.map(|f| unsafe { f(*dev) }).unwrap_or(1).max(1) } else { 0 };
+                let set: Option<FreqFn> = api.set_freq.map(|sf| {
+                    let d = *dev as usize;
+                    let f: FreqFn = Arc::new(move |hz| unsafe {
+                        match sf {
+                            SetFreq::U64(f) => f(d as *mut Dev, hz),
+                            SetFreq::U32(f) => f(d as *mut Dev, hz as u32),
+                        };
+                    });
+                    f
+                });
+                (version, rev, set, lib_path.to_path_buf())
+            }
+        };
+        // The R2 and the Mini share a USB ID and one firmware image; the version string says which.
+        let (board, rate) = match board {
+            Board::Airspy if version.contains("MINI") => (Board::Mini, Rate::M6),
+            Board::Mini if version.contains("NOS") => (Board::Airspy, Rate::M10),
+            b => (b, rate),
+        };
+        set_board(board);
+        let host_mode = fw_revision == 0 || FORCE_HOST.load(Ordering::Relaxed);
         let host = if host_mode { Some(Arc::new(HostShared::new())) } else { None };
         sink.host = host.clone();
+        let io = match opened {
+            Opened::Lib(api, dev) => Io::Lib { api, dev, sink: Box::into_raw(Box::new(sink)) },
+            Opened::Native(usb) => Io::Native { usb, sink: Arc::new(sink) },
+        };
         let mut d = R82xDevice {
-            api,
-            dev,
-            sink: Box::into_raw(Box::new(sink)),
+            io,
             version,
             fw_revision,
-            lib_path: lib_path.to_path_buf(),
+            lib_path: shown_path,
             board,
             plan: None,
             rx,
@@ -599,20 +692,30 @@ impl R82xDevice {
             return Err(format!("firmware \"{}\" has no sweep mode and the library has no set_freq", d.version));
         }
         d.configure()?;
-        let (stop_a, stop_b) = (d.api.sweep_stop.unwrap_or(d.api.stop_rx), d.api.stop_rx);
-        *EMERGENCY.lock() = Some(Emergency { sweep_stop: stop_a, stop_rx: stop_b, dev: d.dev as usize });
+        let stop: Emergency = match &d.io {
+            Io::Lib { api, dev, .. } => {
+                let (a, b, dev) = (api.sweep_stop.unwrap_or(api.stop_rx), api.stop_rx, *dev as usize);
+                Box::new(move || unsafe {
+                    a(dev as *mut Dev);
+                    b(dev as *mut Dev);
+                })
+            }
+            Io::Native { usb, .. } => Box::new(usb.stopper()),
+        };
+        *EMERGENCY.lock() = Some(stop);
         Ok(d)
     }
 
-    fn check(&self, what: &str, rc: c_int) -> Result<(), String> {
-        if rc == 0 { Ok(()) } else { Err(self.api.err(what, rc)) }
-    }
-
     fn configure(&mut self) -> Result<(), String> {
-        // RAW first: it decides how the rate below is read
-        unsafe { self.check("set_sample_type RAW", (self.api.set_sample_type)(self.dev, SAMPLE_RAW))? };
+        // RAW first: it decides how the rate below is read (the built-in driver is always RAW)
+        if let Io::Lib { api, dev, .. } = &self.io {
+            rc_check(api, "set_sample_type RAW", unsafe { (api.set_sample_type)(*dev, SAMPLE_RAW) })?;
+        }
         self.apply_rate()?;
-        unsafe { self.check("set_packing off", (self.api.set_packing)(self.dev, 0))? };
+        match &self.io {
+            Io::Lib { api, dev, .. } => rc_check(api, "set_packing off", unsafe { (api.set_packing)(*dev, 0) })?,
+            Io::Native { usb, .. } => usb.set_packing(false)?,
+        }
         self.apply_rx()
     }
 
@@ -631,25 +734,47 @@ impl R82xDevice {
             _ => self.rate.msps() * 1_000_000,
         };
         let m = self.rate.msps();
-        unsafe { self.check(&format!("set_samplerate {m} MSPS ({hz} real)"), (self.api.set_samplerate)(self.dev, hz)) }
+        match &self.io {
+            Io::Lib { api, dev, .. } => rc_check(api, &format!("set_samplerate {m} MSPS ({hz} real)"), unsafe { (api.set_samplerate)(*dev, hz) }),
+            Io::Native { usb, .. } => usb.set_samplerate(hz),
+        }
     }
 
     fn apply_rx(&self) -> Result<(), String> {
-        let a = &self.api;
-        let d = self.dev;
-        unsafe {
-            if let Some(set_rf_port) = a.set_rf_port {
-                self.check("set_rf_port", set_rf_port(d, self.rx.port as c_int))?;
+        match &self.io {
+            Io::Lib { api: a, dev, .. } => {
+                let d = *dev;
+                unsafe {
+                    if let Some(set_rf_port) = a.set_rf_port {
+                        rc_check(a, "set_rf_port", set_rf_port(d, self.rx.port as c_int))?;
+                    }
+                    match self.rx.gain {
+                        Gain::Linearity(g) => rc_check(a, "set_linearity_gain", (a.set_linearity_gain)(d, g)),
+                        Gain::Sensitivity(g) => rc_check(a, "set_sensitivity_gain", (a.set_sensitivity_gain)(d, g)),
+                        Gain::Manual { lna, mixer, vga } => {
+                            rc_check(a, "set_lna_agc off", (a.set_lna_agc)(d, 0))?;
+                            rc_check(a, "set_mixer_agc off", (a.set_mixer_agc)(d, 0))?;
+                            rc_check(a, "set_lna_gain", (a.set_lna_gain)(d, lna))?;
+                            rc_check(a, "set_mixer_gain", (a.set_mixer_gain)(d, mixer))?;
+                            rc_check(a, "set_vga_gain", (a.set_vga_gain)(d, vga))
+                        }
+                    }
+                }
             }
-            match self.rx.gain {
-                Gain::Linearity(g) => self.check("set_linearity_gain", (a.set_linearity_gain)(d, g)),
-                Gain::Sensitivity(g) => self.check("set_sensitivity_gain", (a.set_sensitivity_gain)(d, g)),
+            Io::Native { usb, .. } => {
+                if self.board.has_ports() {
+                    usb.set_rf_port(self.rx.port)?;
+                }
+                match self.rx.gain {
+                Gain::Linearity(g) => usb.set_linearity_gain(g),
+                Gain::Sensitivity(g) => usb.set_sensitivity_gain(g),
                 Gain::Manual { lna, mixer, vga } => {
-                    self.check("set_lna_agc off", (a.set_lna_agc)(d, 0))?;
-                    self.check("set_mixer_agc off", (a.set_mixer_agc)(d, 0))?;
-                    self.check("set_lna_gain", (a.set_lna_gain)(d, lna))?;
-                    self.check("set_mixer_gain", (a.set_mixer_gain)(d, mixer))?;
-                    self.check("set_vga_gain", (a.set_vga_gain)(d, vga))
+                    usb.set_lna_agc(false)?;
+                    usb.set_mixer_agc(false)?;
+                    usb.set_lna_gain(lna)?;
+                    usb.set_mixer_gain(mixer)?;
+                    usb.set_vga_gain(vga)
+                }
                 }
             }
         }
@@ -657,11 +782,32 @@ impl R82xDevice {
 
     fn start_stream(&mut self) -> Result<(), String> {
         if !self.streaming {
-            let rc = unsafe { (self.api.start_rx)(self.dev, rx_callback, self.sink as *mut c_void) };
-            self.check("start_rx", rc)?;
+            match &mut self.io {
+                Io::Lib { api, dev, sink } => rc_check(api, "start_rx", unsafe { (api.start_rx)(*dev, rx_callback, *sink as *mut c_void) })?,
+                Io::Native { usb, sink } => {
+                    let sink = sink.clone();
+                    usb.start_rx(move |words| match &sink.host {
+                        Some(h) => h.on_transfer(&words, &sink),
+                        None => sink.push(words),
+                    })?
+                }
+            }
             self.streaming = true;
         }
         Ok(())
+    }
+
+    fn sweep_stop(&self) {
+        match &self.io {
+            Io::Lib { api, dev, .. } => {
+                if let Some(f) = api.sweep_stop {
+                    unsafe { f(*dev) };
+                }
+            }
+            Io::Native { usb, .. } => {
+                let _ = usb.sweep_stop();
+            }
+        }
     }
 
     fn stop_sweeper(&mut self) {
@@ -677,12 +823,12 @@ impl R82xDevice {
     }
 
     fn start_sweeper(&mut self, plan: &Plan) {
-        let (Some(set_freq), Some(host)) = (self.set_freq, self.host.clone()) else { return };
+        let (Some(set_freq), Some(host)) = (self.set_freq.clone(), self.host.clone()) else { return };
         let stop = Arc::new(AtomicBool::new(false));
-        let (plan, dev, stop2, sweep_no) = (plan.clone(), self.dev as usize, stop.clone(), self.host_sweep_no.clone());
+        let (plan, stop2, sweep_no) = (plan.clone(), stop.clone(), self.host_sweep_no.clone());
         let thread = std::thread::Builder::new()
             .name("corvus-host-sweep".into())
-            .spawn(move || host_sweep(set_freq, dev, plan, host, stop2, sweep_no))
+            .spawn(move || host_sweep(set_freq, plan, host, stop2, sweep_no))
             .expect("spawn host sweeper");
         self.sweeper = Some(HostSweeper { stop, thread });
     }
@@ -702,9 +848,13 @@ impl R82xDevice {
             self.start_sweeper(plan);
         } else {
             let p = SweepParams::from(plan);
-            let f = self.api.sweep_start.ok_or("the library has no sweep_start")?;
-            let rc = unsafe { f(self.dev, &p) };
-            self.check("sweep_start", rc)?;
+            match &self.io {
+                Io::Lib { api, dev, .. } => {
+                    let f = api.sweep_start.ok_or("the library has no sweep_start")?;
+                    rc_check(api, "sweep_start", unsafe { f(*dev, &p) })?;
+                }
+                Io::Native { usb, .. } => usb.sweep_start(&p)?,
+            }
         }
         self.plan = Some(plan.clone());
         Ok(())
@@ -718,8 +868,8 @@ impl R82xDevice {
         if sweeping {
             if self.host_mode {
                 self.stop_sweeper();
-            } else if let Some(f) = self.api.sweep_stop {
-                unsafe { f(self.dev) };
+            } else {
+                self.sweep_stop();
             }
         }
         let r = self.apply_rx();
@@ -734,11 +884,16 @@ impl R82xDevice {
     pub fn pause(&mut self) {
         self.stop_sweeper();
         if self.streaming {
-            unsafe {
-                if let (false, Some(f)) = (self.host_mode, self.api.sweep_stop) {
-                    f(self.dev);
+            if !self.host_mode {
+                self.sweep_stop();
+            }
+            match &mut self.io {
+                Io::Lib { api, dev, .. } => unsafe {
+                    (api.stop_rx)(*dev);
+                },
+                Io::Native { usb, .. } => {
+                    let _ = usb.stop_rx();
                 }
-                (self.api.stop_rx)(self.dev);
             }
             self.streaming = false;
         }
@@ -747,14 +902,16 @@ impl R82xDevice {
     pub fn resume(&mut self) -> Result<(), String> {
         let plan = self.plan.clone().ok_or("no plan")?;
         // stop_rx leaves the sample type alone, but be explicit: sweep_start refuses anything but RAW.
-        unsafe { self.check("set_sample_type RAW", (self.api.set_sample_type)(self.dev, SAMPLE_RAW))? };
+        if let Io::Lib { api, dev, .. } = &self.io {
+            rc_check(api, "set_sample_type RAW", unsafe { (api.set_sample_type)(*dev, SAMPLE_RAW) })?;
+        }
         self.sweep(&plan)
     }
 }
 
 /// The PC-driven sweep loop: the firmware's visiting order (VCO-continuous passes alternate direction),
 /// the pass counter bumped on every start and every pass.
-fn host_sweep(set_freq: SetFreq, dev: usize, plan: Plan, host: Arc<HostShared>, stop: Arc<AtomicBool>, sweep_no: Arc<AtomicU64>) {
+fn host_sweep(set_freq: FreqFn, plan: Plan, host: Arc<HostShared>, stop: Arc<AtomicBool>, sweep_no: Arc<AtomicU64>) {
     let seq = plan.sequence();
     let vco = plan.order == crate::plan::Order::VcoContinuous;
     let mut forward = true;
@@ -766,12 +923,7 @@ fn host_sweep(set_freq: SetFreq, dev: usize, plan: Plan, host: Arc<HostShared>, 
                 return;
             }
             let centre = plan.centre(step as usize) as u64;
-            unsafe {
-                match set_freq {
-                    SetFreq::U64(f) => f(dev as *mut Dev, centre),
-                    SetFreq::U32(f) => f(dev as *mut Dev, centre as u32),
-                };
-            }
+            set_freq(centre);
             {
                 let mut st = host.state.lock();
                 *st = HostState {
@@ -799,9 +951,11 @@ impl Drop for R82xDevice {
     fn drop(&mut self) {
         EMERGENCY.lock().take();
         self.pause();
-        unsafe {
-            (self.api.close)(self.dev);
-            drop(Box::from_raw(self.sink));
+        if let Io::Lib { api, dev, sink } = &self.io {
+            unsafe {
+                (api.close)(*dev);
+                drop(Box::from_raw(*sink));
+            }
         }
     }
 }
@@ -819,6 +973,56 @@ mod tests {
         assert_eq!(parse_block(&w), Block::Valid(t));
         w[BLOCK_WORDS - 6] ^= 1;
         assert_eq!(parse_block(&w), Block::Torn);
+    }
+
+    /// On real boards, through the built-in driver: sweep, change gain mid-sweep, pause and resume, change
+    /// the plan (and the RFOne's rate), close and reopen, checking that tagged blocks keep coming.
+    /// `CORVUS_TEST_SERIALS=board:hex,...` (e.g. rfone:36B4...,airspy:7358...,hackrf:081c...);
+    /// run with `cargo test --release -- --ignored real_boards --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_boards_survive_the_ui_paths() {
+        use crate::plan::Order;
+        let list = std::env::var("CORVUS_TEST_SERIALS").expect("set CORVUS_TEST_SERIALS");
+        for item in list.split(',') {
+            let (b, sn) = item.split_once(':').expect("board:serial");
+            let board = Board::parse(b).expect("board");
+            let serial = u64::from_str_radix(sn.trim_start_matches("0x"), 16).expect("hex serial");
+            let rates = board.rates();
+            let plan = |r: Rate, lo: f64, hi: f64| Plan::new(lo, hi, if r == Rate::H20 { 5.0 } else { r.max_window_hz() / 1e6 - 1.0 }, 1, 0, 2, Order::VcoContinuous, r);
+            let blocks = |rx: &std::sync::mpsc::Receiver<Vec<u16>>, ms: u64| {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                let mut n = 0;
+                while let Ok(buf) = rx.try_recv() {
+                    n += buf.chunks_exact(BLOCK_WORDS).filter(|b| matches!(parse_block(b), Block::Valid(_))).count();
+                }
+                n
+            };
+            for round in 0..2 {
+                set_board(board);
+                let (tx, rx) = std::sync::mpsc::sync_channel(4096);
+                let sink = Sink { tx, host_drops: Arc::new(AtomicU64::new(0)), host: None };
+                let rx_set = RxSettings { port: 0, gain: Gain::Linearity(10) };
+                let mut d = Device::open(Path::new(NATIVE_LIB), serial, sink, rx_set, rates[0]).unwrap_or_else(|e| panic!("{b}: {e}"));
+                let r = rates[0];
+                d.sweep(&plan(r, 88.0, 470.0)).unwrap();
+                let a = blocks(&rx, 700);
+                d.set_rx(RxSettings { port: 0, gain: Gain::Sensitivity(14) }).unwrap();
+                let g = blocks(&rx, 700);
+                d.pause();
+                let _ = blocks(&rx, 200);
+                let paused = blocks(&rx, 300);
+                d.resume().unwrap();
+                let res = blocks(&rx, 700);
+                let r2 = *rates.last().unwrap();
+                d.sweep(&plan(r2, 400.0, 1000.0)).unwrap();
+                let p2 = blocks(&rx, 900);
+                eprintln!("{b} round {round} ({}): blocks {a} sweeping, {g} after a gain change, {paused} paused, {res} resumed, {p2} after a new plan at {} MSPS", d.version(), r2.msps());
+                assert!(a > 50 && g > 50 && res > 50 && p2 > 50, "{b}: blocks stopped coming");
+                assert!(paused < 20, "{b}: still streaming while paused ({paused})");
+                drop(d);
+            }
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! The HackRF One through the system libhackrf, in its stock firmware sweep (`hackrf_init_sweep`, the
+//! The HackRF One through the system libhackrf or the built-in USB driver (`usbdev::Hackrf`, the same
+//! requests), in its stock firmware sweep (`hackrf_init_sweep`, the
 //! same sweep `hackrf_sweep` uses): 20 MSPS complex, interleaved tunes 5 and 15 MHz past each 20 MHz base,
 //! 7.5 MHz offset. Each 16 KB block (8192 IQ samples, header 0x7f7f + the tune's base frequency) holds the
 //! slice 5 MHz below the LO and the slice 5 MHz above it. The RX callback re-tags each block twice, once
@@ -8,9 +9,11 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use libloading::Library;
 
-use crate::hydra::{BLOCK_WORDS, EMERGENCY, Emergency, Gain, RxSettings, Sink, Tag, tag_block};
+use crate::hydra::{BLOCK_WORDS, EMERGENCY, Gain, RxSettings, Sink, Tag, tag_block};
 use crate::plan::Plan;
 
 type Dev = c_void;
@@ -118,8 +121,14 @@ unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
     // outlives streaming (stop_rx runs before it is freed).
     unsafe {
         let t = &*t;
-        let ctx = &*(t.rx_ctx as *const Ctx);
-        let bytes = std::slice::from_raw_parts(t.buffer, t.valid_length.max(0) as usize);
+        on_blocks(&*(t.rx_ctx as *const Ctx), std::slice::from_raw_parts(t.buffer, t.valid_length.max(0) as usize));
+    }
+    0
+}
+
+/// One USB transfer of sweep blocks: each block tagged twice, once per 5 MHz slice, and passed on.
+fn on_blocks(ctx: &Ctx, bytes: &[u8]) {
+    {
         let geo = *ctx.geo.lock();
         let mut st = ctx.state.lock();
         for blk in bytes.chunks_exact(BLOCK_BYTES) {
@@ -156,20 +165,23 @@ unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
             }
         }
     }
-    0
+}
+
+/// How the HackRF is driven: libhackrf, or the built-in USB driver.
+enum Io {
+    Lib { api: Api, dev: *mut Dev, ctx: *mut Ctx },
+    Native { usb: crate::usbdev::Hackrf, ctx: Arc<Ctx> },
 }
 
 pub struct HackrfDevice {
-    api: Api,
-    dev: *mut Dev,
-    ctx: *mut Ctx,
+    io: Io,
     pub version: String,
     pub lib_path: PathBuf,
     plan: Option<Plan>,
     streaming: bool,
 }
 
-// SAFETY: the handle is only used from the thread that owns the Device (the UI thread).
+// SAFETY: a library handle is only used from the thread that owns the Device (the UI thread).
 unsafe impl Send for HackrfDevice {}
 
 /// LNA (IF) gain 0-40 dB in 8 dB steps and VGA (baseband) 0-62 dB in 2 dB steps, from the app's gain
@@ -186,43 +198,67 @@ fn gains(g: Gain) -> (u32, u32) {
 
 impl HackrfDevice {
     pub fn open(lib_path: &Path, serial: u64, sink: Sink, rx: RxSettings) -> Result<HackrfDevice, String> {
-        let api = Api::load(lib_path)?;
-        // hackrf_init is idempotent, and hackrf_exit only tears libusb down once no device is open.
-        let rc = unsafe { (api.init)() };
-        if rc != 0 {
-            return Err(api.err("hackrf_init", rc));
-        }
-        // libhackrf matches a serial by suffix: the low 64 bits in lower-case hex are enough.
-        let sn = (serial != 0).then(|| CString::new(format!("{serial:016x}")).unwrap());
-        let mut dev = std::ptr::null_mut();
-        let rc = unsafe { (api.open_by_serial)(sn.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()), &mut dev) };
-        if rc != 0 {
-            unsafe { (api.exit)() };
-            let which = if serial == 0 { "the HackRF".to_string() } else { format!("HackRF …{serial:016x}") };
-            return Err(api.err(&format!("open {which} (unplugged, or busy in another program?)"), rc));
-        }
-        let mut buf = [0 as c_char; 255];
-        unsafe { (api.version_string_read)(dev, buf.as_mut_ptr(), 255) };
-        let version = format!("HackRF {}", unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy());
-        let ctx = Box::into_raw(Box::new(Ctx { sink, geo: parking_lot::Mutex::new(Geometry::default()), state: parking_lot::Mutex::new(CbState::default()) }));
-        let d = HackrfDevice { api, dev, ctx, version, lib_path: lib_path.to_path_buf(), plan: None, streaming: false };
+        let ctx = Ctx { sink, geo: parking_lot::Mutex::new(Geometry::default()), state: parking_lot::Mutex::new(CbState::default()) };
+        let (io, version, shown) = if crate::hydra::native_for(crate::hydra::Board::HackRF, lib_path) {
+            let usb = crate::usbdev::Hackrf::open(serial)?;
+            let version = format!("HackRF {}", usb.version);
+            (Io::Native { usb, ctx: Arc::new(ctx) }, version, PathBuf::from(crate::hydra::NATIVE_LIB))
+        } else {
+            let api = Api::load(lib_path)?;
+            // hackrf_init is idempotent, and hackrf_exit only tears libusb down once no device is open.
+            let rc = unsafe { (api.init)() };
+            if rc != 0 {
+                return Err(api.err("hackrf_init", rc));
+            }
+            // libhackrf matches a serial by suffix: the low 64 bits in lower-case hex are enough.
+            let sn = (serial != 0).then(|| CString::new(format!("{serial:016x}")).unwrap());
+            let mut dev = std::ptr::null_mut();
+            let rc = unsafe { (api.open_by_serial)(sn.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()), &mut dev) };
+            if rc != 0 {
+                unsafe { (api.exit)() };
+                let which = if serial == 0 { "the HackRF".to_string() } else { format!("HackRF …{serial:016x}") };
+                return Err(api.err(&format!("open {which} (unplugged, or busy in another program?)"), rc));
+            }
+            let mut buf = [0 as c_char; 255];
+            unsafe { (api.version_string_read)(dev, buf.as_mut_ptr(), 255) };
+            let version = format!("HackRF {}", unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy());
+            (Io::Lib { api, dev, ctx: Box::into_raw(Box::new(ctx)) }, version, lib_path.to_path_buf())
+        };
+        let d = HackrfDevice { io, version, lib_path: shown, plan: None, streaming: false };
         d.configure(rx)?;
-        *EMERGENCY.lock() = Some(Emergency { sweep_stop: d.api.stop_rx, stop_rx: d.api.stop_rx, dev: d.dev as usize });
+        let stop: crate::hydra::Emergency = match &d.io {
+            Io::Lib { api, dev, .. } => {
+                let (stop, dev) = (api.stop_rx, *dev as usize);
+                Box::new(move || unsafe {
+                    stop(dev as *mut Dev);
+                })
+            }
+            Io::Native { usb, .. } => Box::new(usb.stopper()),
+        };
+        *EMERGENCY.lock() = Some(stop);
         Ok(d)
     }
 
-    fn check(&self, what: &str, rc: c_int) -> Result<(), String> {
-        if rc == 0 { Ok(()) } else { Err(self.api.err(what, rc)) }
-    }
-
     fn configure(&self, rx: RxSettings) -> Result<(), String> {
-        unsafe {
-            self.check("set_sample_rate 20 MSPS", (self.api.set_sample_rate)(self.dev, 20e6))?;
-            self.check("set_baseband_filter_bandwidth 15 MHz", (self.api.set_baseband_filter_bandwidth)(self.dev, 15_000_000))?;
-            self.check("RF amp off", (self.api.set_amp_enable)(self.dev, 0))?;
-            self.check("antenna port power off", (self.api.set_antenna_enable)(self.dev, 0))?;
-            if let Some(f) = self.api.set_ui_enable {
-                f(self.dev, 0); // a HackRF without a PortaPack ignores it
+        match &self.io {
+            Io::Lib { api, dev, .. } => {
+                let check = |what: &str, rc: c_int| if rc == 0 { Ok(()) } else { Err(api.err(what, rc)) };
+                unsafe {
+                    check("set_sample_rate 20 MSPS", (api.set_sample_rate)(*dev, 20e6))?;
+                    check("set_baseband_filter_bandwidth 15 MHz", (api.set_baseband_filter_bandwidth)(*dev, 15_000_000))?;
+                    check("RF amp off", (api.set_amp_enable)(*dev, 0))?;
+                    check("antenna port power off", (api.set_antenna_enable)(*dev, 0))?;
+                    if let Some(f) = api.set_ui_enable {
+                        f(*dev, 0); // a HackRF without a PortaPack ignores it
+                    }
+                }
+            }
+            Io::Native { usb, .. } => {
+                usb.set_sample_rate(20e6)?;
+                usb.set_baseband_filter_bandwidth(15_000_000)?;
+                usb.set_amp_enable(false)?;
+                usb.set_antenna_enable(false)?;
+                usb.set_ui_enable(false);
             }
         }
         self.apply_rx(rx)
@@ -230,15 +266,40 @@ impl HackrfDevice {
 
     fn apply_rx(&self, rx: RxSettings) -> Result<(), String> {
         let (lna, vga) = gains(rx.gain);
-        unsafe {
-            self.check("set_lna_gain", (self.api.set_lna_gain)(self.dev, lna))?;
-            self.check("set_vga_gain", (self.api.set_vga_gain)(self.dev, vga))
+        match &self.io {
+            Io::Lib { api, dev, .. } => unsafe {
+                let rc = (api.set_lna_gain)(*dev, lna);
+                if rc != 0 {
+                    return Err(api.err("set_lna_gain", rc));
+                }
+                let rc = (api.set_vga_gain)(*dev, vga);
+                if rc != 0 { Err(api.err("set_vga_gain", rc)) } else { Ok(()) }
+            },
+            Io::Native { usb, .. } => {
+                usb.set_lna_gain(lna)?;
+                usb.set_vga_gain(vga)
+            }
+        }
+    }
+
+    fn ctx(&self) -> &Ctx {
+        match &self.io {
+            // SAFETY: the context lives until Drop.
+            Io::Lib { ctx, .. } => unsafe { &**ctx },
+            Io::Native { ctx, .. } => ctx,
         }
     }
 
     fn stop_stream(&mut self) {
         if self.streaming {
-            unsafe { (self.api.stop_rx)(self.dev) };
+            match &mut self.io {
+                Io::Lib { api, dev, .. } => unsafe {
+                    (api.stop_rx)(*dev);
+                },
+                Io::Native { usb, .. } => {
+                    let _ = usb.stop_rx();
+                }
+            }
             self.streaming = false;
         }
     }
@@ -249,22 +310,29 @@ impl HackrfDevice {
         self.stop_stream();
         let lo = (plan.start_hz / 1e6).round() as u16;
         let hi = (plan.stop_hz / 1e6).round() as u16;
-        let freqs = [lo, hi];
         {
-            // SAFETY: the stream is stopped, so the callback isn't running.
-            let ctx = unsafe { &*self.ctx };
+            // the stream is stopped, so the callback isn't running
+            let ctx = self.ctx();
             *ctx.geo.lock() = Geometry { start_hz: lo as u64 * 1_000_000, f0: plan.f0, n_steps: plan.n_steps };
             let mut st = ctx.state.lock();
             st.last_freq = None;
             st.block = 0;
         }
         let num_bytes = plan.dwell.max(1) as u32 * BLOCK_BYTES as u32;
-        unsafe {
-            self.check(
-                "init_sweep",
-                (self.api.init_sweep)(self.dev, freqs.as_ptr(), 1, num_bytes, TUNE_STEP_HZ, OFFSET_HZ, INTERLEAVED),
-            )?;
-            self.check("start_rx_sweep", (self.api.start_rx_sweep)(self.dev, rx_callback, self.ctx as *mut c_void))?;
+        match &mut self.io {
+            Io::Lib { api, dev, ctx } => {
+                let freqs = [lo, hi];
+                let check = |what: &str, rc: c_int| if rc == 0 { Ok(()) } else { Err(api.err(what, rc)) };
+                unsafe {
+                    check("init_sweep", (api.init_sweep)(*dev, freqs.as_ptr(), 1, num_bytes, TUNE_STEP_HZ, OFFSET_HZ, INTERLEAVED))?;
+                    check("start_rx_sweep", (api.start_rx_sweep)(*dev, rx_callback, *ctx as *mut c_void))?;
+                }
+            }
+            Io::Native { usb, ctx } => {
+                usb.init_sweep(lo, hi, num_bytes, TUNE_STEP_HZ, OFFSET_HZ, true)?;
+                let ctx = ctx.clone();
+                usb.start_rx_sweep(move |bytes| on_blocks(&ctx, bytes))?;
+            }
         }
         self.streaming = true;
         self.plan = Some(plan.clone());
@@ -290,14 +358,17 @@ impl Drop for HackrfDevice {
     fn drop(&mut self) {
         EMERGENCY.lock().take();
         self.stop_stream();
-        unsafe {
-            if let Some(f) = self.api.set_ui_enable {
-                f(self.dev, 1);
+        if let Io::Lib { api, dev, ctx } = &self.io {
+            unsafe {
+                if let Some(f) = api.set_ui_enable {
+                    f(*dev, 1);
+                }
+                (api.close)(*dev);
+                (api.exit)();
+                drop(Box::from_raw(*ctx));
             }
-            (self.api.close)(self.dev);
-            (self.api.exit)();
-            drop(Box::from_raw(self.ctx));
         }
+        // the built-in driver turns the UI back on when it drops
     }
 }
 

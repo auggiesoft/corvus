@@ -85,8 +85,16 @@ their value. Negative numbers use U+2212.
 - Peak labels sit in a rail above the plot, with leaders down to their peaks (O1). The strongest
   peaks win the space, and the rest go into a "+N" pick list that can centre the view on any of
   them (O5). The levels are Full (12), Focus (4) and Minimal (none) (O4).
-- The hover readout is a fixed chip in the plot's top-left corner (O7). Its cursor runs through the
-  waterfall too (L7).
+- The hover readout follows the cursor by default, as a chip beside the pointer with a level line
+  (frequency is what people read most, so it sits where they're looking). A setting pins it as a
+  fixed chip in the plot's top-left corner instead (O7). Its cursor runs through the waterfall too
+  (L7), where it reads the row's age and level.
+- An overview strip above the plot shows the whole sweep with a viewport box (L6).
+- Dragging across the plot selects a range and offers Zoom in / Sweep this. The modifiers skip the
+  menu, and the menu has keys (Z, S, Esc).
+- The 3D waterfall is a second view of the same history, not a separate mode: same colour map,
+  levels and frequency zoom. Its labels (frequency ticks along the front edge, time along the left)
+  are drawn by egui over the GPU landscape.
 - VCO divider switch points are dashed lines in the plot. Their names (`VCO ÷8`) are on the strip
   under the axis, not over the data.
 - Waterfall: relative time ticks in the gutter, the clock time at the top, and a hairline plus a
@@ -108,6 +116,5 @@ their value. Negative numbers use U+2212.
 | L1 (MUST): no vertical scroll | Fits at 1920×1080 with every disclosure closed. Opening disclosures, or a smaller window, scrolls the sidebar (never the plot). | The scroll is a fallback for small windows. Nothing that needs watching is in the sidebar. |
 | L3 / gold thread: page bar with a gold underline | No page bar, so the gold appears only in the wordmark | Corvus Sweep has one page. |
 | P5 (SHOULD): offer Plain | Instrument only | The app runs on one desktop GPU; nothing needs a lighter fallback. |
-| L6 (SHOULD): overview strip with a viewport box | The plot shows the swept range, and "Sweep visible area" and Backspace move between ranges | Not built yet. |
 | I6 (SHOULD): command palette | The shortcut sheet (`?`) lists every command with its key | Not built yet. |
 | D4 meter ballistics, S3, S6, S8 | Not applicable | Corvus Sweep has no meters, mutes or stage mode. |

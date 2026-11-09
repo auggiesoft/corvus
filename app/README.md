@@ -13,23 +13,34 @@ Rust + egui/eframe (wgpu). It loads libhydrasdr with the Corvus sweep API at run
 ## Run
 
 ```
-../host/build/build.sh linux            # once: libhydrasdr with the sweep API (needs Docker)
 cargo run --release -- --sim            # built-in simulator, no radio needed
-cargo run --release                     # the first RFOne found (it must run the Corvus firmware)
+cargo run --release                     # the first supported board plugged in
 cargo run --release -- --serial 0123456789ABCDEF   # a particular board
 cargo run --release -- --range 400:470 --order asc
 cargo run --release -- --msps 10                 # the older 10 MSPS setting (8 MHz steps)
 cargo run --release -- --headless 10 --csv /tmp/spectrum.csv   # no window: rates, seam ripple, CSV
-../host/build/build.sh airspy-linux && cargo run --release -- --board airspy   # an Airspy R2
+cargo run --release -- --board airspy   # an Airspy R2 (--board mini, --board hackrf)
+cargo run --release -- --usb lib        # through the board's C library instead (see below)
+build/build.sh windows                  # corvus-sweep.exe for Windows (MinGW, in Docker)
 ```
 
-`--board airspy` (or `CORVUS_BOARD=airspy`) drives an Airspy R2 running the Corvus firmware through
-libairspy. The R2 runs 10 MSPS only and has one antenna input, so the rate and port controls go away
+**No library needed.** Corvus Sweep talks to every board through its **built-in USB driver**
+(`src/usbdev.rs`, pure Rust via nusb): the requests the app uses from libhydrasdr, libairspy and
+libhackrf, ported one for one. One binary, nothing to install, the same on Linux and Windows. Checked
+side by side against each library on an RFOne, an R2, a Mini and a HackRF: the same noise floor
+(within 0.1 dB), the same signal levels within run-to-run drift, the same steps/s, no integrity issues,
+in firmware and PC-driven sweeps; `cargo test --release -- --ignored real_boards` (with
+`CORVUS_TEST_SERIALS`) drives each board through gain changes, pause/resume, replans and reopening.
+`--usb lib` (or `CORVUS_USB=lib`) uses the board's C library instead: libhydrasdr or libairspy with the
+Corvus sweep API (`../host/build/build.sh linux` / `airspy-linux`), or the system libhackrf.
+
+Without `--board`, the app picks the first supported board plugged in (the one with `--serial`, if
+given). `--board airspy` (or `CORVUS_BOARD=airspy`) drives an Airspy R2. The R2 runs 10 MSPS only and has one antenna input, so the rate and port controls go away
 and profiles with 10 MHz steps use 8 MHz. `--board mini` drives an Airspy Mini: 6 MSPS (12 MHz ADC,
 3 MHz IF), steps of 2–4 MHz, profiles at 4 MHz. Each board's learned passband is cached separately.
 
-`--board hackrf` drives a HackRF One on its **stock** firmware, through the system libhackrf and the
-same firmware sweep `hackrf_sweep` uses: 20 MSPS complex, tunes 5 and 15 MHz past each 20 MHz base,
+`--board hackrf` drives a HackRF One on its **stock** firmware, with the same firmware sweep
+`hackrf_sweep` uses: 20 MSPS complex, tunes 5 and 15 MHz past each 20 MHz base,
 each tune giving the 5 MHz slice below its LO and the one above. The app treats the slices as steps of
 a 5 MHz grid (visited 0, 2, 1, 3, 4, ...), so stitching, peaks, the waterfall and integrity work as for
 the other boards, from 1 MHz to 6 GHz. While it's open, the PortaPack's screen (if one is fitted) is
@@ -54,8 +65,13 @@ GL libraries that wgpu uses.
 
 The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the details and exceptions).
 
-- **Top bar:** Run/Pause, Auto levels, Export CSV, Snapshot, Settings (density, text size, frame
-  rate cap, grid and trace brightness) and `?` for the shortcut sheet.
+- **Top bar:** a device chip, Run/Pause, Auto levels, Export CSV, Snapshot, Settings (density, text
+  size, frame rate cap, grid and trace brightness) and `?` for the shortcut sheet.
+  - The **device chip** (with a ▾) names the radio and how it sweeps: green for Corvus firmware or the
+    HackRF's own sweep, amber for a PC-driven sweep on stock firmware, blue for the simulator, red
+    when nothing is open. Hover for the firmware, serial and library. Click it to switch radios without restarting: it lists every RFOne, Airspy R2/Mini
+    and HackRF on USB, plus the simulator. The sweep is re-planned for the new board (rates, steps
+    and ports differ), and each board keeps its own learned passband.
 - **Status bar:** one tile ("All good", or how many problems) and the current conditions as
   sentences with a button that fixes each one: RFOne not open, a refused setting, steps lost in the
   last 10 s, lock check off, paused, simulator, a range that can't avoid a VCO switch.
@@ -63,10 +79,15 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
   order, PLL lock polls, integrity (torn / gaps / timeouts / host drops) and USB MB/s. After any
   restart (plan, gain or port change, resume), blocks are dropped quietly until the new run's first
   block arrives, so the old plan's blocks still in flight don't count as misfiled or as gaps.
-- **Spectrum:** live trace (cyan), peak hold (sand) and video average (violet) on a black well.
+- **Overview strip:** the whole swept range as a thin trace, with a box for the part the plot
+  shows. Drag the box to pan (zoomed all the way out: to move the swept range), drag its edges to
+  zoom, click to centre there, double-click to show the full sweep. It can be turned off under Display.
+- **Spectrum:** live trace (cyan), peak (sand) and average (violet) on a black well.
   - Peak labels sit in a rail above the plot with leaders to their peaks. The ones without room go
     into a "+N" list that can centre the view on them.
-  - The hover readout is always in the top-left corner.
+  - The hover readout follows the cursor: frequency and level next to the pointer, with a level
+    line across the plot. Over the waterfall it gives the row's age and level. Display has a
+    setting to pin it in the top-left corner instead.
   - The **sweep beam** faintly lights each step as the firmware visits it, but only when a full pass
     takes about a second or more (fine steps, slow settings). Faster than that it can only flash.
   - Dashed lines mark the tuner's **VCO divider switch points** (50.3, 105.6, 216.3, 437.5, 880 MHz).
@@ -77,6 +98,14 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
 - **Waterfall:** one row per pass (narrow plans merge passes up to a max row rate), drawn from a GPU
   texture ring. The gutter has relative time, the clock time at the top, and a `retune` line
   wherever gain, port or flattening changed.
+  - Drag the grip between the spectrum and the waterfall to share the height between them.
+  - **3D view** (the button at the top right of the waterfall, **W**, or `--3d`): the history as a
+    lit landscape on the GPU, newest row at the front, frequency left to right, height and colour
+    from level. Drag to turn it, scroll to zoom, double-click to reset. It frames itself to fill the
+    pane, and follows the plot's zoom and the waterfall's colour map and levels. It's drawn with 4×
+    multisample anti-aliasing, and *3D smoothing* (Display, under the disclosure, while 3D is on) puts
+    a Gaussian filter over the heights: Off, Light (the default) or Strong. The filter averages in
+    power, not dB, so a narrow carrier keeps most of its height while the noise floor calms down.
   - Changing the range, profile, step, rate, order, dwell, lock reads, settle or bin width doesn't
     clear it. A hard break (a gap with a label such as "400–1000 MHz" or "Quality") marks the
     change, and older rows are re-mapped onto the new frequency axis from their own data: at their
@@ -89,8 +118,13 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
   area*, *Full range*, and a ↶ button back to the previous range.
   - Typed values apply on Enter, Tab or clicking away, and Esc cancels. A typed start above the
     stop, or a stop below the start, keeps the old span.
-  - Shift-drag on the plot sweeps the selected range. Ranges smaller than one step become a single
-    retuned step.
+  - Drag across the plot to select a range, then pick *Zoom in* (Z or Enter) or *Sweep this* (S)
+    from the menu that opens. Shift-drag sweeps straight away, Ctrl-drag zooms straight away.
+    Ranges smaller than one step become a single retuned step.
+  - Zoomed all the way out, drag the frequency axis under the plot, or the box on the overview
+    strip, to move the swept range itself (same width). The plot slides as a preview, a chip shows
+    the new range, and it retunes when you let go; Esc cancels. The range stops at what the radio
+    can tune, so a full-range sweep has nowhere to go.
 - **Sweep engine:** a scan profile (F2–F5), with sample rate, order, dwell, lock reads and settle
   under a disclosure. A profile sets those (and the step), and the header then offers a ↶ button
   back to what you had. Range, receiver and display are left alone, except where noted.
@@ -114,6 +148,17 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
   points), peak/mean detector, traces, flatten passband, and peak labels Full / Focus / Minimal.
   Beam, switch marks, *Clear peaks* and *Relearn the passband* (a two-step confirm) are under a
   disclosure.
+  - **Average:** each bin's exponential average over the *Averaging* time (0.5–60 s, default 10 s;
+    the caption says how many passes that is at the current speed). The time runs on the device
+    clock, so it means the same on every board and profile. *Average in* dB (a video average: smooth,
+    about 2.5 dB under the true mean on noise, little moved by bursts) or Power (the true mean
+    power, so busy channels read higher). Changing either restarts the average.
+  - **Peak trace** (under the disclosure): *Hold* keeps the highest level since the last clear.
+    *Decay* rises at once, holds 1 s, then falls at 1–30 dB/s (default 6), so it shows where
+    signals have been lately. *Percentile* tracks the level each bin is under 50/75/90/95 % of the
+    time over a 1–120 s window: P90 ignores one-off spikes and rises on channels that are busy more
+    than a tenth of the time. The trace's name in Traces follows the mode (Peak, Peak ↓, P90), and
+    the CSV's peak column holds whichever it is. The Bursts profile switches to Hold.
 - **Levels** (closed by default): spectrum and waterfall ranges, Inferno / Viridis / Grey colour
   maps, history length and row rate.
 - **Sliders** never jump. Drag relative to the current value (Shift for fine), use the wheel, or
@@ -122,7 +167,8 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
 - **Labels with a dotted underline** explain themselves on hover; click to keep the explanation
   open.
 - **Mouse and keys:**
-  - Scroll zooms, drag pans, double-click resets the view.
+  - Scroll zooms, right- or middle-drag pans (as does dragging the frequency axis), plain drag
+    selects (above), double-click resets the view.
   - Drag or scroll the dB gutter to move or stretch the scale.
   - **?** or **F1** shows every shortcut. The main ones:
     - Sweep: Space run/pause, **G** type a range (Start, Tab, Stop, Enter), **1–9** band presets,
@@ -130,9 +176,16 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
       S sweep the visible area, [ / ] step size, M 10/12 MSPS, O visiting order.
     - Profiles: F2 Fastest, F3 Quality, F4 Weak signals, F5 Bursts.
     - View: ←/→ pan, + / − zoom, 0 or Home reset zoom, ↑/↓ move the dB scale.
-    - Display: A auto levels, P clear peak, H peak hold, V average, E flatten passband, B beam.
+    - Display: A auto levels, P clear peak, H peak hold, V average, E flatten passband, B beam,
+      W 3D waterfall.
     - Files: Ctrl+E export CSV, Ctrl+S snapshot.
-  - Keys are ignored while a text field has the cursor.
+  - Keys are ignored while a text field has the cursor, the Zoom/Sweep menu is open or the radio
+    picker is open (those take their own keys).
+  - **Gesture hints:** with the pointer over the plot, a small note in the corner says what dragging,
+    scrolling and panning do. Each part goes away once you've used that gesture, and the 3D view's
+    instructions go once you've turned it. While dragging, the selection names what letting go will
+    do. The separator, overview strip, frequency axis and dB gutter explain themselves on hover.
+    Settings → *Gesture hints* turns them off, and *Show them again* brings them back.
 - *Export CSV* and *Snapshot* write to `../captures/` if it exists (gitignored), otherwise to
   `~/.local/share/corvus-sweep/captures/`.
 
@@ -184,12 +237,16 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 
 | File | |
 |---|---|
-| `src/hydra.rs` | libloading FFI to libhydrasdr, block tags, `Device` (open, configure, sweep, stop → set → start) |
+| `src/hydra.rs` | libloading FFI to libhydrasdr/libairspy, block tags, `Device` (open, configure, sweep, stop → set → start) |
+| `src/usbdev.rs` | the built-in USB driver for every board (libhydrasdr's, libairspy's and libhackrf's requests in Rust, nusb), and board discovery on any platform |
+| `src/hackrf.rs` | the HackRF's stock sweep: setup and re-tagging its blocks as 5 MHz steps (built-in driver or libhackrf) |
+| `build/` | `build.sh windows`: the Windows cross-build (MinGW in Docker) |
 | `src/plan.rs` | sample rate, range → step grid, firmware visiting order, VCO divider model, presets |
 | `src/dsp.rs` | raw block → dBFS power on the RF offset grid (rustfft, Hann, Welch) |
 | `src/engine.rs` | worker thread: parse, accumulate dwell, stitch, peak/avg, flatness learner, waterfall rows, stats |
 | `src/sim.rs` | synthetic band plan with the firmware's hop timing |
 | `src/app.rs`, `waterfall.rs` | UI: frame, status, HUD, sidebar, plot, waterfall, keys |
+| `src/view3d.rs` | 3D waterfall: a wgpu paint callback (WGSL, heights from a texture, no vertex buffer) and its orbit camera |
 | `src/theme.rs` | Instrument tokens, house fonts, and the guide's widgets (never-jumping slider, hints, two-step confirm) |
 | `assets/fonts/` | Barlow, Barlow Semi Condensed, Auggie Mono (SIL OFL), compiled in |
 | `DESIGN.md` | how the UI follows the auggiesoft guide, and its exceptions |
@@ -202,5 +259,7 @@ stitching and pass counting.
 
 - *Snapshot* uses eframe's wgpu screen capture. It never returned on a Hyprland headless output and
   is untested on a real display (`grim` works as a fallback).
-- Linux only for now. `../host/build/build.sh windows` builds the library for Windows, but the app
-  hasn't been built or tested there.
+- **Windows:** `build/build.sh windows` cross-builds `corvus-sweep.exe` (MinGW, in Docker), also in the
+  release. It imports only Windows system DLLs and needs nothing else: every board's firmware asks
+  Windows for WinUSB through Microsoft OS descriptors (if another driver such as libusbK took a board,
+  Zadig can switch it to WinUSB). First tests on Windows hardware are under way.

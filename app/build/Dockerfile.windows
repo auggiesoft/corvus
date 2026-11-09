@@ -1,0 +1,6 @@
+# Corvus Sweep for Windows x64, cross-built with MinGW-w64 (x86_64-pc-windows-gnu). The app talks to the
+# Airspy over its built-in USB driver (WinUSB), so nothing but the .exe is needed for it.
+FROM rust:1.99-bookworm
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc-mingw-w64-x86-64 \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup target add x86_64-pc-windows-gnu

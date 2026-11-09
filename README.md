@@ -17,8 +17,12 @@ spectrum: on the RFOne, **24–1800 MHz about five times a second (8.6 GHz/s), l
 
 The three Corvus boards speak the same sweep protocol, and the same API is added to their host
 libraries (libhydrasdr for the RFOne, libairspy for the Airspys). The R2/Mini image detects which board
-it's on at boot. The HackRF already has a firmware sweep, so Corvus Sweep drives it through the
-system libhackrf as it is, from 1 MHz to 6 GHz.
+it's on at boot. The HackRF already has a firmware sweep, so Corvus Sweep drives it as it is, from
+1 MHz to 6 GHz.
+
+**Corvus Sweep needs no library or driver install.** It talks to every board over USB itself (a
+built-in driver ported from the boards' libraries), so it's one file on Linux and one `.exe` on
+Windows, where all four boards use WinUSB, which their firmware asks Windows for.
 
 **Stock firmware works too, just slower.** On an RFOne or Airspy without the Corvus firmware, Corvus
 Sweep retunes the board from the PC step by step: about 30–60 steps a second (0.1–0.6 GHz/s), roughly
@@ -42,7 +46,7 @@ Sweep retunes the board from the PC step by step: about 30–60 steps a second (
 
 ## Try it
 
-Prebuilt firmware images, libraries and Corvus Sweep for Linux are on the
+Prebuilt firmware images, libraries and Corvus Sweep for Linux and Windows are on the
 [Releases](https://github.com/auggiesoft/corvus/releases) page, built by `tools/release.sh` in GitHub
 Actions on every version tag. To build everything yourself, run `tools/release.sh` (Docker and Rust).
 
@@ -57,15 +61,14 @@ With a board (everything builds in Docker):
 
 | | RFOne | Airspy R2 or Mini | HackRF One |
 |---|---|---|---|
-| 1. Build the library | `host/build/build.sh linux` | `host/build/build.sh airspy-linux` | install libhackrf (your distribution's `hackrf` package) |
-| 2. Build the firmware | `firmware/build/build.sh rfone` | `firmware/build/build.sh airspy` | not needed: stock firmware |
-| 3. Flash it | [firmware/README.md](firmware/README.md#flashing) | the same section, with the airspy tools | not needed |
-| 4. Run Corvus Sweep (in `app/`) | `cargo run --release` | `cargo run --release -- --board airspy` (R2) or `--board mini` | `cargo run --release -- --board hackrf` |
+| 1. Build the firmware | `firmware/build/build.sh rfone` | `firmware/build/build.sh airspy` | not needed: stock firmware |
+| 2. Flash it (with the board's tools: `host/build/build.sh linux` / `airspy-linux` builds them) | [firmware/README.md](firmware/README.md#flashing) | the same section, with the airspy tools | not needed |
+| 3. Run Corvus Sweep (in `app/`) | `cargo run --release` | `cargo run --release` (it finds the R2 or Mini) | `cargo run --release` |
 
-Steps 2–3 are optional for the RFOne and the Airspys: on stock firmware Corvus Sweep falls back to the
-slower PC-driven sweep.
+Steps 1–2 are optional for the RFOne and the Airspys: on stock firmware Corvus Sweep falls back to the
+slower PC-driven sweep. With more than one board plugged in, pick one with `--board` or `--serial`.
 
-**Back up the board's flash before step 3**, and keep the file. The firmware README has the commands,
+**Back up the board's flash before step 2**, and keep the file. The firmware README has the commands,
 and how to recover a board if a flash goes wrong (that means opening the case).
 
 ## Status
@@ -73,8 +76,9 @@ and how to recover a board if a flash goes wrong (that means opening the case).
 - The RFOne firmware (`v1.0.2-sweep5`), the library and Corvus Sweep are used daily on one RFOne
   under Linux. Every firmware version has passed the same regression checks: normal streaming is
   unchanged, and the factory calibration survives flashing.
-- The Windows library builds but hasn't been tested on hardware, and the app hasn't been built for
-  Windows.
+- Corvus Sweep for Windows (`corvus-sweep-<version>-windows-x64.zip` on the Releases page, or
+  `app/build/build.sh windows`) is a single `.exe` using the built-in USB driver; first tests on Windows
+  hardware are under way. The libhydrasdr Windows build is untested on hardware.
 - The Airspy R2 and Mini were added on 2026-11-08 and tested on one board each: firmware flashed from
   stock rc10, calibration intact, normal streaming unchanged with the stock tools, sweeps with clean
   integrity, `host/tests/test_airspy_sweep_api.py` passing, and a killed host never locking out the next

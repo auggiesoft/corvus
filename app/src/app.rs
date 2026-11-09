@@ -7,11 +7,11 @@ use egui::{Align2, Color32, Key, Mesh, Modifiers, Painter, PointerButton, Pos2, 
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::{self, NFFTS};
-use crate::engine::{Detector, DspSettings, Engine, EqState, Stats, Trace};
+use crate::engine::{Detector, DspSettings, Engine, EqState, PeakMode, Stats, Trace};
 use crate::hydra::{self, Device, Gain, RxSettings};
 use crate::plan::{self, Order, PRESETS, Plan, Rate};
 use crate::sim::Sim;
-use crate::theme::{self, ACCENT, AVERAGE, CAUTION, CHIP, Density, EDGE, GRATICULE, HOUSE, INK, INK2, INK3, LINE, Level, PANEL, PEAK, Palette, SCALE_INK, Slide, TOUCH, TRACE, WELL};
+use crate::theme::{self, ACCENT, AVERAGE, BG, CAUTION, CHIP, Density, EDGE, GRATICULE, HOUSE, INK, INK2, INK3, LINE, Level, PANEL, PEAK, Palette, SCALE_INK, Slide, TOUCH, TRACE, WELL};
 use crate::waterfall::{ROWS, Waterfall};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -30,7 +30,14 @@ pub struct Config {
     pub nfft: usize,
     pub detector: Detector,
     pub show_avg: bool,
-    pub avg_alpha: f32,
+    /// Averaging time (s) and kind (linear power or dB).
+    pub avg_secs: f32,
+    pub avg_power: bool,
+    /// The peak trace: hold, decay (fall in dB/s) or a running percentile (percent, window in s).
+    pub peak_kind: PeakKind,
+    pub peak_fall: f32,
+    pub peak_pct: u8,
+    pub peak_win: f32,
     pub show_peak: bool,
     pub eq_on: bool,
     pub beam: bool,
@@ -51,6 +58,37 @@ pub struct Config {
     /// Graticule and trace brightness, in percent (rule D9).
     pub grid_dim: f32,
     pub data_dim: f32,
+    /// Share of the plot height the spectrum takes; the waterfall gets the rest (drag the separator).
+    pub split: f32,
+    /// The hover readout follows the cursor (else it sits in the plot's corner).
+    pub readout_follow: bool,
+    /// The overview strip above the spectrum: the whole sweep, with the zoomed view as a box.
+    pub overview: bool,
+    /// The waterfall pane shows the 3D landscape instead of the flat waterfall.
+    pub wf3d: bool,
+    pub cam3d: crate::view3d::Camera,
+    /// 3D smoothing: 0 off, 1 light, 2 strong (a Gaussian over the heights, see `view3d::smooth`).
+    pub smooth3d: u8,
+    /// Gesture hints over the plot (each retires once its gesture has been used; see `Hint`).
+    pub hints: bool,
+    pub hints_learned: u8,
+}
+
+/// What the peak trace keeps (see `engine::PeakMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PeakKind {
+    Hold,
+    Decay,
+    Percentile,
+}
+
+/// Gestures with a hint that goes away once used (bits of `Config::hints_learned`).
+struct Hint;
+impl Hint {
+    const SELECT: u8 = 1;
+    const PAN: u8 = 2;
+    const ZOOM: u8 = 4;
+    const ORBIT: u8 = 8;
 }
 
 impl Default for Config {
@@ -69,7 +107,12 @@ impl Default for Config {
             nfft: 2048,
             detector: Detector::Peak,
             show_avg: false,
-            avg_alpha: 0.2,
+            avg_secs: 10.0,
+            avg_power: false,
+            peak_kind: PeakKind::Hold,
+            peak_fall: 6.0,
+            peak_pct: 90,
+            peak_win: 10.0,
             show_peak: true,
             eq_on: true,
             beam: true,
@@ -87,11 +130,28 @@ impl Default for Config {
             text_scale: 1.0,
             grid_dim: 70.0,
             data_dim: 100.0,
+            split: 0.48,
+            readout_follow: true,
+            overview: true,
+            wf3d: false,
+            cam3d: crate::view3d::Camera::default(),
+            smooth3d: 1,
+            hints: true,
+            hints_learned: 0,
         }
     }
 }
 
 impl Config {
+    /// A gesture hint still worth showing.
+    fn hint(&self, h: u8) -> bool {
+        self.hints && self.hints_learned & h == 0
+    }
+
+    fn learned(&mut self, h: u8) {
+        self.hints_learned |= h;
+    }
+
     fn plan(&self) -> Plan {
         Plan::new(self.start_mhz, self.stop_mhz, self.step_mhz, self.dwell, self.skip, self.lock_reads, self.order, self.rate)
     }
@@ -146,7 +206,21 @@ impl Config {
     }
 
     fn dsp(&self) -> DspSettings {
-        DspSettings { nfft: self.nfft, avg_alpha: if self.show_avg { self.avg_alpha } else { 0.0 }, eq_on: self.eq_on, wf_rate: self.wf_rate }
+        let peak = match self.peak_kind {
+            PeakKind::Hold => PeakMode::Hold,
+            PeakKind::Decay => PeakMode::Decay(self.peak_fall),
+            PeakKind::Percentile => PeakMode::Percentile { p: self.peak_pct as f32 / 100.0, tau: self.peak_win },
+        };
+        DspSettings { nfft: self.nfft, avg_tau: if self.show_avg { self.avg_secs } else { 0.0 }, avg_power: self.avg_power, peak, eq_on: self.eq_on, wf_rate: self.wf_rate }
+    }
+
+    /// The peak trace's name as the Traces row shows it.
+    fn peak_name(&self) -> String {
+        match self.peak_kind {
+            PeakKind::Hold => "Peak".into(),
+            PeakKind::Decay => "Peak ↓".into(),
+            PeakKind::Percentile => format!("P{}", self.peak_pct),
+        }
     }
 }
 
@@ -240,6 +314,7 @@ impl Profile {
         }
         if self.peak_hold {
             c.show_peak = true;
+            c.peak_kind = PeakKind::Hold;
             c.detector = Detector::Peak;
         }
     }
@@ -253,7 +328,7 @@ impl Profile {
             && c.lock_reads == self.lock_reads
             && c.skip == self.skip
             && self.nfft.is_none_or(|n| c.nfft == n)
-            && (!self.peak_hold || (c.show_peak && c.detector == Detector::Peak))
+            && (!self.peak_hold || (c.show_peak && c.peak_kind == PeakKind::Hold && c.detector == Detector::Peak))
     }
 }
 
@@ -268,17 +343,18 @@ struct EngineSnap {
     skip: u8,
     nfft: usize,
     show_peak: bool,
+    peak_kind: PeakKind,
     detector: Detector,
 }
 
 impl EngineSnap {
     fn of(c: &Config) -> EngineSnap {
-        EngineSnap { rate: c.rate, step_mhz: c.step_mhz, order: c.order, dwell: c.dwell, lock_reads: c.lock_reads, skip: c.skip, nfft: c.nfft, show_peak: c.show_peak, detector: c.detector }
+        EngineSnap { rate: c.rate, step_mhz: c.step_mhz, order: c.order, dwell: c.dwell, lock_reads: c.lock_reads, skip: c.skip, nfft: c.nfft, show_peak: c.show_peak, peak_kind: c.peak_kind, detector: c.detector }
     }
 
     fn restore(&self, c: &mut Config) {
-        (c.rate, c.step_mhz, c.order, c.dwell, c.lock_reads, c.skip, c.nfft, c.show_peak, c.detector) =
-            (self.rate, self.step_mhz, self.order, self.dwell, self.lock_reads, self.skip, self.nfft, self.show_peak, self.detector);
+        (c.rate, c.step_mhz, c.order, c.dwell, c.lock_reads, c.skip, c.nfft, c.show_peak, c.peak_kind, c.detector) =
+            (self.rate, self.step_mhz, self.order, self.dwell, self.lock_reads, self.skip, self.nfft, self.show_peak, self.peak_kind, self.detector);
     }
 }
 
@@ -289,6 +365,10 @@ pub struct Options {
     pub screenshot: Option<(PathBuf, f32)>,
     pub overrides: Vec<Box<dyn Fn(&mut Config)>>,
 }
+
+/// What the cached 3D heights were built from: waterfall stamp, view (×1e5), grid size, floor (×10),
+/// smoothing.
+type V3Key = ((usize, usize, u64, usize), i32, i32, usize, usize, i32, u8);
 
 enum Src {
     Device(Device),
@@ -336,12 +416,33 @@ impl Src {
     }
 }
 
+/// What a primary drag on the plot does when it's let go.
+#[derive(Clone, Copy, PartialEq)]
+enum DragMode {
+    /// Offer Zoom or Sweep.
+    Ask,
+    /// Shift: sweep the span straight away.
+    Sweep,
+    /// Ctrl: zoom to it straight away.
+    Zoom,
+}
+
+/// Which part of the overview's view box a drag holds.
+#[derive(Clone, Copy, PartialEq)]
+enum OvGrab {
+    Move,
+    Left,
+    Right,
+}
+
 #[derive(Default)]
 struct Shown {
     live: (Vec<f64>, Vec<f32>),
     avg: Option<(Vec<f64>, Vec<f32>)>,
     peak: Option<(Vec<f64>, Vec<f32>)>,
     hover: Option<(f64, f32)>,
+    /// The whole sweep at the overview strip's width.
+    overview: Option<(Vec<f64>, Vec<f32>)>,
 }
 
 pub struct App {
@@ -363,6 +464,19 @@ pub struct App {
     labels_t: Instant,
     selection: Option<(f64, f64)>,
     hover_x: Option<f32>,
+    /// Pointer position over the spectrum or waterfall, and which one (true: waterfall).
+    hover_pos: Option<(Pos2, bool)>,
+    /// A dragged span waiting for Zoom or Sweep, and where the pointer let go.
+    pending_sel: Option<(f64, f64, Pos2)>,
+    /// The pointer is on (or dragging) the spectrum/waterfall separator.
+    sep_hot: bool,
+    /// Zoomed all the way out, dragging the axis or the overview box moves the swept range itself: the
+    /// offset so far (Hz). The view follows it as a preview; letting go retunes.
+    range_drag: Option<f64>,
+    /// What the current primary drag does when released.
+    drag_mode: DragMode,
+    /// Overview strip drag: what's being moved, and the view when it started.
+    ov_drag: Option<(OvGrab, (f64, f64))>,
     shown: Shown,
     /// Acknowledges the user's own action for 2.6 s (rule A1).
     toast: Option<(String, Instant)>,
@@ -390,6 +504,15 @@ pub struct App {
     auto_pending: bool,
     switches: Vec<f64>,
     lib: PathBuf,
+    /// The board and library given at startup (`--lib` only applies to that board).
+    start_lib: (crate::hydra::Board, PathBuf),
+    /// The 3D pipeline is set up (a wgpu renderer with a depth buffer).
+    view3d_ok: bool,
+    /// What the 3D view's heights were last built from, and the palette last uploaded.
+    v3_key: Option<V3Key>,
+    v3_palette: Option<Palette>,
+    /// The device picker under the device chip: open, where, and what was found on USB.
+    picker: Option<(Pos2, Vec<crate::hydra::Found>)>,
     serial: u64,
     screenshot: Option<(PathBuf, f32)>,
     shot_requested: Option<(PathBuf, bool)>,
@@ -429,7 +552,7 @@ impl App {
             open_device(&opts.lib, opts.serial, &engine, &plan, rx)
         };
         let view = (plan.start_hz, plan.stop_hz);
-        App {
+        let mut app = App {
             engine,
             src,
             applied: plan,
@@ -447,6 +570,12 @@ impl App {
             labels_t: Instant::now(),
             selection: None,
             hover_x: None,
+            hover_pos: None,
+            pending_sel: None,
+            sep_hot: false,
+            range_drag: None,
+            drag_mode: DragMode::Ask,
+            ov_drag: None,
             shown: Shown::default(),
             toast: None,
             error: None,
@@ -463,6 +592,11 @@ impl App {
             styled: None,
             auto_pending: true,
             switches: plan::divider_switches(cfg.rate),
+            view3d_ok: cc.wgpu_render_state.as_ref().is_some_and(|rs| crate::view3d::init(rs, eframe::egui_wgpu::depth_format_from_bits(24, 0))),
+            v3_key: None,
+            v3_palette: None,
+            start_lib: (crate::hydra::board(), opts.lib.clone()),
+            picker: None,
             lib: opts.lib,
             serial: opts.serial,
             screenshot: opts.screenshot,
@@ -472,7 +606,19 @@ impl App {
             focus_start: false,
             show_keys: false,
             cfg,
+        };
+        // the firmware said which Airspy it is (the board was switched while opening): fit and sweep
+        if !crate::hydra::board().rates().contains(&app.applied.rate) {
+            app.engine.set_eq_prefix(crate::hydra::board().cache_prefix());
+            app.cfg.fit_board();
+            app.replan();
+            if let Src::Device(d) = &mut app.src
+                && let Err(e) = d.sweep(&app.applied)
+            {
+                app.src = Src::Offline(e);
+            }
         }
+        app
     }
 
     /// Acknowledge the user's own action for 2.6 s. A failure is a condition instead: it stays in
@@ -603,6 +749,110 @@ impl App {
         }
     }
 
+    /// Close what's open and open another board (or the simulator, with `None`): switch the board, its
+    /// learned passband and the settings it allows, then start the sweep. An Airspy turns out to be an
+    /// R2 or a Mini only once opened, so the settings are fitted again afterwards.
+    fn switch_device(&mut self, target: Option<(crate::hydra::Board, u64)>) {
+        self.src = Src::Offline(String::new());
+        let Some((board, serial)) = target else {
+            self.cfg.fit_board();
+            self.replan();
+            self.use_sim();
+            self.toast("Simulator", false);
+            return;
+        };
+        crate::hydra::set_board(board);
+        self.serial = serial;
+        self.lib = if board == self.start_lib.0 { self.start_lib.1.clone() } else { crate::hydra::default_lib_path(board) };
+        self.engine.set_eq_prefix(board.cache_prefix());
+        self.cfg.fit_board();
+        self.replan();
+        self.src = open_device(&self.lib, self.serial, &self.engine, &self.applied, self.applied_rx);
+        let now = crate::hydra::board();
+        if now != board {
+            // the firmware said which Airspy it is
+            self.engine.set_eq_prefix(now.cache_prefix());
+            self.cfg.fit_board();
+            self.replan();
+            if let Src::Device(d) = &mut self.src
+                && let Err(e) = d.sweep(&self.applied)
+            {
+                self.src = Src::Offline(e);
+            }
+        }
+        if let Src::Device(_) = self.src {
+            self.engine.set_persist_eq(true);
+            self.engine.note_restart();
+            self.running = true;
+            self.toast(format!("{} connected", now.name()), false);
+        } else {
+            self.engine.set_persist_eq(false);
+        }
+    }
+
+    /// Make the plan from the settings and hand it to the engine (not to a device).
+    fn replan(&mut self) {
+        let p = self.cfg.plan();
+        self.cfg.start_mhz = p.start_hz / 1e6;
+        self.cfg.stop_mhz = p.stop_hz / 1e6;
+        self.switches = plan::divider_switches(p.rate);
+        self.engine.set_plan(p.clone());
+        self.view = (p.start_hz, p.stop_hz);
+        self.labels.clear();
+        self.applied = p;
+    }
+
+    /// The device picker: boards found on USB and the simulator; the current one is lit.
+    fn device_picker(&mut self, ui: &mut Ui) {
+        let Some((pos, found)) = self.picker.clone() else { return };
+        let mut pick: Option<Option<(crate::hydra::Board, u64)>> = None;
+        let mut close = false;
+        let area = egui::Area::new(ui.id().with("devpicker")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(330.0);
+                theme::section(ui, "Radios");
+                if found.is_empty() {
+                    theme::caption(ui, "Nothing found on USB. Plug a board in and refresh.");
+                }
+                let cur_board = crate::hydra::board();
+                let live = matches!(self.src, Src::Device(_));
+                for f in &found {
+                    let same_family = f.board == cur_board || (f.board == crate::hydra::Board::Airspy && cur_board == crate::hydra::Board::Mini);
+                    let current = live && same_family && (f.serial == self.serial || self.serial == 0);
+                    let label = if f.board == crate::hydra::Board::Airspy && current { cur_board.name().to_string() } else { f.label.clone() };
+                    let text = RichText::new(format!("{label}   {:016X}", f.serial)).font(theme::num(theme::SM));
+                    if ui.add(egui::Button::selectable(current, text)).clicked() && !current {
+                        pick = Some(Some((f.board, f.serial)));
+                    }
+                }
+                ui.separator();
+                let sim = matches!(self.src, Src::Sim(_));
+                if ui.add(egui::Button::selectable(sim, format!("Simulator ({} timing)", cur_board.name()))).clicked() && !sim {
+                    pick = Some(None);
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.picker = Some((pos, crate::hydra::list_devices()));
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+                theme::caption(ui, "Boards on Corvus firmware sweep on the board; stock firmware is swept from the PC, more slowly. A board another program is using won't open.");
+            });
+        });
+        if let Some(t) = pick {
+            self.picker = None;
+            self.switch_device(t);
+            return;
+        }
+        let outside = ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer();
+        if close || outside || ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.picker = None;
+        }
+    }
+
     fn use_sim(&mut self) {
         self.engine.set_persist_eq(false);
         self.src = Src::Sim(Sim::start(self.engine.sink(), self.applied.clone(), self.applied_rx));
@@ -641,7 +891,8 @@ impl App {
             ui.label(RichText::new("AUGGIESOFT").font(theme::label_font(15.0)).extra_letter_spacing(15.0 * 0.14).color(HOUSE));
             ui.add_space(8.0);
             ui.label(RichText::new("Corvus Sweep").size(theme::MD).color(INK));
-            ui.label(RichText::new(format!("{} firmware sweep, stitched live", crate::hydra::board().name())).size(theme::SM).color(INK2));
+            ui.add_space(10.0);
+            self.device_chip(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("?").on_hover_text("Keyboard shortcuts (? or F1)").clicked() {
                     self.show_keys = !self.show_keys;
@@ -665,6 +916,46 @@ impl App {
         });
     }
 
+    /// What's connected and how it sweeps: (dot colour, short text, details for the hover).
+    fn device_status(&self) -> (Color32, String, String) {
+        let board = crate::hydra::board().name();
+        match &self.src {
+            Src::Sim(_) => (theme::INFO, format!("Simulator · {board} timing"), "A synthetic band plan swept with the firmware's timing. No radio is open.".into()),
+            Src::Offline(e) => (theme::ALARM, format!("{board} · not open"), if e.is_empty() { "Not connected.".into() } else { e.clone() }),
+            Src::Device(d) => {
+                let serial = if self.serial == 0 { "first one found".to_string() } else { format!("{:016X}", self.serial) };
+                let how = match d {
+                    crate::hydra::Device::HackRF(_) => "stock firmware sweep".to_string(),
+                    _ if d.host_driven() => "stock firmware · PC-driven sweep".to_string(),
+                    _ => format!("Corvus firmware sweep{}", d.fw_revision()),
+                };
+                let colour = if d.host_driven() { theme::CAUTION } else { theme::OK };
+                (colour, format!("{board} · {how}"), format!("{}\nSerial {serial}\nLibrary {}", d.version(), d.lib_path().display()))
+            }
+        }
+    }
+
+    fn device_chip(&mut self, ui: &mut Ui) {
+        let (dot, text, details) = self.device_status();
+        let g = ui.painter().layout_no_wrap(text, theme::ui_font(theme::SM), INK);
+        let size = vec2(g.size().x + 44.0, 24.0);
+        let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+        let p = ui.painter();
+        p.rect_filled(r, 12, if resp.hovered() { CHIP } else { PANEL });
+        p.rect_stroke(r, 12, Stroke::new(1.0, EDGE), egui::StrokeKind::Inside);
+        p.circle_filled(pos2(r.left() + 13.0, r.center().y), 4.0, dot);
+        p.galley(pos2(r.left() + 23.0, r.center().y - g.size().y / 2.0), g, INK);
+        // a caret: the chip opens the radio picker
+        let c = pos2(r.right() - 13.0, r.center().y + 1.0);
+        let ink = if resp.hovered() || self.picker.is_some() { INK } else { INK2 };
+        p.add(egui::Shape::convex_polygon(vec![c + vec2(-4.0, -2.5), c + vec2(4.0, -2.5), c + vec2(0.0, 2.5)], ink, Stroke::NONE));
+        let clicked = resp.clicked();
+        resp.on_hover_text(format!("{details}\n\nClick to switch radios."));
+        if clicked {
+            self.picker = if self.picker.is_some() { None } else { Some((r.left_bottom() + vec2(0.0, 6.0), crate::hydra::list_devices())) };
+        }
+    }
+
     fn settings_menu(&mut self, ui: &mut Ui) {
         ui.set_min_width(340.0);
         theme::section(ui, "Display settings");
@@ -675,6 +966,15 @@ impl App {
         ui.add_space(4.0);
         theme::slider_f32(ui, "Grid", &mut self.cfg.grid_dim, &Slide::int(10.0, 100.0, 70.0, "%"));
         theme::slider_f32(ui, "Traces", &mut self.cfg.data_dim, &Slide::int(30.0, 100.0, 100.0, "%"));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.cfg.hints, "Gesture hints")
+                .on_hover_text("Short notes over the plot on what dragging, scrolling and the separator do. Each one goes away once you've used it.");
+            if ui.add_enabled(self.cfg.hints_learned != 0, egui::Button::new("Show them again")).clicked() {
+                self.cfg.hints = true;
+                self.cfg.hints_learned = 0;
+            }
+        });
     }
 
     /// What needs attention, as sentences, worst first. Informational lines don't change the tile.
@@ -897,7 +1197,7 @@ impl App {
                 }
                 ui.horizontal_wrapped(|ui| {
                     let zoomed = self.view.0 > self.applied.start_hz + 1e3 || self.view.1 < self.applied.stop_hz - 1e3;
-                    if ui.add_enabled(zoomed, egui::Button::new("Sweep visible area")).on_hover_text("Zoom in first (scroll on the plot), or shift-drag on the plot to sweep a selection. Key: S").on_disabled_hover_text("Zoom in first (scroll on the plot), or shift-drag on the plot to sweep a selection").clicked() {
+                    if ui.add_enabled(zoomed, egui::Button::new("Sweep visible area")).on_hover_text("Zoom in first (scroll, or drag a span on the plot), or drag a span and pick Sweep. Key: S").on_disabled_hover_text("Zoom in first (scroll, or drag a span on the plot), or drag a span and pick Sweep").clicked() {
                         let (a, b) = self.view;
                         self.set_range(a, b);
                     }
@@ -1027,12 +1327,20 @@ impl App {
                     swatch(ui, TRACE);
                     ui.label(RichText::new("Live").size(theme::SM));
                     swatch(ui, PEAK);
-                    ui.checkbox(&mut self.cfg.show_peak, "Peak").on_hover_text("Peak hold (H)");
+                    let name = self.cfg.peak_name();
+                    ui.checkbox(&mut self.cfg.show_peak, name).on_hover_text("The peak trace (H). Hold, decay or percentile: under the disclosure below.");
                     swatch(ui, AVERAGE);
                     ui.checkbox(&mut self.cfg.show_avg, "Average").on_hover_text("V");
                 });
                 if self.cfg.show_avg {
-                    theme::slider_f32(ui, "Response", &mut self.cfg.avg_alpha, &Slide { min: 0.02, max: 0.8, default: 0.2, integer: false, log: true, decimals: 2, unit: "" });
+                    theme::slider_f32(ui, "Averaging", &mut self.cfg.avg_secs, &Slide { min: 0.5, max: 60.0, default: 10.0, integer: false, log: true, decimals: 1, unit: "s" });
+                    let passes = self.cfg.avg_secs / self.pass_s;
+                    let kind = if self.cfg.avg_power { "power" } else { "dB" };
+                    theme::caption(ui, if passes.is_finite() && passes > 0.0 {
+                        format!("About {} passes at the current speed, averaged in {kind}.", fmt_trim(passes as f64, if passes < 10.0 { 1 } else { 0 }))
+                    } else {
+                        format!("Averaged in {kind}.")
+                    });
                 }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.cfg.eq_on, "Flatten passband")
@@ -1046,12 +1354,41 @@ impl App {
                     ui.label(RichText::new(txt).size(theme::SM).color(INK2));
                 });
                 theme::row(ui, "Peak labels", |ui| theme::segmented(ui, &mut self.cfg.labels, &[(12, "Full"), (4, "Focus"), (0, "Minimal")]));
-                theme::more(ui, "display-more", "Layers, peak hold and passband", |ui| {
+                theme::more(ui, "display-more", "Peak and average modes, layers, passband", |ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.cfg.beam, "Sweep beam")
                             .on_hover_text("Lights the steps as the radio visits them, when a full pass takes about a second or more. Faster sweeps would only flash, so the strip under the axis shows which steps are fresh instead. Key: B");
                         ui.checkbox(&mut self.cfg.vco_marks, "VCO switch marks");
                     });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.cfg.readout_follow, "Readout follows cursor")
+                            .on_hover_text("The frequency and level readout rides next to the pointer. Off: it stays in the spectrum's top-left corner.");
+                        ui.add_enabled(self.view3d_ok, egui::Checkbox::new(&mut self.cfg.wf3d, "3D waterfall"))
+                            .on_hover_text("The waterfall as a landscape: drag to turn, scroll to zoom, double-click to reset. Key: W");
+                        ui.checkbox(&mut self.cfg.overview, "Overview strip")
+                            .on_hover_text("The whole sweep above the spectrum, with the zoomed view as a box: drag the box to pan, its edges to zoom, click to centre, double-click to show everything.");
+                    });
+                    theme::row_hint(ui, "Peak trace", "Hold keeps the highest level since the last clear. Decay rises at once, holds 1 s, then falls at the set rate, so it shows where signals have been lately. Percentile tracks the level each bin is under that share of the time (P90: exceeded 10 % of the time), which ignores single spikes and shows how busy a channel is.", |ui| {
+                        theme::segmented(ui, &mut self.cfg.peak_kind, &[(PeakKind::Hold, "Hold"), (PeakKind::Decay, "Decay"), (PeakKind::Percentile, "Percentile")])
+                    });
+                    match self.cfg.peak_kind {
+                        PeakKind::Hold => {}
+                        PeakKind::Decay => {
+                            theme::slider_f32(ui, "Fall", &mut self.cfg.peak_fall, &Slide { min: 1.0, max: 30.0, default: 6.0, integer: false, log: true, decimals: 1, unit: "dB/s" });
+                        }
+                        PeakKind::Percentile => {
+                            theme::row(ui, "Percentile", |ui| theme::segmented(ui, &mut self.cfg.peak_pct, &[(50, "50"), (75, "75"), (90, "90"), (95, "95")]));
+                            theme::slider_f32(ui, "Window", &mut self.cfg.peak_win, &Slide { min: 1.0, max: 120.0, default: 10.0, integer: false, log: true, decimals: 0, unit: "s" });
+                        }
+                    }
+                    theme::row_hint(ui, "Average in", "dB is a video average: smooth, and about 2.5 dB under the true mean on noise; bursts move it little. Power averages the actual power, so busy or bursty channels read at their mean power.", |ui| {
+                        theme::segmented(ui, &mut self.cfg.avg_power, &[(false, "dB"), (true, "Power")])
+                    });
+                    if self.cfg.wf3d && self.view3d_ok {
+                        theme::row_hint(ui, "3D smoothing", "A Gaussian filter over the landscape, averaged in power so narrow carriers keep most of their height while the noise floor calms down. The flat waterfall and the spectrum are never smoothed.", |ui| {
+                            theme::segmented(ui, &mut self.cfg.smooth3d, &[(0, "Off"), (1, "Light"), (2, "Strong")])
+                        });
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Clear peaks").on_hover_text("P").clicked() {
                             self.engine.clear_peak();
@@ -1125,31 +1462,257 @@ impl App {
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
         let gutter = 50.0;
+        let ov_h = if self.cfg.overview { 34.0 } else { 0.0 };
         let rail_h = if self.cfg.labels > 0 { 26.0 } else { 6.0 };
         let axis_h = 20.0;
         let strip_h = 20.0;
-        let spec_h = ((full.height() - rail_h - axis_h - strip_h - 8.0) * 0.48).max(120.0);
-        let rail = Rect::from_min_size(pos2(full.left() + gutter, full.top()), vec2(full.width() - gutter, rail_h));
-        let spec = Rect::from_min_size(pos2(rail.left(), rail.bottom()), vec2(rail.width(), spec_h));
-        let axis = Rect::from_min_size(pos2(spec.left(), spec.bottom()), vec2(spec.width(), axis_h));
-        let strip = Rect::from_min_size(pos2(spec.left(), axis.bottom() + 2.0), vec2(spec.width(), strip_h));
-        let wf = Rect::from_min_max(pos2(spec.left(), strip.bottom() + 6.0), pos2(spec.right(), full.bottom()));
+        let sep_h = 10.0;
+        let avail = (full.height() - ov_h - rail_h - axis_h - strip_h - 2.0 - sep_h).max(200.0);
+        let spec_h = (avail * self.cfg.split.clamp(0.15, 0.85)).max(80.0);
+        let left = full.left() + gutter;
+        let width = full.width() - gutter;
+        let ov = Rect::from_min_size(pos2(left, full.top()), vec2(width, (ov_h - 6.0).max(0.0)));
+        let rail = Rect::from_min_size(pos2(left, full.top() + ov_h), vec2(width, rail_h));
+        let spec = Rect::from_min_size(pos2(left, rail.bottom()), vec2(width, spec_h));
+        let axis = Rect::from_min_size(pos2(left, spec.bottom()), vec2(width, axis_h));
+        let strip = Rect::from_min_size(pos2(left, axis.bottom() + 2.0), vec2(width, strip_h));
+        let sep = Rect::from_min_size(pos2(left, strip.bottom()), vec2(width, sep_h));
+        let wf = Rect::from_min_max(pos2(left, sep.bottom()), pos2(full.right(), full.bottom()));
 
         self.clamp_view();
-        self.interact(ui, spec, wf, Rect::from_min_max(pos2(full.left(), spec.top()), pos2(spec.left() - 4.0, spec.bottom())));
-        self.gather(spec.width().max(1.0) as usize);
+        if self.cfg.overview {
+            self.interact_overview(ui, ov);
+        }
+        let three = self.cfg.wf3d && self.view3d_ok;
+        self.interact(ui, spec, (!three).then_some(wf), axis, Rect::from_min_max(pos2(full.left(), spec.top()), pos2(spec.left() - 4.0, spec.bottom())));
+        if three {
+            self.interact_3d(ui, wf);
+        }
+        self.interact_separator(ui, sep, avail);
+        self.gather(spec.width().max(1.0) as usize, ov.width().max(1.0) as usize);
 
         let painter = ui.painter().clone();
+        if self.cfg.overview {
+            self.paint_overview(&painter, ov);
+        }
         self.paint_spectrum(&painter, spec);
         self.paint_axis(&painter, axis);
         self.paint_strip(&painter, strip);
-        self.paint_waterfall(ui.ctx(), &painter, wf, Rect::from_min_max(pos2(full.left(), wf.top()), pos2(wf.left() - 4.0, wf.bottom())));
-        self.paint_overlays(&painter, spec, wf);
+        self.paint_separator(&painter, sep);
+        if three {
+            self.paint_3d(&painter, wf);
+        } else {
+            self.paint_waterfall(ui.ctx(), &painter, wf, Rect::from_min_max(pos2(full.left(), wf.top()), pos2(wf.left() - 4.0, wf.bottom())));
+        }
+        self.paint_overlays(&painter, spec, wf, three);
+        self.wf_mode_toggle(ui, wf);
         self.peak_rail(ui, rail, spec);
-        self.paint_readout(&painter, spec);
+        self.paint_gesture_hint(&painter, spec, (!three).then_some(wf));
+        self.paint_range_drag(&painter, spec, ov);
+        self.paint_readout(&painter, spec, wf);
+        self.selection_menu(ui);
         if let Src::Offline(err) = &self.src {
             let err = err.clone();
             self.offline_banner(ui, spec, &err);
+        }
+    }
+
+    /// The separator between spectrum and waterfall: drag to give one more room (double-click: default).
+    fn interact_separator(&mut self, ui: &mut Ui, sep: Rect, avail: f32) {
+        // reaches a little into the strip and the waterfall, so the thin grip is easy to catch
+        let resp = ui.interact(sep.expand2(vec2(0.0, 5.0)), ui.id().with("split"), Sense::click_and_drag());
+        self.sep_hot = resp.hovered() || resp.dragged();
+        if resp.dragged() {
+            self.cfg.split = (self.cfg.split + resp.drag_delta().y / avail).clamp(0.15, 0.85);
+        }
+        if resp.double_clicked() {
+            self.cfg.split = Config::default().split;
+        }
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        resp.on_hover_text("Drag to share the height between the spectrum and the waterfall. Double-click to reset.");
+    }
+
+    fn paint_separator(&self, p: &Painter, sep: Rect) {
+        let c = sep.center();
+        let (w, ink) = if self.sep_hot { (30.0, TOUCH) } else { (18.0, INK3) };
+        p.line_segment([pos2(c.x - w, c.y - 1.5), pos2(c.x + w, c.y - 1.5)], Stroke::new(1.0, ink));
+        p.line_segment([pos2(c.x - w, c.y + 1.5), pos2(c.x + w, c.y + 1.5)], Stroke::new(1.0, ink));
+    }
+
+    /// Overview strip: drag the view box to pan, its edges to zoom, click elsewhere to centre the view
+    /// there, double-click to show the whole sweep.
+    fn interact_overview(&mut self, ui: &mut Ui, ov: Rect) {
+        let (lo, hi) = (self.applied.start_hz, self.applied.stop_hz);
+        let fx = |f: f64| ov.left() + ((f - lo) / (hi - lo)) as f32 * ov.width();
+        let xf = |x: f32| lo + ((x - ov.left()) / ov.width()) as f64 * (hi - lo);
+        let resp = ui.interact(ov, ui.id().with("overview"), Sense::click_and_drag());
+        let (x0, x1) = (fx(self.view.0), fx(self.view.1));
+        let grab_at = |x: f32| {
+            if (x - x0).abs() <= 5.0 {
+                Some(OvGrab::Left)
+            } else if (x - x1).abs() <= 5.0 {
+                Some(OvGrab::Right)
+            } else if x > x0 && x < x1 {
+                Some(OvGrab::Move)
+            } else {
+                None
+            }
+        };
+        let hover = resp.hover_pos().map(|pos| grab_at(pos.x));
+        if let Some(g) = hover {
+            ui.ctx().set_cursor_icon(match g {
+                Some(OvGrab::Left | OvGrab::Right) => egui::CursorIcon::ResizeHorizontal,
+                Some(OvGrab::Move) => egui::CursorIcon::Grab,
+                None => egui::CursorIcon::PointingHand,
+            });
+        }
+        let resp = match hover {
+            Some(Some(OvGrab::Left | OvGrab::Right)) => resp.on_hover_text("Drag the edge to zoom"),
+            Some(Some(OvGrab::Move)) if self.view.1 - self.view.0 < hi - lo - 1e3 => resp.on_hover_text("Drag the box to pan. Double-click to show the whole sweep."),
+            Some(Some(OvGrab::Move)) => resp.on_hover_text("The whole sweep is in view: drag the box to move the swept range (it retunes when you let go), or its edges to zoom in."),
+            Some(None) => resp.on_hover_text("Click to centre the view here"),
+            None => resp,
+        };
+        if resp.drag_started()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            if self.full_view() && grab_at(pos.x) == Some(OvGrab::Move) {
+                self.range_drag = Some(0.0);
+            }
+            let g = grab_at(pos.x).unwrap_or_else(|| {
+                // outside the box: centre it on the pointer, then move it
+                let half = (self.view.1 - self.view.0) / 2.0;
+                let c = xf(pos.x);
+                self.view = (c - half, c + half);
+                OvGrab::Move
+            });
+            self.ov_drag = Some((g, self.view));
+        }
+        if resp.dragged()
+            && let Some((g, _)) = self.ov_drag
+        {
+            let df = resp.drag_delta().x as f64 / ov.width() as f64 * (hi - lo);
+            let min_span = dsp::bin_hz(self.cfg.nfft, self.applied.rate) * 24.0;
+            match g {
+                OvGrab::Move if self.range_drag.is_some() => self.drag_range(df),
+                OvGrab::Move => self.view = (self.view.0 + df, self.view.1 + df),
+                OvGrab::Left => self.view.0 = (self.view.0 + df).min(self.view.1 - min_span),
+                OvGrab::Right => self.view.1 = (self.view.1 + df).max(self.view.0 + min_span),
+            }
+            if g == OvGrab::Move {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+        }
+        if resp.drag_stopped() {
+            self.ov_drag = None;
+            self.finish_range_drag();
+        }
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+            && grab_at(pos.x).is_none()
+        {
+            let half = (self.view.1 - self.view.0) / 2.0;
+            let c = xf(pos.x);
+            self.view = (c - half, c + half);
+        }
+        if resp.double_clicked() {
+            self.view = (lo, hi);
+        }
+        self.clamp_view();
+    }
+
+    fn paint_overview(&self, p: &Painter, ov: Rect) {
+        p.rect_filled(ov, 2, WELL);
+        let (lo, hi) = (self.applied.start_hz, self.applied.stop_hz);
+        let fx = |f: f64| ov.left() + ((f - lo) / (hi - lo)) as f32 * ov.width();
+        let (t, b) = (self.cfg.spec_top, self.cfg.spec_bot);
+        let yv = |db: f32| ov.bottom() - 2.0 - ((db - b) / (t - b).max(1.0)).clamp(0.0, 1.0) * (ov.height() - 4.0);
+        if let Some((xs, ys)) = &self.shown.overview {
+            let pts: Vec<Option<Pos2>> = xs.iter().zip(ys).map(|(&f, &v)| v.is_finite().then(|| pos2(fx(f), yv(v)))).collect();
+            let pc = p.with_clip_rect(ov);
+            fill_under(&pc, &pts, ov.bottom(), TRACE.gamma_multiply(0.22), TRACE.gamma_multiply(0.02));
+            polyline(&pc, &pts, Stroke::new(1.0, TRACE.gamma_multiply(0.75)));
+        }
+        let (x0, x1) = (fx(self.view.0).max(ov.left()), fx(self.view.1).min(ov.right()));
+        // dim what's outside the view, outline the view box
+        p.rect_filled(Rect::from_min_max(ov.min, pos2(x0, ov.bottom())), 2, BG.gamma_multiply(0.55));
+        p.rect_filled(Rect::from_min_max(pos2(x1, ov.top()), ov.max), 2, BG.gamma_multiply(0.55));
+        let vb = Rect::from_min_max(pos2(x0, ov.top()), pos2(x1, ov.bottom()));
+        p.rect_stroke(vb, 2, Stroke::new(1.0, ACCENT.gamma_multiply(0.85)), egui::StrokeKind::Inside);
+        for x in [vb.left() + 1.0, vb.right() - 1.0] {
+            p.line_segment([pos2(x, vb.center().y - 5.0), pos2(x, vb.center().y + 5.0)], Stroke::new(2.0, ACCENT));
+        }
+        // the sweep's ends on chips (they sit over the trace), and the box's span while it's dragged
+        let end_chip = |x: f32, align: Align2, text: String| {
+            let g = p.layout_no_wrap(text, theme::num(theme::XS), INK2);
+            let at = align.anchor_size(pos2(x, ov.top() + 2.0), g.size() + vec2(6.0, 2.0));
+            p.rect_filled(at, 2, WELL.gamma_multiply(0.85));
+            p.galley(at.min + vec2(3.0, 1.0), g, INK2);
+        };
+        if self.ov_drag.is_some() && self.range_drag.is_none() {
+            let dec = label_decimals(self.view.1 - self.view.0);
+            let text = format!("{} – {} MHz", fmt_freq(self.view.0, dec), fmt_freq(self.view.1, dec));
+            let g = p.layout_no_wrap(text, theme::num(theme::XS), INK);
+            let w = g.size().x + 8.0;
+            let cx = vb.center().x.clamp(ov.left() + w / 2.0, ov.right() - w / 2.0);
+            let at = Rect::from_center_size(pos2(cx, ov.center().y), g.size() + vec2(8.0, 2.0));
+            p.rect_filled(at, 2, WELL.gamma_multiply(0.9));
+            p.galley(at.min + vec2(4.0, 1.0), g, INK);
+        } else {
+            end_chip(ov.left() + 2.0, Align2::LEFT_TOP, fmt_freq(lo, 1));
+            end_chip(ov.right() - 2.0, Align2::RIGHT_TOP, format!("{} MHz", fmt_freq(hi, 1)));
+        }
+        p.rect_stroke(ov, 2, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+    }
+
+    /// After a plain drag on the plot: offer Zoom or Sweep for the span (Esc cancels).
+    fn selection_menu(&mut self, ui: &mut Ui) {
+        let Some((lo, hi, pos)) = self.pending_sel else { return };
+        let mut done = false;
+        let area = egui::Area::new(ui.id().with("selmenu")).order(egui::Order::Foreground).fixed_pos(pos + vec2(10.0, 10.0)).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(RichText::new(format!("{} – {} MHz", fmt_freq(lo, 3), fmt_freq(hi, 3))).font(theme::num(theme::SM)).color(INK));
+                ui.label(RichText::new(format!("{} MHz wide", fmt_trim((hi - lo) / 1e6, 3))).size(theme::XS + 1.0).color(INK2));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Zoom in").on_hover_text("Show just this span (Z or Enter)").clicked() {
+                        self.view = (lo, hi);
+                        done = true;
+                    }
+                    let can_sweep = hi - lo >= 0.2e6;
+                    if ui.add_enabled(can_sweep, egui::Button::new("Sweep this")).on_hover_text("Sweep only this span (S)").on_disabled_hover_text("Spans under 200 kHz can't be swept").clicked() {
+                        self.set_range(lo, hi);
+                        done = true;
+                    }
+                    if ui.button("Cancel").on_hover_text("Esc").clicked() {
+                        done = true;
+                    }
+                });
+                ui.label(RichText::new("Keys: Z or Enter zoom · S sweep · Esc cancel").size(theme::XS).color(INK2));
+                if self.cfg.hints {
+                    ui.label(RichText::new("Next time: Ctrl-drag zooms and Shift-drag sweeps without this menu").size(theme::XS).color(INK2));
+                }
+            });
+        });
+        let (z, sw, esc) = ui.input(|i| (i.key_pressed(Key::Z) || i.key_pressed(Key::Enter), i.key_pressed(Key::S), i.key_pressed(Key::Escape)));
+        if z {
+            self.view = (lo, hi);
+            done = true;
+        } else if sw && hi - lo >= 0.2e6 {
+            self.set_range(lo, hi);
+            done = true;
+        } else if esc {
+            done = true;
+        }
+        // a click anywhere else dismisses it
+        if ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer() && !done {
+            done = true;
+        }
+        if done {
+            self.pending_sel = None;
+            self.selection = None;
         }
     }
 
@@ -1217,28 +1780,262 @@ impl App {
         }
     }
 
-    /// The hover readout: always in the same corner of the plot (rule O7).
-    fn paint_readout(&self, p: &Painter, r: Rect) {
-        let Some((f, db)) = self.shown.hover else { return };
+    /// While the pointer is over the spectrum or the flat waterfall: what the mouse can do there, minus
+    /// the gestures already used. Sits in the pane's bottom-right corner on a chip (rule O2), and steps
+    /// aside if the pointer comes near it.
+    fn paint_gesture_hint(&self, p: &Painter, spec: Rect, wf: Option<Rect>) {
+        let Some((pos, in_wf)) = self.hover_pos else { return };
+        if self.selection.is_some() || self.pending_sel.is_some() {
+            return;
+        }
+        let parts: Vec<&str> = [(Hint::SELECT, "drag to select a span"), (Hint::ZOOM, "scroll to zoom"), (Hint::PAN, "right-drag or drag the axis to pan")]
+            .into_iter()
+            .filter(|(h, _)| self.cfg.hint(*h))
+            .map(|(_, t)| t)
+            .collect();
+        if parts.is_empty() {
+            return;
+        }
+        let pane = if in_wf { wf.unwrap_or(spec) } else { spec };
+        let mut text = parts.join(" · ");
+        text[..1].make_ascii_uppercase();
+        let g = p.layout_no_wrap(text, theme::ui_font(theme::XS + 1.0), INK2);
+        let size = g.size() + vec2(14.0, 8.0);
+        let mut r = Rect::from_min_size(pane.right_bottom() - size - vec2(8.0, 8.0), size);
+        if r.expand(24.0).contains(pos) {
+            r = Rect::from_min_size(pos2(pane.left() + 8.0, pane.bottom() - size.y - 8.0), size);
+        }
+        p.rect_filled(r, 4, WELL.gamma_multiply(0.88));
+        p.rect_stroke(r, 4, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+        p.galley(r.min + vec2(7.0, 4.0), g, INK2);
+    }
+
+    /// While a range drag is on: the range it will sweep, on a chip at the top of the plot, and the
+    /// moved box on the overview strip.
+    fn paint_range_drag(&self, p: &Painter, spec: Rect, ov: Rect) {
+        let Some(off) = self.range_drag else { return };
+        let (lo, hi) = (self.applied.start_hz + off, self.applied.stop_hz + off);
+        let head = p.layout_no_wrap(format!("Sweep {} – {} MHz", fmt_freq(lo, 1), fmt_freq(hi, 1)), theme::num(12.0), INK);
+        let sub = p.layout_no_wrap("Let go to retune · Esc cancels".into(), theme::ui_font(theme::XS), INK2);
+        let w = head.size().x.max(sub.size().x) + 14.0;
+        let r = Rect::from_min_size(pos2(spec.center().x - w / 2.0, spec.top() + 8.0), vec2(w, head.size().y + sub.size().y + 10.0));
+        p.rect_filled(r, 4, WELL.gamma_multiply(0.9));
+        p.rect_stroke(r, 4, Stroke::new(1.0, ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Inside);
+        let hh = head.size().y;
+        p.galley(r.min + vec2(7.0, 4.0), head, INK);
+        p.galley(r.min + vec2(7.0, 6.0 + hh), sub, INK2);
+        if self.cfg.overview && ov.width() > 0.0 {
+            let (a, b) = (self.applied.start_hz, self.applied.stop_hz);
+            let dx = (off / (b - a)) as f32 * ov.width();
+            let moved = Rect::from_min_max(pos2(ov.left() + dx, ov.top()), pos2(ov.right() + dx, ov.bottom())).intersect(ov);
+            p.rect_filled(ov, 2, BG.gamma_multiply(0.45));
+            p.rect_stroke(moved, 2, Stroke::new(1.5, ACCENT), egui::StrokeKind::Inside);
+        }
+    }
+
+    /// 3D view mouse: drag turns it, scroll moves closer or further, double-click resets the camera.
+    fn interact_3d(&mut self, ui: &mut Ui, wf: Rect) {
+        let resp = ui.interact(wf, ui.id().with("view3d"), Sense::click_and_drag());
+        if resp.dragged() {
+            self.cfg.learned(Hint::ORBIT);
+            let d = resp.drag_delta();
+            let c = &mut self.cfg.cam3d;
+            c.yaw += d.x * 0.008;
+            c.pitch = (c.pitch + d.y * 0.006).clamp(0.08, 1.45);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            let s = ui.input(|i| i.smooth_scroll_delta.y);
+            if s != 0.0 {
+                self.cfg.cam3d.dist = (self.cfg.cam3d.dist * (-s * 0.002).exp()).clamp(1.3, 8.0);
+            }
+        }
+        if resp.double_clicked() {
+            self.cfg.cam3d = crate::view3d::Camera::default();
+        }
+    }
+
+    /// The 3D waterfall in the waterfall pane: the newest rows of the history for the visible span,
+    /// heights and colours by the waterfall levels, with frequency and time marked along the floor.
+    fn paint_3d(&mut self, p: &Painter, wf: Rect) {
+        use crate::view3d::{Camera, DEPTH, GX_MAX, GZ_MAX};
+        p.rect_filled(wf, 0, WELL);
+        p.rect_stroke(wf, 0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+        self.wf.set_levels(self.cfg.palette, self.cfg.wf_lo, self.cfg.wf_hi);
+        let gx = (wf.width() as usize).clamp(2, GX_MAX).min(self.wf.cols.max(2));
+        let gz = self.wf.filled.min(self.cfg.wf_rows.clamp(8, ROWS)).min(GZ_MAX);
+        if gz < 2 {
+            p.text(wf.center(), Align2::CENTER_CENTER, "The 3D view fills in as passes arrive", theme::ui_font(theme::SM), INK2);
+            return;
+        }
+        let (c0, c1) = self.applied.cover();
+        let u0 = ((self.view.0 - c0) / (c1 - c0)) as f32;
+        let u1 = ((self.view.1 - c0) / (c1 - c0)) as f32;
+        let key = (self.wf.stamp(), (u0 * 1e5) as i32, (u1 * 1e5) as i32, gx, gz, (self.cfg.wf_lo * 10.0) as i32, self.cfg.smooth3d);
+        let heights = (self.v3_key != Some(key)).then(|| {
+            self.v3_key = Some(key);
+            let mut h = self.wf.grid(u0, u1, gx, gz, self.cfg.wf_lo - 30.0);
+            let (sx, sz) = match self.cfg.smooth3d {
+                0 => (0.0, 0.0),
+                1 => (1.2, 1.0),
+                _ => (2.5, 2.0),
+            };
+            crate::view3d::smooth(&mut h, gx, gz, sx, sz);
+            std::sync::Arc::new(h)
+        });
+        let lut = (self.v3_palette != Some(self.cfg.palette)).then(|| {
+            self.v3_palette = Some(self.cfg.palette);
+            std::sync::Arc::new(self.wf.palette_rgba())
+        });
+        let m = self.cfg.cam3d.matrix(wf.width() / wf.height().max(1.0));
+        p.add(eframe::egui_wgpu::Callback::new_paint_callback(
+            wf,
+            crate::view3d::Callback { mvp: m, lo: self.cfg.wf_lo, hi: self.cfg.wf_hi, gx, gz, heights, lut },
+        ));
+        // floor outline and labels, projected with the same camera
+        let pr = |x: f32, y: f32, z: f32| Camera::project(&m, wf, [x, y, z]);
+        let pc = p.with_clip_rect(wf);
+        let edge = Stroke::new(1.0, INK3.gamma_multiply(0.8));
+        for (a, b) in [([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]), ([-1.0, 0.0, 0.0], [-1.0, 0.0, -DEPTH]), ([1.0, 0.0, 0.0], [1.0, 0.0, -DEPTH]), ([-1.0, 0.0, -DEPTH], [1.0, 0.0, -DEPTH])] {
+            if let (Some(pa), Some(pb)) = (pr(a[0], a[1], a[2]), pr(b[0], b[1], b[2])) {
+                pc.line_segment([pa, pb], edge);
+            }
+        }
+        let span = self.view.1 - self.view.0;
+        let dec = label_decimals(span);
+        for (f, major) in freq_ticks(self.view.0, self.view.1) {
+            let x = ((f - self.view.0) / span) as f32 * 2.0 - 1.0;
+            if let (Some(a), Some(b)) = (pr(x, 0.0, 0.0), pr(x, 0.0, 0.04)) {
+                pc.line_segment([a, b], edge);
+                if major {
+                    pc.text(b + vec2(0.0, 3.0), Align2::CENTER_TOP, fmt_freq(f, dec), theme::num(theme::XS), SCALE_INK);
+                }
+            }
+        }
+        let now = self.engine.now();
+        for k in 0..5 {
+            let i = k * (gz - 1) / 4;
+            let t = self.wf.row_time(i);
+            if !t.is_finite() {
+                continue;
+            }
+            let z = -(i as f32) / (gz - 1) as f32 * DEPTH;
+            if let Some(a) = pr(-1.04, 0.0, z) {
+                let txt = if i == 0 { "now".to_string() } else { format!("−{:.0} s", now - t) };
+                pc.text(a, Align2::RIGHT_CENTER, txt, theme::num(theme::XS), SCALE_INK);
+            }
+        }
+        let hint = if self.cfg.hint(Hint::ORBIT) { "3D · drag to turn · scroll to zoom · double-click to reset" } else { "3D" };
+        pc.text(wf.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, hint, theme::ui_font(theme::XS + 1.0), INK2);
+    }
+
+    /// The 2D / 3D switch in the waterfall pane's top-right corner (key W).
+    fn wf_mode_toggle(&mut self, ui: &mut Ui, wf: Rect) {
+        let r = Rect::from_min_size(pos2(wf.right() - 70.0, wf.top() + 6.0), vec2(62.0, 22.0));
+        let txt = if self.cfg.wf3d { "2D view" } else { "3D view" };
+        let hint = if self.view3d_ok { "Switch the waterfall between flat and 3D (W)" } else { "3D needs the wgpu renderer with a depth buffer" };
+        let resp = ui.add_enabled_ui(self.view3d_ok, |ui| ui.put(r, egui::Button::new(RichText::new(txt).size(theme::XS + 1.0)))).inner;
+        let resp = if self.view3d_ok { resp.on_hover_text(hint) } else { resp.on_disabled_hover_text(hint) };
+        if resp.clicked() && self.view3d_ok {
+            self.cfg.wf3d = !self.cfg.wf3d;
+        }
+    }
+
+    /// The hover readout: frequency and level (over the waterfall, also how long ago that row was).
+    /// It follows the cursor, or sits in the plot's corner (Display setting).
+    fn paint_readout(&self, p: &Painter, spec: Rect, wf: Rect) {
+        let Some((pos, in_wf)) = self.hover_pos else { return };
         let dec = label_decimals(self.view.1 - self.view.0) + 1;
-        let vf = p.layout_no_wrap(fmt_freq(f, dec), theme::num_medium(15.0), INK);
-        let uf = p.layout_no_wrap("MHz".into(), theme::ui_font(12.0), INK2);
-        let vd = p.layout_no_wrap(format!("{db:.1}").replace('-', "−"), theme::num_medium(15.0), INK);
-        let ud = p.layout_no_wrap("dBFS".into(), theme::ui_font(12.0), INK2);
-        let w = vf.size().x + uf.size().x + vd.size().x + ud.size().x + 3.0 * 2.0 + 16.0 + 20.0;
-        let br = Rect::from_min_size(r.min + vec2(8.0, 8.0), vec2(w, 28.0));
-        p.rect_filled(br, 5, WELL.gamma_multiply(0.9));
-        p.rect_stroke(br, 5, egui::Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
+        let (f, db, age) = if in_wf {
+            let rows = self.cfg.wf_rows.clamp(8, ROWS);
+            let i = (((pos.y - wf.top()) / wf.height()) * rows as f32).floor().max(0.0) as usize;
+            let f = self.f_of(wf, pos.x);
+            let t = self.wf.row_time(i);
+            let age = (i < self.wf.filled && t.is_finite()).then(|| self.engine.now() - t);
+            (f, self.wf.value_at(i, f), age)
+        } else {
+            match self.shown.hover {
+                Some((f, db)) => (f, Some(db), None),
+                None => (self.f_of(spec, pos.x), None, None),
+            }
+        };
+        let mut parts: Vec<(egui::Galley, f32)> = Vec::new();
+        let big = theme::num_medium(15.0);
+        let unit = theme::ui_font(12.0);
+        parts.push(((*p.layout_no_wrap(fmt_freq(f, dec), big.clone(), INK)).clone(), 3.0));
+        parts.push(((*p.layout_no_wrap("MHz".into(), unit.clone(), INK2)).clone(), 14.0));
+        if let Some(db) = db {
+            parts.push(((*p.layout_no_wrap(format!("{db:.1}").replace('-', "−"), big.clone(), INK)).clone(), 3.0));
+            parts.push(((*p.layout_no_wrap("dBFS".into(), unit.clone(), INK2)).clone(), 14.0));
+        }
+        if let Some(a) = age {
+            parts.push(((*p.layout_no_wrap(format!("{a:.1}").replace('-', "−"), big, INK)).clone(), 3.0));
+            parts.push(((*p.layout_no_wrap("s ago".into(), unit, INK2)).clone(), 0.0));
+        }
+        let w: f32 = parts.iter().map(|(g, gap)| g.size().x + gap).sum::<f32>() + 20.0;
+        let size = vec2(w, 28.0);
+        let area = spec.union(wf);
+        let min = if self.cfg.readout_follow {
+            let mut m = pos + vec2(16.0, 18.0);
+            if m.x + size.x > area.right() - 4.0 {
+                m.x = pos.x - 16.0 - size.x;
+            }
+            if m.y + size.y > area.bottom() - 4.0 {
+                m.y = pos.y - 18.0 - size.y;
+            }
+            pos2(m.x.max(area.left() + 4.0), m.y.max(area.top() + 4.0))
+        } else {
+            spec.min + vec2(8.0, 8.0)
+        };
+        let br = Rect::from_min_size(min, size);
+        p.rect_filled(br, 5, WELL.gamma_multiply(0.92));
+        p.rect_stroke(br, 5, egui::Stroke::new(1.0, TOUCH.gamma_multiply(0.5)), egui::StrokeKind::Inside);
         let mut x = br.left() + 10.0;
         let cy = br.center().y;
-        for (g, gap) in [(vf, 3.0), (uf, 16.0), (vd, 3.0), (ud, 0.0)] {
-            let w = g.size().x;
-            p.galley(pos2(x, cy - g.size().y / 2.0), g, INK);
-            x += w + gap;
+        for (g, gap) in parts {
+            let gw = g.size().x;
+            p.galley(pos2(x, cy - g.size().y / 2.0), std::sync::Arc::new(g), INK);
+            x += gw + gap;
+        }
+        // a level line across the spectrum at the readout's level
+        if !in_wf && let Some(db) = db {
+            let y = self.y_of(spec, db);
+            if y > spec.top() && y < spec.bottom() {
+                p.line_segment([pos2(spec.left(), y), pos2(spec.right(), y)], Stroke::new(1.0, TOUCH.gamma_multiply(0.18)));
+            }
+        }
+    }
+
+    /// The view shows the whole swept range (nothing to pan).
+    fn full_view(&self) -> bool {
+        self.view.1 - self.view.0 >= (self.applied.stop_hz - self.applied.start_hz) * 0.999
+    }
+
+    /// Move the swept range by `df` while dragging, within what the radio can tune.
+    fn drag_range(&mut self, df: f64) {
+        let (lo, hi) = (self.applied.start_hz, self.applied.stop_hz);
+        let (fmin, fmax) = self.cfg.rate.f_range();
+        let off = (self.range_drag.unwrap_or(0.0) + df).clamp((fmin - lo).min(0.0), (fmax - hi).max(0.0));
+        self.range_drag = Some(off);
+        self.view = (lo + off, hi + off);
+    }
+
+    /// Letting go of a range drag: retune to the moved range (a nudge under one bin does nothing).
+    fn finish_range_drag(&mut self) {
+        let Some(off) = self.range_drag.take() else { return };
+        if off.abs() >= dsp::bin_hz(self.cfg.nfft, self.applied.rate) {
+            self.set_range(self.applied.start_hz + off, self.applied.stop_hz + off);
+            self.cfg.learned(Hint::PAN);
+        } else {
+            self.view = (self.applied.start_hz, self.applied.stop_hz);
         }
     }
 
     fn clamp_view(&mut self) {
+        // a range drag previews past the swept range on purpose
+        if self.range_drag.is_some() {
+            return;
+        }
         let (lo, hi) = (self.applied.start_hz, self.applied.stop_hz);
         let min_span = (dsp::bin_hz(self.cfg.nfft, self.applied.rate) * 24.0).min(hi - lo);
         let span = (self.view.1 - self.view.0).clamp(min_span, hi - lo);
@@ -1262,51 +2059,107 @@ impl App {
         r.top() + (t - db) / (t - b).max(1.0) * r.height()
     }
 
-    fn interact(&mut self, ui: &mut Ui, spec: Rect, wf: Rect, gutter: Rect) {
-        let shift = ui.input(|i| i.modifiers.shift);
+    /// Plot mouse: scroll zooms, a plain drag selects a span and offers Zoom or Sweep (Shift sweeps it at
+    /// once, Ctrl zooms at once), the right or middle button pans, double-click shows the whole sweep.
+    /// Dragging the frequency axis pans too.
+    fn interact(&mut self, ui: &mut Ui, spec: Rect, wf: Option<Rect>, axis: Rect, gutter: Rect) {
+        let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.command));
         self.hover_x = None;
-        for (i, r) in [spec, wf].into_iter().enumerate() {
+        self.hover_pos = None;
+        for (i, r) in std::iter::once(spec).chain(wf).enumerate() {
             let resp = ui.interact(r, ui.id().with(("plot", i)), Sense::click_and_drag());
             if let Some(p) = resp.hover_pos() {
                 self.hover_x = Some(p.x);
+                self.hover_pos = Some((p, i == 1));
                 let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
                 let k = (-scroll.y as f64 * 0.0025).exp() / zoom as f64;
                 if k != 1.0 {
+                    self.cfg.learned(Hint::ZOOM);
                     let f = self.f_of(r, p.x);
                     let span = (self.view.1 - self.view.0) * k;
                     let a = f - (f - self.view.0) * k;
                     self.view = (a, a + span);
                 }
                 if scroll.x != 0.0 {
+                    self.cfg.learned(Hint::PAN);
                     let df = -scroll.x as f64 / r.width() as f64 * (self.view.1 - self.view.0);
                     self.view = (self.view.0 + df, self.view.1 + df);
                 }
             }
-            if resp.drag_started_by(PointerButton::Primary) && shift
+            if resp.drag_started_by(PointerButton::Primary)
                 && let Some(p) = resp.interact_pointer_pos()
             {
                 let f = self.f_of(r, p.x);
+                self.pending_sel = None;
                 self.selection = Some((f, f));
+                self.drag_mode = if shift { DragMode::Sweep } else if ctrl { DragMode::Zoom } else { DragMode::Ask };
             }
-            if resp.dragged_by(PointerButton::Primary) {
-                if let (Some(sel), Some(p)) = (&mut self.selection, resp.interact_pointer_pos()) {
-                    sel.1 = self.view.0 + ((p.x - r.left()) / r.width()) as f64 * (self.view.1 - self.view.0);
-                } else {
-                    let df = -resp.drag_delta().x as f64 / r.width() as f64 * (self.view.1 - self.view.0);
-                    self.view = (self.view.0 + df, self.view.1 + df);
-                }
+            if resp.dragged_by(PointerButton::Primary)
+                && let (Some(sel), Some(p)) = (&mut self.selection, resp.interact_pointer_pos())
+            {
+                sel.1 = self.view.0 + ((p.x - r.left()) / r.width()) as f64 * (self.view.1 - self.view.0);
             }
-            if resp.drag_stopped()
-                && let Some((a, b)) = self.selection.take()
+            if resp.dragged_by(PointerButton::Secondary) || resp.dragged_by(PointerButton::Middle) {
+                self.cfg.learned(Hint::PAN);
+                let df = -resp.drag_delta().x as f64 / r.width() as f64 * (self.view.1 - self.view.0);
+                self.view = (self.view.0 + df, self.view.1 + df);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            if resp.drag_stopped_by(PointerButton::Primary)
+                && let Some((a, b)) = self.selection
             {
                 let (lo, hi) = (a.min(b), a.max(b));
-                if hi - lo >= 0.2e6 {
-                    self.set_range(lo, hi);
+                let wide_enough = (self.x_of(r, hi) - self.x_of(r, lo)) >= 4.0;
+                let pos = resp.interact_pointer_pos().unwrap_or(r.center());
+                if wide_enough {
+                    self.cfg.learned(Hint::SELECT);
+                }
+                match (wide_enough, self.drag_mode) {
+                    (false, _) => self.selection = None,
+                    (true, DragMode::Sweep) => {
+                        if hi - lo >= 0.2e6 {
+                            self.set_range(lo, hi);
+                        } else {
+                            self.toast("Spans under 200 kHz can't be swept. Ctrl-drag zooms instead.", false);
+                        }
+                        self.selection = None;
+                    }
+                    (true, DragMode::Zoom) => {
+                        self.view = (lo, hi);
+                        self.selection = None;
+                    }
+                    (true, DragMode::Ask) => self.pending_sel = Some((lo, hi, pos)),
                 }
             }
             if resp.double_clicked() {
                 self.view = (self.applied.start_hz, self.applied.stop_hz);
+                self.selection = None;
+                self.pending_sel = None;
             }
+        }
+        // the frequency axis pans
+        // (zoomed all the way out, it moves the swept range instead, retuning on release)
+        let ax = ui.interact(axis, ui.id().with("axis"), Sense::drag());
+        if ax.drag_started() && self.full_view() {
+            self.range_drag = Some(0.0);
+        }
+        if ax.dragged() {
+            let df = -ax.drag_delta().x as f64 / axis.width() as f64 * (self.view.1 - self.view.0);
+            if self.range_drag.is_some() {
+                self.drag_range(df);
+            } else {
+                self.cfg.learned(Hint::PAN);
+                self.view = (self.view.0 + df, self.view.1 + df);
+            }
+        }
+        if ax.drag_stopped() {
+            self.finish_range_drag();
+        }
+        if ax.hovered() || ax.dragged() {
+            ui.ctx().set_cursor_icon(if ax.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        }
+        if self.range_drag.is_none() {
+            ax.on_hover_text(if self.full_view() { "Drag to move the swept range (it retunes when you let go)" } else { "Drag to pan" });
         }
         // dB gutter: drag to shift, scroll to stretch
         let g = ui.interact(gutter, ui.id().with("gutter"), Sense::drag());
@@ -1327,14 +2180,19 @@ impl App {
         if g.hovered() || g.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
         }
-        if ui.input(|i| i.key_pressed(Key::Escape)) {
+        g.on_hover_text("Drag to move the dB scale, scroll to stretch it");
+        if self.pending_sel.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) {
             self.selection = None;
+            // cancel a range drag: back to the swept range, nothing retuned
+            if self.range_drag.take().is_some() {
+                self.view = (self.applied.start_hz, self.applied.stop_hz);
+            }
         }
         self.clamp_view();
     }
 
     /// Reduce the stitched arrays to what is on screen (one lock).
-    fn gather(&mut self, cols: usize) {
+    fn gather(&mut self, cols: usize, ov_cols: usize) {
         let live = self.engine.live.clone();
         let l = live.lock();
         let (a, b) = self.view;
@@ -1342,6 +2200,7 @@ impl App {
         self.shown.live = l.trace(Trace::Live, a, b, cols, det);
         self.shown.avg = self.cfg.show_avg.then(|| l.trace(Trace::Average, a, b, cols, det));
         self.shown.peak = self.cfg.show_peak.then(|| l.trace(Trace::Peak, a, b, cols, Detector::Peak));
+        self.shown.overview = self.cfg.overview.then(|| l.trace(Trace::Live, self.applied.start_hz, self.applied.stop_hz, ov_cols, Detector::Peak));
         let px = (b - a) / cols as f64;
         // peak labels, refreshed a few times a second from the full-resolution data
         if self.labels_t.elapsed() > Duration::from_millis(300) {
@@ -1421,10 +2280,27 @@ impl App {
             let sr = Rect::from_min_max(pos2(x0, r.top()), pos2(x1, r.bottom()));
             p.rect_filled(sr, 0, ACCENT.gamma_multiply(0.10));
             p.rect_stroke(sr, 0, Stroke::new(1.0, ACCENT.gamma_multiply(0.8)), egui::StrokeKind::Inside);
-            let g = p.layout_no_wrap(format!("Sweep {} – {} MHz", fmt_freq(a.min(b), 3), fmt_freq(a.max(b), 3)), theme::num(12.0), INK);
-            let cr = Rect::from_center_size(pos2((x0 + x1) / 2.0, r.top() + 18.0), g.size() + vec2(14.0, 8.0));
+            let (lo, hi) = (a.min(b), a.max(b));
+            let span = format!("{} – {} MHz", fmt_freq(lo, 3), fmt_freq(hi, 3));
+            let (head, sub) = match self.drag_mode {
+                DragMode::Sweep if hi - lo < 0.2e6 => (span, "Too narrow to sweep (200 kHz minimum)"),
+                DragMode::Sweep => (format!("Sweep {span}"), ""),
+                DragMode::Zoom => (format!("Zoom to {span}"), ""),
+                DragMode::Ask if self.pending_sel.is_some() => (span, ""),
+                DragMode::Ask => (span, if self.cfg.hints { "Let go to zoom or sweep · hold Shift to sweep, Ctrl to zoom" } else { "" }),
+            };
+            let g = p.layout_no_wrap(head, theme::num(12.0), INK);
+            let gs = (!sub.is_empty()).then(|| p.layout_no_wrap(sub.to_string(), theme::ui_font(theme::XS), INK2));
+            let w = g.size().x.max(gs.as_ref().map_or(0.0, |g| g.size().x)) + 14.0;
+            let h = g.size().y + gs.as_ref().map_or(0.0, |g| g.size().y + 2.0) + 8.0;
+            let cx = ((x0 + x1) / 2.0).clamp(r.left() + w / 2.0 + 2.0, r.right() - w / 2.0 - 2.0);
+            let cr = Rect::from_min_size(pos2(cx - w / 2.0, r.top() + 8.0), vec2(w, h));
             p.rect_filled(cr, 4, WELL.gamma_multiply(0.9));
+            let gh = g.size().y;
             p.galley(cr.min + vec2(7.0, 4.0), g, INK);
+            if let Some(gs) = gs {
+                p.galley(cr.min + vec2(7.0, 6.0 + gh), gs, INK2);
+            }
         }
         // hover cursor
         if let Some(x) = self.hover_x
@@ -1537,10 +2413,16 @@ impl App {
         p.rect_filled(r, 0, WELL);
         self.wf.set_levels(self.cfg.palette, self.cfg.wf_lo, self.cfg.wf_hi);
         let (c0, c1) = self.applied.cover();
-        let u0 = ((self.view.0 - c0) / (c1 - c0)) as f32;
-        let u1 = ((self.view.1 - c0) / (c1 - c0)) as f32;
+        let (mut u0, mut u1) = (((self.view.0 - c0) / (c1 - c0)) as f32, ((self.view.1 - c0) / (c1 - c0)) as f32);
         let rows = self.cfg.wf_rows.clamp(8, ROWS);
-        self.wf.paint(ctx, &p.with_clip_rect(r), r, u0, u1, rows);
+        // only the part of the view the history covers (a range drag looks past it)
+        let x_at = |u: f32| r.left() + (u - u0) / (u1 - u0) * r.width();
+        let (xl, xr) = (x_at(0.0).max(r.left()), x_at(1.0).min(r.right()));
+        if xr > xl {
+            let sub = Rect::from_min_max(pos2(xl, r.top()), pos2(xr, r.bottom()));
+            (u0, u1) = (u0.max(0.0), u1.min(1.0));
+            self.wf.paint(ctx, &p.with_clip_rect(r), sub, u0, u1, rows);
+        }
         p.rect_stroke(r, 0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
         let now = self.engine.now();
         let row_y = |i: usize| r.top() + (i as f32 + 0.5) / rows as f32 * r.height();
@@ -1593,7 +2475,7 @@ impl App {
         p.text(pos2(gutter.right(), r.top() + 2.0), Align2::RIGHT_TOP, local_hms(), theme::num(theme::XS), INK2);
     }
 
-    fn paint_overlays(&self, p: &Painter, spec: Rect, wf: Rect) {
+    fn paint_overlays(&self, p: &Painter, spec: Rect, wf: Rect, three: bool) {
         // dB scale in the gutter
         let (t, b) = (self.cfg.spec_top, self.cfg.spec_bot);
         let db_step = if t - b > 60.0 { 10.0 } else { 5.0 };
@@ -1608,6 +2490,9 @@ impl App {
         p.text(pos2(spec.left() - 6.0, spec.top() + 2.0), Align2::RIGHT_TOP, "dBFS", theme::ui_font(theme::XS + 1.0), INK2);
         p.rect_stroke(spec, 0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
         // spectrum and waterfall share one cursor and one selection (rule L7)
+        if three {
+            return;
+        }
         if let Some(x) = self.hover_x
             && x >= wf.left()
             && x <= wf.right()
@@ -1709,7 +2594,8 @@ impl App {
 
     fn keys(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        if ctx.egui_wants_keyboard_input() {
+        // a text field, the Zoom/Sweep menu or the radio picker has the keys
+        if ctx.egui_wants_keyboard_input() || self.pending_sel.is_some() || self.picker.is_some() {
             return;
         }
         let pressed: Vec<(Key, Modifiers)> = ctx.input(|i| {
@@ -1786,6 +2672,7 @@ impl App {
                     self.toast(if self.cfg.eq_on { "Flatten passband on" } else { "Flatten passband off" }, false);
                 }
                 Key::B => self.cfg.beam = !self.cfg.beam,
+                Key::W if self.view3d_ok => self.cfg.wf3d = !self.cfg.wf3d,
                 _ => {
                     let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
                     if let Some(pr) = digits.iter().position(|&d| d == key).and_then(|i| PRESETS.get(i)) {
@@ -1859,8 +2746,17 @@ const KEYS: &[&[(&str, KeyRows)]] = &[
                 ("+  −", "Zoom in / out"),
                 ("0  Home", "Reset zoom"),
                 ("↑ ↓", "Move the dB scale"),
-                ("Shift-drag", "Select a range to sweep"),
+                ("Drag", "Select a span, then Zoom or Sweep"),
+                ("Shift-drag", "Sweep the span at once"),
+                ("Ctrl-drag", "Zoom to the span at once"),
+                ("Right-drag", "Pan (or drag the axis)"),
+                ("Drag the axis, zoomed out", "Move the swept range"),
+                ("Scroll", "Zoom at the pointer"),
+                ("Swipe sideways", "Pan (touchpad)"),
+                ("Double-click", "Show the whole sweep"),
                 ("Esc", "Cancel selection"),
+                ("Drag the grip", "Resize spectrum / waterfall"),
+                ("3D: drag", "Turn (scroll zooms, double-click resets)"),
             ],
         ),
         (
@@ -1868,10 +2764,11 @@ const KEYS: &[&[(&str, KeyRows)]] = &[
             &[
                 ("A", "Auto levels"),
                 ("P", "Clear peak hold"),
-                ("H", "Peak hold on / off"),
+                ("H", "Peak trace on / off"),
                 ("V", "Average on / off"),
                 ("E", "Flatten passband on / off"),
                 ("B", "Sweep beam on / off"),
+                ("W", "Waterfall flat / 3D"),
             ],
         ),
     ],
@@ -1916,6 +2813,7 @@ impl eframe::App for App {
         egui::Panel::right("controls").frame(theme::side_frame()).exact_size(392.0).resizable(false).show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| self.central(ui));
         self.keys_window(ui);
+        self.device_picker(ui);
         self.handle_screenshots(ui);
         if crate::QUIT.load(std::sync::atomic::Ordering::Relaxed) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1975,7 +2873,19 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
     cfg.fit_board();
     let plan = cfg.plan();
     let engine = Engine::new(plan.clone(), cfg.dsp(), !opts.sim);
-    let src = if opts.sim { Src::Sim(Sim::start(engine.sink(), plan.clone(), cfg.rx())) } else { open_device(&opts.lib, opts.serial, &engine, &plan, cfg.rx()) };
+    let asked = crate::hydra::board();
+    let mut src = if opts.sim { Src::Sim(Sim::start(engine.sink(), plan.clone(), cfg.rx())) } else { open_device(&opts.lib, opts.serial, &engine, &plan, cfg.rx()) };
+    let mut plan = plan;
+    if crate::hydra::board() != asked {
+        // the firmware said which Airspy it is: fit the settings and start the sweep
+        engine.set_eq_prefix(crate::hydra::board().cache_prefix());
+        cfg.fit_board();
+        plan = cfg.plan();
+        engine.set_plan(plan.clone());
+        if let Src::Device(d) = &mut src {
+            d.sweep(&plan)?;
+        }
+    }
     match &src {
         Src::Offline(e) => return Err(e.clone()),
         Src::Device(d) => println!("{} via {}", d.version(), d.lib_path().display()),
@@ -2014,7 +2924,10 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
 }
 
 fn open_device(lib: &std::path::Path, serial: u64, engine: &Engine, plan: &Plan, rx: RxSettings) -> Src {
+    let asked = crate::hydra::board();
     match Device::open(lib, serial, engine.sink(), rx, plan.rate) {
+        // an Airspy turned out to be the other model: the caller fits the plan and starts the sweep
+        Ok(d) if crate::hydra::board() != asked => Src::Device(d),
         Ok(mut d) => match d.sweep(plan) {
             Ok(()) => {
                 log::info!("{} via {}", d.version(), d.lib_path().display());
@@ -2084,7 +2997,6 @@ fn swatch(ui: &mut Ui, c: Color32) {
     ui.painter().line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(2.0, c));
 }
 
-/// Local wall-clock time, HH:MM:SS (glibc localtime_r; Linux only, like the rest of the app).
 /// What a sweep mode change changed, for its waterfall break: the new range, else the profile now in
 /// use, else the settings that differ. None if nothing a viewer would care about changed.
 fn mode_change((a, na): &(Plan, usize), (b, nb): &(Plan, usize), cfg: &Config) -> Option<String> {
@@ -2122,38 +3034,37 @@ fn mode_change((a, na): &(Plan, usize), (b, nb): &(Plan, usize), cfg: &Config) -
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// Local wall-clock time, HH:MM:SS, from the C library (localtime_r; _localtime64_s on Windows).
 fn local_hms() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    // struct tm starts with sec, min, hour as ints everywhere; glibc adds gmtoff and zone at the end
     #[repr(C)]
     struct Tm {
-        sec: i32,
-        min: i32,
-        hour: i32,
-        mday: i32,
-        mon: i32,
-        year: i32,
-        wday: i32,
-        yday: i32,
-        isdst: i32,
-        gmtoff: i64,
-        zone: *const std::ffi::c_char,
+        f: [i32; 9],
+        _glibc: [u64; 2],
     }
-    unsafe extern "C" {
-        fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
-    }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let mut tm = Tm { sec: 0, min: 0, hour: 0, mday: 0, mon: 0, year: 0, wday: 0, yday: 0, isdst: 0, gmtoff: 0, zone: std::ptr::null() };
-    // SAFETY: localtime_r only writes into `tm`, which outlives the call.
-    if unsafe { localtime_r(&now, &mut tm) }.is_null() {
+    let mut tm = Tm { f: [0; 9], _glibc: [0; 2] };
+    #[cfg(not(windows))]
+    let ok = {
+        unsafe extern "C" {
+            fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
+        }
+        // SAFETY: localtime_r only writes into `tm`, which outlives the call and is big enough.
+        !unsafe { localtime_r(&now, &mut tm) }.is_null()
+    };
+    #[cfg(windows)]
+    let ok = {
+        unsafe extern "C" {
+            fn _localtime64_s(out: *mut Tm, t: *const i64) -> i32;
+        }
+        // SAFETY: as above; the Windows struct tm is the nine ints alone.
+        unsafe { _localtime64_s(&mut tm, &now) == 0 }
+    };
+    if !ok {
         return String::new();
     }
-    format!("{:02}:{:02}:{:02}", tm.hour, tm.min, tm.sec)
+    format!("{:02}:{:02}:{:02}", tm.f[2], tm.f[1], tm.f[0])
 }
-
-
-
-
-
-
 
 fn paint_palette_bar(p: &Painter, r: Rect, pal: Palette) {
     let lut = pal.lut();
@@ -2319,11 +3230,18 @@ fn connect_label() -> &'static str {
     }
 }
 
-/// Where exports go: the repo's captures/ when it exists (gitignored), else $XDG_DATA_HOME/corvus-sweep/captures.
+/// Where exports go: the repo's captures/ when it exists (gitignored), else $XDG_DATA_HOME/corvus-sweep/captures
+/// (on Windows, Documents\Corvus Sweep).
 fn captures_dir() -> PathBuf {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../captures");
     if repo.exists() {
         return repo;
+    }
+    #[cfg(windows)]
+    if let Some(dir) = std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Documents").join("Corvus Sweep"))
+        && std::fs::create_dir_all(&dir).is_ok()
+    {
+        return dir;
     }
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)

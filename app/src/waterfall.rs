@@ -118,6 +118,53 @@ impl Waterfall {
         self.times[(self.head + i) % ROWS]
     }
 
+    /// For the 3D view: the newest `gz` rows, columns u0..u1 (0..1 of the cover) pooled to `gx` points by
+    /// their maximum, row-major with the newest row first. Unmeasured points read `floor`.
+    pub fn grid(&self, u0: f32, u1: f32, gx: usize, gz: usize, floor: f32) -> Vec<f32> {
+        let mut out = vec![floor; gx * gz];
+        if self.cols == 0 || gx == 0 {
+            return out;
+        }
+        let c0 = (u0.clamp(0.0, 1.0) * self.cols as f32) as usize;
+        let c1 = ((u1.clamp(0.0, 1.0) * self.cols as f32).ceil() as usize).clamp(c0 + 1, self.cols);
+        let span = (c1 - c0) as f32;
+        for z in 0..gz.min(self.filled) {
+            let row = &self.hist[((self.head + z) % ROWS) * self.cols..][..self.cols];
+            for x in 0..gx {
+                let a = c0 + (x as f32 / gx as f32 * span) as usize;
+                let b = (c0 + ((x + 1) as f32 / gx as f32 * span).ceil() as usize).clamp(a + 1, c1);
+                let m = row[a..b].iter().copied().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+                if m.is_finite() {
+                    out[z * gx + x] = m;
+                }
+            }
+        }
+        out
+    }
+
+    /// The current palette as RGBA bytes (for the 3D view).
+    pub fn palette_rgba(&self) -> Vec<[u8; 4]> {
+        self.lut.iter().map(|c| [c.r(), c.g(), c.b(), 255]).collect()
+    }
+
+    /// Changes whenever a row arrives or the history is re-mapped (for caching derived views).
+    pub fn stamp(&self) -> (usize, usize, u64, usize) {
+        (self.head, self.filled, self.generation, self.cols)
+    }
+
+    /// Level (dB) at frequency `f` (Hz) in the row shown `i` rows below the top, if it was measured there.
+    pub fn value_at(&self, i: usize, f: f64) -> Option<f32> {
+        if i >= self.filled || self.cols == 0 || self.cover.1 <= self.cover.0 {
+            return None;
+        }
+        let u = (f - self.cover.0) / (self.cover.1 - self.cover.0);
+        if !(0.0..1.0).contains(&u) {
+            return None;
+        }
+        let v = self.hist[((self.head + i) % ROWS) * self.cols + (u * self.cols as f64) as usize];
+        v.is_finite().then_some(v)
+    }
+
     /// Draw the newest `rows` rows into `rect`, showing texture columns u0..u1 (0..1 of the cover).
     pub fn paint(&mut self, ctx: &egui::Context, painter: &Painter, rect: Rect, u0: f32, u1: f32, rows: usize) {
         self.upload(ctx);

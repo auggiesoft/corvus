@@ -22,11 +22,47 @@ use crate::plan::{Order, Plan, Rate};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DspSettings {
     pub nfft: usize,
-    /// Video averaging weight per pass (0 = off).
-    pub avg_alpha: f32,
+    /// Averaging time constant in seconds (0 = the average just follows the live trace).
+    pub avg_tau: f32,
+    /// Average in linear power (true mean power) rather than in dB (a video average, smoother and
+    /// about 2.5 dB lower on noise).
+    pub avg_power: bool,
+    /// What the peak trace keeps.
+    pub peak: PeakMode,
     pub eq_on: bool,
     /// Waterfall rows per second at most (fast narrow plans merge passes by max).
     pub wf_rate: f32,
+}
+
+/// The peak trace: a plain hold, a hold that falls back, or a running percentile of each bin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PeakMode {
+    /// Highest level seen since the last clear.
+    Hold,
+    /// Rises at once, holds for `PEAK_HOLD_S`, then falls at this many dB per second.
+    Decay(f32),
+    /// The level each bin exceeds `1 - p` of the time (p in 0..1), tracked over about `tau` seconds.
+    Percentile { p: f32, tau: f32 },
+}
+
+/// How long a decaying peak stays at its top before it starts to fall (the guide's meter hold, D4).
+pub const PEAK_HOLD_S: f32 = 1.0;
+
+/// One update of a decaying peak: `t` seconds after the last, with a new reading `v`. Holds for
+/// `PEAK_HOLD_S` after it was set, then falls at `rate` dB/s; a reading above it sets it again.
+/// Returns the new peak and its age.
+fn decay_step(pk: f32, age: f32, v: f32, rate: f32, t: f32) -> (f32, f32) {
+    let age = age + t;
+    let fallen = pk - rate * (age - PEAK_HOLD_S).clamp(0.0, t);
+    if v >= fallen { (v, 0.0) } else { (fallen, age) }
+}
+
+/// One update of a streaming quantile: up by `p * eta` when the reading is above, down by
+/// `(1 - p) * eta` when below, so it settles where a share `p` of readings fall under it. `eta` lets it
+/// climb about 30 dB in one window of `tau` seconds.
+fn quantile_step(est: f32, v: f32, p: f32, tau: f32, t: f32) -> f32 {
+    let eta = (30.0 * t / tau.max(0.1)).min(10.0);
+    if v > est { (est + eta * p).min(v) } else { est - eta * (1.0 - p) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +125,8 @@ pub struct Live {
     pub cur: Vec<f32>,
     pub avg: Vec<f32>,
     pub peak: Vec<f32>,
+    /// Seconds since each bin's decaying peak was last set (for the hold before it falls).
+    peak_age: Vec<f32>,
     /// Per-bin correction (dB) subtracted from every step; zeros when off or unknown.
     pub eq: Vec<f32>,
     pub eq_state: EqState,
@@ -102,6 +140,8 @@ pub struct Live {
     reset_eq: bool,
     /// Load and save the learned passband in the cache: on for the radio, off for the simulator and tests.
     persist_eq: bool,
+    /// File-name prefix of this board's learned passband (each board's passband differs).
+    eq_prefix: String,
 }
 
 impl Live {
@@ -117,6 +157,7 @@ impl Live {
             cur: Vec::new(),
             avg: Vec::new(),
             peak: Vec::new(),
+            peak_age: Vec::new(),
             eq: Vec::new(),
             eq_state: EqState::Unknown,
             step_t: Vec::new(),
@@ -128,6 +169,7 @@ impl Live {
             clear_peak: false,
             reset_eq: false,
             persist_eq: false,
+            eq_prefix: crate::hydra::board().cache_prefix().to_string(),
         };
         l.relayout();
         l
@@ -143,6 +185,7 @@ impl Live {
         self.cur = vec![f32::NAN; len];
         self.avg = vec![f32::NAN; len];
         self.peak = vec![f32::NAN; len];
+        self.peak_age = vec![0.0; len];
         self.eq = vec![0.0; self.m];
         self.step_t = vec![f32::NEG_INFINITY; self.plan.n()];
         self.head = None;
@@ -362,6 +405,11 @@ impl Engine {
         self.live.lock().persist_eq = on;
     }
 
+    /// Another board: the worker saves what it learned under the old board's name and loads the new one's.
+    pub fn set_eq_prefix(&self, prefix: &str) {
+        self.live.lock().eq_prefix = prefix.to_string();
+    }
+
     pub fn clear_peak(&self) {
         self.live.lock().clear_peak = true;
     }
@@ -448,6 +496,8 @@ struct Worker {
     settle_dropped: u32,
     acc_lock: u16,
     acc_dma: u32,
+    /// Each step's block counter at its previous visit, for the time between visits (device clock).
+    step_dma: Vec<Option<u32>>,
     scratch: Vec<f32>,
     done: Vec<Done>,
     order: OrderModel,
@@ -456,6 +506,7 @@ struct Worker {
     /// Learned passband shape per (rate, FFT size), on that grid, with the passes behind it.
     eq_store: HashMap<(Rate, usize), (Vec<f32>, u32)>,
     persist_eq: bool,
+    eq_prefix: String,
     eq_t: f32,
     eq_saved_t: f32,
     row_acc: Option<Vec<f32>>,
@@ -469,11 +520,11 @@ struct Worker {
 
 impl Worker {
     fn new(live: Arc<Mutex<Live>>, rx: Receiver<Vec<u16>>, stop: Arc<AtomicBool>, host_drops: Arc<AtomicU64>, epoch: Instant) -> Worker {
-        let (plan, settings, persist_eq) = {
+        let (plan, settings, persist_eq, eq_prefix) = {
             let l = live.lock();
-            (l.plan.clone(), l.settings, l.persist_eq)
+            (l.plan.clone(), l.settings, l.persist_eq, l.eq_prefix.clone())
         };
-        let eq_store = if persist_eq { load_eq_store() } else { HashMap::new() };
+        let eq_store = if persist_eq { load_eq_store(&eq_prefix) } else { HashMap::new() };
         Worker {
             dsp: Dsp::new(settings.nfft, plan.rate),
             order: OrderModel::new(&plan),
@@ -495,12 +546,14 @@ impl Worker {
             settle_dropped: 0,
             acc_lock: 0,
             acc_dma: 0,
+            step_dma: Vec::new(),
             scratch: Vec::new(),
             done: Vec::new(),
             last_key: None,
             last_sweep: None,
             eq_store,
             persist_eq,
+            eq_prefix,
             eq_t: 0.0,
             eq_saved_t: 0.0,
             row_acc: None,
@@ -541,26 +594,33 @@ impl Worker {
             self.restarts = l.restarts;
             self.reset_sequence(true);
         }
-        if l.persist_eq != self.persist_eq {
+        if l.persist_eq != self.persist_eq || l.eq_prefix != self.eq_prefix {
             if self.persist_eq {
                 self.save_eq();
             }
             self.persist_eq = l.persist_eq;
-            self.eq_store = if self.persist_eq { load_eq_store() } else { HashMap::new() };
+            self.eq_prefix = l.eq_prefix.clone();
+            self.eq_store = if self.persist_eq { load_eq_store(&self.eq_prefix) } else { HashMap::new() };
             self.publish_eq(&mut l);
         }
         if l.reset_eq {
             l.reset_eq = false;
             self.eq_store.remove(&(l.plan.rate, l.settings.nfft));
             if self.persist_eq {
-                let _ = std::fs::remove_file(eq_path(l.plan.rate, l.settings.nfft));
+                let _ = std::fs::remove_file(eq_path(&self.eq_prefix, l.plan.rate, l.settings.nfft));
             }
             self.publish_eq(&mut l);
         }
-        if l.clear_peak {
+        // a new peak mode starts from the live trace, like Clear peaks
+        if l.clear_peak || l.settings.peak != self.settings.peak {
             l.clear_peak = false;
             let cur = l.cur.clone();
             l.peak = cur;
+            l.peak_age.iter_mut().for_each(|a| *a = 0.0);
+        }
+        // a new averaging time or kind restarts the average, so it shows at once
+        if l.settings.avg_tau != self.settings.avg_tau || l.settings.avg_power != self.settings.avg_power {
+            l.avg.iter_mut().for_each(|a| *a = f32::NAN);
         }
         let eq_toggled = l.settings.eq_on != self.settings.eq_on;
         self.settings = l.settings;
@@ -575,6 +635,7 @@ impl Worker {
             self.acc = vec![0.0; l.m];
             self.scratch = vec![0.0; l.m];
             self.order = OrderModel::new(&self.plan);
+            self.step_dma = vec![None; self.plan.n()];
             self.row_acc = None;
             self.rate_win.clear();
             self.reset_sequence(restarted);
@@ -726,17 +787,50 @@ impl Worker {
         self.last_key = Some(key);
         let m = l.m;
         let i0 = d.step as usize * m;
-        let a = self.settings.avg_alpha;
+        // seconds since this step was last measured, on the device clock (several visits can arrive in
+        // one batch on a narrow plan, so the host clock won't do)
+        let dt = match self.step_dma.get_mut(d.step as usize) {
+            Some(slot) => {
+                let dt = slot.map(|p| (d.dma.wrapping_sub(p) as f64 * self.plan.rate.block_s()) as f32);
+                *slot = Some(d.dma);
+                dt.filter(|t| *t > 0.0 && *t < 60.0)
+            }
+            None => None,
+        };
+        let s = self.settings;
+        let alpha = match dt {
+            Some(t) if s.avg_tau > 0.0 => 1.0 - (-t / s.avg_tau).exp(),
+            _ => 1.0,
+        };
         let clear = l.stats.steps == 0;
         for j in 0..m {
             let v = d.db[j];
-            l.cur[i0 + j] = v;
-            let av = &mut l.avg[i0 + j];
-            *av = if av.is_nan() || a <= 0.0 { v } else { *av + a * (v - *av) };
-            let pk = &mut l.peak[i0 + j];
-            if pk.is_nan() || v > *pk || clear {
-                *pk = v;
-            }
+            let i = i0 + j;
+            l.cur[i] = v;
+            let av = &mut l.avg[i];
+            *av = if av.is_nan() || alpha >= 1.0 {
+                v
+            } else if s.avg_power {
+                let (pa, pv) = (10f32.powf(*av * 0.1), 10f32.powf(v * 0.1));
+                10.0 * (pa + alpha * (pv - pa)).max(1e-30).log10()
+            } else {
+                *av + alpha * (v - *av)
+            };
+            let pk = l.peak[i];
+            l.peak[i] = if pk.is_nan() || clear {
+                l.peak_age[i] = 0.0;
+                v
+            } else {
+                match (s.peak, dt) {
+                    (PeakMode::Decay(rate), Some(t)) => {
+                        let (pk, age) = decay_step(pk, l.peak_age[i], v, rate, t);
+                        l.peak_age[i] = age;
+                        pk
+                    }
+                    (PeakMode::Percentile { p, tau }, Some(t)) => quantile_step(pk, v, p, tau, t),
+                    (PeakMode::Hold, _) | (_, None) => pk.max(v),
+                }
+            };
         }
         l.step_t[d.step as usize] = now;
         l.head = Some(d.step as usize);
@@ -851,7 +945,7 @@ impl Worker {
         }
         for ((rate, nfft), (eq, passes)) in &self.eq_store {
             if *passes > 0 && eq.iter().any(|v| !v.is_nan()) {
-                let path = eq_path(*rate, *nfft);
+                let path = eq_path(&self.eq_prefix, *rate, *nfft);
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
@@ -901,9 +995,10 @@ fn median(v: &mut [f32]) -> f32 {
     *v.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
 }
 
-fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
+fn eq_path(prefix: &str, rate: Rate, nfft: usize) -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from)) // Windows
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("."));
     // 10 MSPS keeps the name it had before 12 MSPS existed
@@ -913,15 +1008,15 @@ fn eq_path(rate: Rate, nfft: usize) -> PathBuf {
         Rate::M6 => format!("passband-eq-6msps-{nfft}.f32"),
         Rate::H20 => format!("passband-eq-20msps-iq-{nfft}.f32"),
     };
-    base.join("corvus-sweep").join(format!("{}{name}", crate::hydra::board().cache_prefix()))
+    base.join("corvus-sweep").join(format!("{prefix}{name}"))
 }
 
 /// Every learned passband in the cache, counted as 10 passes so new data can still move it.
-fn load_eq_store() -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
+fn load_eq_store(prefix: &str) -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
     let mut store = HashMap::new();
     for rate in [Rate::M10, Rate::M12, Rate::M6, Rate::H20] {
         for nfft in dsp::NFFTS {
-            if let Some(v) = load_eq(rate, nfft) {
+            if let Some(v) = load_eq(prefix, rate, nfft) {
                 store.insert((rate, nfft), (v, 10));
             }
         }
@@ -929,8 +1024,8 @@ fn load_eq_store() -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
     store
 }
 
-fn load_eq(rate: Rate, nfft: usize) -> Option<Vec<f32>> {
-    let bytes = std::fs::read(eq_path(rate, nfft)).ok()?;
+fn load_eq(prefix: &str, rate: Rate, nfft: usize) -> Option<Vec<f32>> {
+    let bytes = std::fs::read(eq_path(prefix, rate, nfft)).ok()?;
     let v: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     (v.len() == dsp::grid(nfft, rate).len()).then_some(v)
 }
@@ -944,7 +1039,7 @@ mod tests {
     fn index_and_freq_agree() {
         for rate in [Rate::M10, Rate::M12] {
             let plan = Plan::new(24.0, 1800.0, rate.default_step_mhz(), 1, 0, 2, Order::VcoContinuous, rate);
-            let l = Live::new(plan, DspSettings { nfft: 8192, avg_alpha: 0.0, eq_on: false, wf_rate: 30.0 });
+            let l = Live::new(plan, DspSettings { nfft: 8192, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 30.0 });
             for f in [24e6, 100e6, 433.92e6, 1799.9e6] {
                 let i = l.index_of(f);
                 assert!(l.freq(i) >= f && l.freq(i) - f < 3e3, "{rate:?} {f} -> {}", l.freq(i));
@@ -955,7 +1050,7 @@ mod tests {
     #[test]
     fn worker_stitches_steps_and_counts_passes() {
         let plan = Plan::new(400.0, 440.0, 8.0, 1, 0, 2, Order::Ascending, Rate::M10);
-        let eng = Engine::new(plan.clone(), DspSettings { nfft: 2048, avg_alpha: 0.0, eq_on: false, wf_rate: 1000.0 }, false);
+        let eng = Engine::new(plan.clone(), DspSettings { nfft: 2048, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 1000.0 }, false);
         let sink = eng.sink();
         let mut cnt = 0;
         for sweep in 1..=3u32 {
@@ -988,7 +1083,7 @@ mod tests {
         let fastest = Plan::new(24.0, 1800.0, 10.0, 1, 0, 2, Order::VcoContinuous, Rate::M12);
         let quality = Plan::new(24.0, 1800.0, 8.0, 4, 1, 3, Order::VcoContinuous, Rate::M12);
         let bursts = Plan::new(24.0, 1800.0, 10.0, 4, 0, 2, Order::VcoContinuous, Rate::M12);
-        let eng = Engine::new(fastest.clone(), DspSettings { nfft: 2048, avg_alpha: 0.0, eq_on: false, wf_rate: 20.0 }, false);
+        let eng = Engine::new(fastest.clone(), DspSettings { nfft: 2048, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 20.0 }, false);
         let sim = Sim::start(eng.sink(), fastest.clone(), RxSettings { port: 0, gain: Gain::Linearity(10) });
         std::thread::sleep(Duration::from_millis(500));
         for p in [&quality, &fastest, &bursts, &fastest, &quality, &bursts] {
@@ -998,12 +1093,49 @@ mod tests {
         }
         // a new bin width re-lays out the engine mid-pass, without restarting the radio
         for nfft in [1024, 4096, 2048, 512] {
-            eng.set_settings(DspSettings { nfft, avg_alpha: 0.0, eq_on: false, wf_rate: 20.0 });
+            eng.set_settings(DspSettings { nfft, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 20.0 });
             std::thread::sleep(Duration::from_millis(330));
         }
         let l = eng.live.lock();
         assert!(l.stats.steps > 500, "the sweep kept running ({} steps)", l.stats.steps);
         assert_eq!((l.stats.gaps, l.stats.misfiled, l.stats.torn), (0, 0, 0));
+    }
+
+    #[test]
+    fn decaying_peak_holds_then_falls() {
+        // set at -40, then quiet readings at -90 every 0.2 s, falling at 6 dB/s after a 1 s hold
+        let (mut pk, mut age) = (-40.0f32, 0.0f32);
+        let mut at = Vec::new();
+        for _ in 0..15 {
+            (pk, age) = decay_step(pk, age, -90.0, 6.0, 0.2);
+            at.push(pk);
+        }
+        assert!((at[3] + 40.0).abs() < 1e-4, "still held at 0.8 s: {}", at[3]);
+        assert!((at[14] - (-40.0 - 6.0 * 2.0)).abs() < 1e-3, "fallen 12 dB after 3 s: {}", at[14]);
+        // a new reading above it sets it again, and the hold restarts
+        (pk, age) = decay_step(pk, age, -45.0, 6.0, 0.2);
+        assert_eq!((pk, age), (-45.0, 0.0));
+        // it never falls below what it's reading
+        let (pk, _) = decay_step(-50.0, 30.0, -52.0, 30.0, 1.0);
+        assert_eq!(pk, -52.0);
+    }
+
+    #[test]
+    fn percentile_settles_at_the_quantile() {
+        // readings spread evenly over -100..-80 dB: the 90th percentile is -82
+        let mut seed = 12345u32;
+        let mut est = -100.0f32;
+        let mut tail = Vec::new();
+        for k in 0..20000 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = -100.0 + 20.0 * (seed >> 8) as f32 / (1u32 << 24) as f32;
+            est = quantile_step(est, v, 0.9, 10.0, 0.2);
+            if k > 10000 {
+                tail.push(est);
+            }
+        }
+        let mean = tail.iter().sum::<f32>() / tail.len() as f32;
+        assert!((mean + 82.0).abs() < 0.6, "P90 estimate {mean}");
     }
 
     #[test]
@@ -1013,7 +1145,7 @@ mod tests {
         // 1-6000 MHz crosses 4.29 GHz, where the 32-bit tag frequencies wrap
         let wide = Plan::new(1.0, 6000.0, 5.0, 1, 0, 0, Order::Interleaved, Rate::H20);
         let narrow = Plan::new(2400.0, 2500.0, 5.0, 2, 0, 0, Order::Interleaved, Rate::H20);
-        let eng = Engine::new(wide.clone(), DspSettings { nfft: 1024, avg_alpha: 0.0, eq_on: false, wf_rate: 20.0 }, false);
+        let eng = Engine::new(wide.clone(), DspSettings { nfft: 1024, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 20.0 }, false);
         let sim = Sim::start(eng.sink(), wide.clone(), RxSettings { port: 0, gain: Gain::Linearity(10) });
         std::thread::sleep(Duration::from_millis(1200));
         for p in [&narrow, &wide] {

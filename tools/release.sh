@@ -18,6 +18,8 @@ echo "== host libraries"
 "$R/host/build/build.sh" all
 echo "== Corvus Sweep"
 (cd "$R/app" && cargo build --release --locked)
+echo "== Corvus Sweep for Windows"
+"$R/app/build/build.sh" windows
 
 notice() { # what the archive holds and where its source and licences are
   cat <<EOF
@@ -26,7 +28,9 @@ Source for everything in this archive: $SRC_URL
 
 Licences:
 - Corvus Sweep (corvus-sweep) and Corvus's own code: MIT, see LICENSE. It embeds the Barlow and
-  Auggie Mono (IBM Plex Mono based) fonts, SIL Open Font License 1.1: see OFL-*.txt.
+  Auggie Mono (IBM Plex Mono based) fonts, SIL Open Font License 1.1: see OFL-*.txt. Its built-in
+  USB driver is ported from libairspy (BSD-3-Clause), libhydrasdr (MIT) and libhackrf
+  (BSD-3-Clause): see LICENSE-libairspy.txt, LICENSE-libhydrasdr.md and LICENSE-libhackrf.txt.
 - libhydrasdr: MIT, with hydrasdr.c/hydrasdr.h BSD-3-Clause: see LICENSE-libhydrasdr.md.
 - libairspy: BSD-3-Clause: see LICENSE-libairspy.txt.
 - hydrasdr_* and airspy_* tools: GPL-2.0 (from the HackRF project); source at the link above
@@ -39,6 +43,7 @@ licences() { # <dir>
   cp "$R/LICENSE" "$1/LICENSE"
   cp "$R/host/hydrasdr-host/libhydrasdr/LICENSE.md" "$1/LICENSE-libhydrasdr.md"
   tr -d '\r' < "$R/host/airspyone-host/libairspy/src/airspy.c" | sed -n '1,/\*\//p' > "$1/LICENSE-libairspy.txt"
+  cp "$R/app/licenses/LICENSE-libhackrf.txt" "$1/LICENSE-libhackrf.txt"
   cp "$R"/app/assets/fonts/OFL-*.txt "$1/"
   notice > "$1/NOTICE.txt"
 }
@@ -48,7 +53,8 @@ echo "== packaging $VER"
 cp "$R"/firmware/build/out/rfone/corvus-fw-*-rfone.bin "$OUT/"
 cp "$R"/firmware/build/out/airspy/corvus-fw-*-airspy.bin "$OUT/"
 
-# Corvus Sweep for Linux, with both libraries beside it (it loads the one next to itself first)
+# Corvus Sweep for Linux. It talks to every board through its built-in USB driver; both libraries ride
+# along beside it for --usb lib (it loads the one next to itself first)
 A=corvus-sweep-$VER-linux-x86_64
 S=$OUT.stage
 case "$S" in "$R"/dist/?*.stage) rm -rf "$S" ;; *) exit 1 ;; esac
@@ -59,6 +65,13 @@ cp "$R/app/README.md" "$S/$A/README-corvus-sweep.md"
 licences "$S/$A"
 tar -C "$S" -czf "$OUT/$A.tar.gz" "$A"
 
+# Corvus Sweep for Windows x64: the .exe alone (built-in USB driver, WinUSB; no DLLs needed)
+WA=corvus-sweep-$VER-windows-x64
+mkdir -p "$S/$WA"
+cp "$R/app/target/x86_64-pc-windows-gnu/release/corvus-sweep-stripped.exe" "$S/$WA/corvus-sweep.exe"
+cp "$R/app/README.md" "$S/$WA/README-corvus-sweep.md"
+licences "$S/$WA"
+(cd "$S" && python3 -m zipfile -c "$OUT/$WA.zip" "$WA")
 # host libraries and tools for Linux (libhydrasdr + hydrasdr_* tools, libairspy + airspy_* tools)
 H=corvus-host-$VER-linux-x86_64
 mkdir -p "$S/$H/hydrasdr" "$S/$H/airspy"
