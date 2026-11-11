@@ -227,6 +227,18 @@ Where the time above goes, and what replaced it:
 - **Profiles:** calibrating 149 steps through the driver takes 0.66 s. About 7 of a profile's 16 words differ
   between steps 8 apart (6–11), so only those are rewritten.
 
+### On Tezuka firmware (corvus-pluto 0.2.2)
+
+The same Pluto+ on F5OEO's Tezuka v0.3.24 (kernel 6.12, Maia SDR running alongside), AD936x in 1R1T:
+
+- **Served over Gigabit Ethernet, 70–6000 MHz, 40 MHz steps:** ~2,730 steps/s (109 GHz/s, 18.3 passes/s),
+  no gaps or drops; 20–6170 MHz (past the driver's range): ~2,615 steps/s. **Driver path:** 443 steps/s.
+- **On the board, no network:** 7,906 steps/s with no per-block work, 5,265 copying each block out, 5,371
+  building the frame; the driver path 461–478. 15–35 % below PlutoDVB2 on the same board, CPU clock and
+  bootloader (the pinning works the same; Maia's spectrometer adds ~15 interrupts/s): the newer kernel.
+- **Pollers:** Tezuka's dashboard telemetry and PTT watcher make 30–60 SPI transactions a second at idle;
+  paused during a plan, the bus carries none (0 SPI interrupts in 2 s mid-sweep), and they resume after.
+
 ## Restarts
 
 Changing gain or port mid-sweep means SWEEP_STOP, the setting, then SWEEP_START, because the firmware

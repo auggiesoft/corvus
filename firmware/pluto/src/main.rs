@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 
 mod fast;
 mod gaintable;
+mod pollers;
 
 use fast::{Driver, Fast, Profiles};
 
@@ -474,6 +475,8 @@ struct Sweeper<'a> {
     /// scratch block, and when the bus and the profiles' age were last checked.
     scratch: Vec<u8>,
     checked: Instant,
+    /// Other programs that poll the radio, paused while a plan runs (src/pollers.rs).
+    paused: Option<pollers::Paused>,
 }
 
 impl Sweeper<'_> {
@@ -493,6 +496,13 @@ impl Sweeper<'_> {
     fn start(&mut self, p: SweepPlan) -> Result<&'static str, String> {
         self.release();
         self.fast_note = None;
+        if self.paused.is_none() {
+            let paused = pollers::pause();
+            if paused.count() > 0 {
+                eprintln!("paused {} programs that poll the radio", paused.count());
+            }
+            self.paused = Some(paused);
+        }
         if p.fast {
             let why = fast::unavailable(&self.radio.phy);
             let r = match why {
@@ -531,6 +541,7 @@ impl Sweeper<'_> {
             Ok(Cmd::Config { rate, bw, gain }) => {
                 self.release();
                 self.plan = None;
+                self.paused = None;
                 self.lo = None;
                 self.radio.configure(rate, bw, gain).map(|_| format!("OK CONFIG rate={} bw={bw} gain={gain}", self.radio.rate))
             }
@@ -544,6 +555,7 @@ impl Sweeper<'_> {
             Ok(Cmd::Stop) => {
                 self.release();
                 self.plan = None;
+                self.paused = None;
                 self.radio.stop_capture();
                 Ok("OK STOP".into())
             }
@@ -745,6 +757,7 @@ impl Sweeper<'_> {
 
 fn bench() -> Result<(), String> {
     let mut r = Radio::open()?;
+    let _paused = pollers::pause();
     println!("{}", r.describe());
     let lo0 = read_attr(&r.phy.join("out_altvoltage0_RX_LO_frequency"));
     r.configure(61_440_000, 56_000_000, 40)?;
@@ -934,7 +947,7 @@ fn session(stream: TcpStream, radio: &mut Radio, profiles: &mut Profiles) {
     // the sweep loop spins while capture blocks fill: keep it off the core that takes the interrupts
     pin_to_cpu(1);
     let _ = out.send(text(&format!("HELLO {}", radio.describe())));
-    let mut sw = Sweeper { radio, plan: None, sweep: 0, pass: 0, t0: Instant::now(), lo: None, iq: vec![0u8; IQ_BYTES], fast: None, profiles, fast_note: None, pending: None, scratch: vec![0u8; IQ_BYTES], checked: Instant::now() };
+    let mut sw = Sweeper { radio, plan: None, sweep: 0, pass: 0, t0: Instant::now(), lo: None, iq: vec![0u8; IQ_BYTES], fast: None, profiles, fast_note: None, pending: None, scratch: vec![0u8; IQ_BYTES], checked: Instant::now(), paused: None };
     while alive.load(Ordering::Relaxed) {
         let cmd = if sw.plan.is_some() {
             match cmds.try_recv() {
@@ -959,12 +972,14 @@ fn session(stream: TcpStream, radio: &mut Radio, profiles: &mut Profiles) {
             let _ = out.send(text(&format!("ERR {e}")));
             sw.release();
             sw.plan = None;
+            sw.paused = None;
             sw.lo = None;
             sw.radio.stop_capture();
         }
     }
     sw.release();
     sw.radio.stop_capture();
+    sw.paused = None;
     drop(out);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = writer.join();
@@ -1023,6 +1038,10 @@ fn serve(port: u16) -> Result<(), String> {
     let mut profiles = Profiles::default();
     if let Some(why) = fast::unavailable(&radio.phy) {
         eprintln!("fast mode unavailable: {why}");
+    }
+    let n = pollers::resume_stopped();
+    if n > 0 {
+        eprintln!("resumed {n} radio pollers an earlier run left paused");
     }
     let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("listen on {port}: {e}"))?;
     eprintln!("{} listening on {port}", radio.describe());

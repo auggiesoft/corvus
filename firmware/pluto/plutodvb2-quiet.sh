@@ -8,6 +8,9 @@
 # Installed by install.sh (STOP_DATV=1) as /mnt/jffs2/plutodvb2-quiet.sh and started from
 # /mnt/jffs2/backdoor.sh, which S95bgcript runs *before* it starts those services, so this waits for them
 # first. Log: /tmp/plutodvb2-quiet.log. To undo: delete its line from /mnt/jffs2/backdoor.sh and reboot.
+# PlutoDVB2 only (its MQTT control daemon is the marker): other firmware that runs /mnt/jffs2/backdoor.sh, such
+# as Tezuka, keeps its services
+[ -x /root/pluto_mqtt_ctrl ] || exit 0
 LOG=/tmp/plutodvb2-quiet.log
 echo "plutodvb2-quiet $(date)" > $LOG
 i=0

@@ -1,6 +1,6 @@
 [package]
 name = "corvus-pluto"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Corvus sweep for the PlutoSDR family: runs on the board, serves tagged sweep blocks over TCP"
 license = "MIT"

@@ -219,7 +219,7 @@ impl Drop for Spi {
 }
 
 /// SPI0's interrupt count: the kernel's transfers raise interrupts, ours don't (they're masked).
-fn spi_irqs() -> u64 {
+pub(crate) fn spi_irqs() -> u64 {
     fs::read_to_string("/proc/interrupts")
         .unwrap_or_default()
         .lines()
@@ -251,8 +251,14 @@ fn dma_irqs_to_cpu1() -> Vec<(String, String)> {
     moved
 }
 
-fn spi0_power() -> PathBuf {
-    PathBuf::from(format!("/sys/devices/soc0/amba/{SPI0_NAME}/power/control"))
+/// SPI0's runtime-PM switch, found from the AD936x's own sysfs path (the bus sits under `amba/` on older
+/// kernels, `axi/` on newer ones).
+fn spi0_power(phy: &Path) -> Result<PathBuf, String> {
+    let real = fs::canonicalize(phy).map_err(|e| format!("{}: {e}", phy.display()))?;
+    real.ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == SPI0_NAME))
+        .map(|a| a.join("power/control"))
+        .ok_or(format!("the AD936x isn't on {SPI0_NAME}"))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -484,7 +490,7 @@ impl Fast {
         let w = |a: &str, v: &str| fs::write(phy.join(a), v).map_err(|e| format!("{a}: {e}"));
         w("out_altvoltage0_RX_LO_fastlock_store", "0")?;
         w("out_altvoltage0_RX_LO_fastlock_recall", "0")?;
-        let power = spi0_power();
+        let power = spi0_power(&phy)?;
         fs::write(&power, "on").map_err(|e| format!("{}: {e}", power.display()))?;
         let quiet = || -> Result<(Spi, u64), String> {
             let a = spi_irqs();

@@ -18,10 +18,14 @@ fallback) does about 650 steps/s.
 ## What the board needs
 
 - **Firmware with ADI's capture path**: the `cf-ad9361-lpc` IIO device with a buffer (`scan_elements`).
-  ADI's stock firmware has it, and so do the Pluto+ builds of F5OEO's PlutoDVB2 (tested: 0.5.16.7).
-  **Maia SDR's firmware does not**: it keeps iiod for tuning, but its FPGA design has no RX buffer, so it
-  can't hand samples to a program (Maia's own docs say a Pluto running Maia "can't send or receive IQ
-  samples to a PC").
+  ADI's stock firmware has it, and so do the Pluto+ builds of F5OEO's PlutoDVB2 (tested: 0.5.16.7) and
+  F5OEO's Tezuka (tested: v0.3.24, which carries Maia SDR alongside ADI's capture path). **Maia SDR's own
+  firmware does not**: it keeps iiod for tuning, but its FPGA design has no RX buffer, so it can't hand
+  samples to a program (Maia's own docs say a Pluto running Maia "can't send or receive IQ samples to a PC").
+- **The AD936x in 1R1T mode** for 61.44 MSPS. With both RX channels on (2R2T, `adi,2rx-2tx-mode-enable` in
+  the device tree) the chip's data port tops out at 30.72 MSPS, and the board offers nothing faster (see
+  `in_voltage_sampling_frequency_available`). The firmware's bootloader removes that property when the U-Boot
+  variable `mode` is `1r1t`, but some bootloaders only for the board models they know.
 - A network link to the PC: Ethernet (Pluto+), or the USB network link every Pluto has (the board at
   192.168.2.1, the default here). Fast mode sends 40–50 MB/s, so Ethernet gets the most out of it.
 - SSH access (root; the stock password is `analog`) to install it.
@@ -38,7 +42,7 @@ STOP_DATV=1 firmware/pluto/install.sh 192.168.1.50           # on PlutoDVB2: als
 ```
 
 `install.sh` copies the binary to `/mnt/jffs2` (the board's small persistent flash area; about 530 KB of
-its 896 KB) and starts it. On firmware that runs `/mnt/jffs2/backdoor.sh` at boot (PlutoDVB2), it adds a
+its 896 KB) and starts it. On firmware that runs `/mnt/jffs2/backdoor.sh` at boot (PlutoDVB2, Tezuka), it adds a
 line there so it also starts at every boot. Elsewhere it runs until the next reboot.
 
 Then, on the PC: `corvus-sweep --pluto 192.168.1.50` (or `CORVUS_PLUTO=192.168.1.50`), or just `--board pluto`
@@ -79,7 +83,15 @@ Measured levels against the driver path at the same frequencies (112 steady step
 
 **Nothing else may drive the AD936x while fast mode sweeps:** another program reading or writing the radio
 through iiod or sysfs uses the same SPI bus. Fast mode notices after the pass and drops to the driver path,
-but a transfer that collides with one of its own can misconfigure the chip until the next CONFIG. PlutoDVB2's
+but a transfer that collides with one of its own can misconfigure the chip until the next CONFIG.
+
+Pollers it knows are paused for the length of a plan (SIGSTOP when a SWEEP starts, SIGCONT on STOP, CONFIG,
+an error or a disconnect; src/pollers.rs). On Tezuka those are the web dashboard's telemetry loop
+(`/root/api_controller.sh`: ~100 IIO reads every 2 s, register reads through `direct_reg_access` among
+them) and its PTT watcher (`/root/watchconsoletx.sh`: reads and rewrites register 0x27 every second). They
+are found by their exact script path, only their own processes are signalled, and a start-up resumes any an
+earlier run left stopped. The dashboard's figures freeze while Corvus sweeps. Maia SDR's web server isn't
+paused (idle, it leaves the chip alone), so don't change radio settings from its page mid-sweep. Unknown programs aren't touched: if one polls the chip, fast mode stays off (`NOTE`). PlutoDVB2's
 MQTT control daemon polls the chip ~24 times a second, which keeps fast mode off. `STOP_DATV=1 install.sh HOST`
 also installs `plutodvb2-quiet.sh`, which stops PlutoDVB2's DATV services at every boot (the MQTT control daemon
 and broker, the DATV streamer, its LO/TX watcher scripts and its NFS server) and keeps iiod, SSH, DHCP and the
