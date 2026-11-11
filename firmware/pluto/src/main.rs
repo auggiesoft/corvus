@@ -13,14 +13,21 @@
 //!
 //! Protocol (TCP, default port 30433). Client to board, text lines:
 //!   CONFIG rate=<Hz> bw=<Hz> gain=<dB>                         sample rate, RF bandwidth, manual RX gain
-//!   SWEEP f0=<Hz> step=<Hz> n=<steps> [dwell=<blocks>] [skip=<blocks>] [order=bounce|asc]
+//!   SWEEP f0=<Hz> step=<Hz> n=<steps> [dwell=<blocks>] [settle=<blocks>] [order=bounce|asc] [mode=fast|driver]
+//!         settle: extra blocks dropped after each retune, beyond what the board needs itself (the driver
+//!         path's two stale blocks). Older clients send skip=<2 + settle> instead; that still works.
 //!   GAIN <dB>                                                  takes effect at once, also mid-sweep
 //!   STOP                                                       stop sweeping (the connection stays)
 //! Board to client, frames of [u32 type][u32 length][payload], little-endian:
 //!   1  one sweep block (16384 bytes)
-//!   2  a text line: "HELLO ...", "OK ...", "ERR ..."
+//!   2  a text line: "HELLO ...", "OK ...", "ERR ...", "NOTE ..."
+//!   3  one sweep block with 12-bit packed samples (12296 bytes; asked for with SWEEP ... pack=12)
 //! Tags: step index, block within the step, pass counter (one per pass, either direction), the LO in Hz
 //! (low 32 bits), and a block clock: time since the sweep started in units of one block's duration.
+//!
+//! Fast mode (src/fast.rs, the default when the board allows it) drives the AD936x itself: fastlock profiles
+//! switched over direct SPI, gain tables written at the band edges, mmap capture blocks queued after each
+//! switch. About 6x the steps/s of the driver path above, which stays as the fallback (`mode=driver`).
 //!
 //! `corvus-pluto bench` measures retune and capture timing on the board instead.
 
@@ -34,6 +41,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
 
+mod fast;
+mod gaintable;
+
+use fast::{Driver, Fast, Profiles};
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PORT: u16 = 30433;
 
@@ -46,6 +58,10 @@ const IQ_BYTES: usize = IQ_PER_BLOCK * 4;
 
 const FRAME_BLOCK: u32 = 1;
 const FRAME_TEXT: u32 = 2;
+/// A sweep block with its samples packed to 12 bits (`pack=12`): the 8 header words, then 4088 I, Q pairs
+/// in 3 bytes each (I bits 0-7; I bits 8-11 | Q bits 0-3 << 4; Q bits 4-11), then the 8 trailer words.
+const FRAME_PACKED: u32 = 3;
+const PACKED_BYTES: usize = 4 * TAG_WORDS + IQ_PER_BLOCK * 3;
 
 // ---------------------------------------------------------------------------------------------------------
 // IIO
@@ -95,6 +111,7 @@ struct Radio {
     gain: FastAttr,
     dev: Option<File>,
     rate: u32,
+    gain_db: i32,
 }
 
 impl Radio {
@@ -104,13 +121,14 @@ impl Radio {
         let rx_lo = FastAttr::open(phy.join("out_altvoltage0_RX_LO_frequency"))?;
         let gain = FastAttr::open(phy.join("in_voltage0_hardwaregain"))?;
         let rate = read_attr(&phy.join("in_voltage_sampling_frequency")).parse().unwrap_or(0);
-        Ok(Radio { phy, rx, rx_lo, gain, dev: None, rate })
+        Ok(Radio { phy, rx, rx_lo, gain, dev: None, rate, gain_db: 40 })
     }
 
     fn describe(&self) -> String {
         let fw = fs::read_to_string("/opt/VERSIONS").ok().and_then(|v| v.lines().next().map(|l| l.trim().to_string())).unwrap_or_default();
         let model = fs::read_to_string("/sys/firmware/devicetree/base/model").unwrap_or_default().trim_end_matches('\0').trim().to_string();
-        format!("corvus-pluto {VERSION} model=\"{model}\" fw=\"{fw}\"")
+        let fast = if fast::unavailable(&self.phy).is_none() { "fast" } else { "driver" };
+        format!("corvus-pluto {VERSION} model=\"{model}\" fw=\"{fw}\" modes={fast}")
     }
 
     /// Sample rate, analog bandwidth and manual gain; DC and quadrature tracking on; the TX LO off (its
@@ -129,8 +147,9 @@ impl Radio {
         Ok(())
     }
 
-    fn set_gain(&self, db: i32) -> Result<(), String> {
-        self.gain.set(db.clamp(0, 73) as u64)
+    fn set_gain(&mut self, db: i32) -> Result<(), String> {
+        self.gain_db = db.clamp(0, 73);
+        self.gain.set(self.gain_db as u64)
     }
 
     fn tune(&self, hz: u64) -> Result<(), String> {
@@ -174,6 +193,21 @@ impl Drop for Radio {
     }
 }
 
+impl Driver for Radio {
+    fn phy(&self) -> &Path {
+        &self.phy
+    }
+    fn rx(&self) -> &Path {
+        &self.rx
+    }
+    fn tune(&self, hz: u64) -> Result<(), String> {
+        Radio::tune(self, hz)
+    }
+    fn stop_capture(&mut self) {
+        Radio::stop_capture(self)
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Blocks
 
@@ -183,19 +217,41 @@ struct Tag {
     sweep: u32,
     freq_hz: u32,
     dma_count: u32,
+    /// Trailer word 1: bit 15 set when the synthesizer didn't report lock (the RFOne firmware's meaning).
+    lock: u16,
 }
 
 /// Wrap `iq` (IQ_BYTES) in the Corvus header and trailer: the words the RFOne firmware writes.
 fn make_block(iq: &[u8], t: &Tag, out: &mut [u8]) {
+    make_block_tags(t, out);
+    out[2 * TAG_WORDS..2 * TAG_WORDS + IQ_BYTES].copy_from_slice(&iq[..IQ_BYTES]);
+}
+
+/// The header and trailer words of a block (the sample area untouched).
+fn make_block_tags(t: &Tag, out: &mut [u8]) {
     let h: [u16; TAG_WORDS] = [0xA55A, 0x5357, t.step, t.block, t.sweep as u16, (t.sweep >> 16) as u16, t.freq_hz as u16, (t.freq_hz >> 16) as u16];
-    let r: [u16; TAG_WORDS] = [0x5AA5, 0, t.step, t.block, t.dma_count as u16, (t.dma_count >> 16) as u16, t.freq_hz as u16, (t.freq_hz >> 16) as u16];
+    let r: [u16; TAG_WORDS] = [0x5AA5, t.lock, t.step, t.block, t.dma_count as u16, (t.dma_count >> 16) as u16, t.freq_hz as u16, (t.freq_hz >> 16) as u16];
     for (i, w) in h.iter().enumerate() {
         out[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
     }
-    out[2 * TAG_WORDS..2 * TAG_WORDS + IQ_BYTES].copy_from_slice(&iq[..IQ_BYTES]);
     let tail = 2 * (BLOCK_WORDS - TAG_WORDS);
     for (i, w) in r.iter().enumerate() {
         out[tail + 2 * i..tail + 2 * i + 2].copy_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// The tags as in make_block, with the samples packed to 12 bits (FRAME_PACKED).
+fn make_packed(iq: &[u8], t: &Tag, out: &mut [u8]) {
+    let mut words = [0u8; BLOCK_BYTES];
+    make_block_tags(t, &mut words);
+    out[..2 * TAG_WORDS].copy_from_slice(&words[..2 * TAG_WORDS]);
+    let tail = 2 * (BLOCK_WORDS - TAG_WORDS);
+    out[PACKED_BYTES - 2 * TAG_WORDS..].copy_from_slice(&words[tail..]);
+    let body = &mut out[2 * TAG_WORDS..PACKED_BYTES - 2 * TAG_WORDS];
+    for (o, s) in body.as_chunks_mut::<3>().0.iter_mut().zip(iq[..IQ_BYTES].as_chunks::<4>().0) {
+        let i = u16::from_le_bytes([s[0], s[1]]) & 0xFFF;
+        let q = u16::from_le_bytes([s[2], s[3]]) & 0xFFF;
+        *o = [i as u8, (i >> 8) as u8 | ((q as u8 & 0xF) << 4), (q >> 4) as u8];
     }
 }
 
@@ -217,9 +273,14 @@ struct SweepPlan {
     step: u64,
     n: u32,
     dwell: u16,
-    skip: u16,
+    /// Extra blocks dropped after each retune (beyond the driver path's two stale ones).
+    settle: u16,
     /// Odd passes walk the steps backwards (no 6 GHz -> 70 MHz wrap).
     bounce: bool,
+    /// Fast mode wanted (used when the board allows it).
+    fast: bool,
+    /// Send blocks as FRAME_PACKED.
+    pack12: bool,
 }
 
 impl SweepPlan {
@@ -230,6 +291,15 @@ impl SweepPlan {
 
     fn freq(&self, step: u32) -> u64 {
         self.f0 + step as u64 * self.step
+    }
+
+    /// Blocks the driver path drops after a retune: the two stale DMA blocks, plus settle.
+    fn driver_skip(&self) -> u16 {
+        2 + self.settle
+    }
+
+    fn freqs(&self) -> Vec<u64> {
+        (0..self.n).map(|i| self.freq(i)).collect()
     }
 }
 
@@ -245,40 +315,149 @@ struct Sweeper<'a> {
     /// The LO now set, so the turnaround of a back-and-forth sweep isn't retuned.
     lo: Option<u64>,
     iq: Vec<u8>,
+    /// Fast mode, while it owns the radio; its calibrated profiles (kept across plans).
+    fast: Option<Fast>,
+    profiles: &'a mut Profiles,
+    /// Why fast mode isn't running, when it was asked for.
+    fast_note: Option<String>,
+    /// A command that arrived during a fast pass, to apply next.
+    pending: Option<Result<Cmd, String>>,
 }
 
 impl Sweeper<'_> {
+    /// Hand the radio back from fast mode to the driver (no-op otherwise).
+    fn release(&mut self) {
+        if let Some(f) = self.fast.take() {
+            let resume = self.lo.or(self.plan.map(|p| p.f0)).unwrap_or(1_000_000_000);
+            if let Err(e) = f.release(self.radio, resume) {
+                eprintln!("fast mode release: {e}");
+            }
+            let _ = self.radio.set_gain(self.radio.gain_db);
+            self.lo = Some(resume);
+        }
+    }
+
+    /// Start a plan: fast mode if wanted and possible (calibrating its profiles first), else the driver path.
+    fn start(&mut self, p: SweepPlan) -> Result<&'static str, String> {
+        self.release();
+        self.fast_note = None;
+        if p.fast {
+            let why = fast::unavailable(&self.radio.phy);
+            let r = match why {
+                Some(w) => Err(w),
+                None => self.take_fast(&p),
+            };
+            match r {
+                Ok(()) => return Ok("fast"),
+                Err(e) => {
+                    eprintln!("fast mode off: {e}");
+                    self.fast_note = Some(e);
+                }
+            }
+        }
+        self.radio.start_capture()?;
+        Ok("driver")
+    }
+
+    fn take_fast(&mut self, p: &SweepPlan) -> Result<(), String> {
+        let freqs = p.freqs();
+        let t = Instant::now();
+        let n = self.profiles.calibrate(self.radio, &freqs)?;
+        if n > 0 {
+            eprintln!("calibrated {n} fastlock profiles in {:.2} s", t.elapsed().as_secs_f64());
+        }
+        let f = Fast::take(self.radio, freqs[0], self.radio.gain_db, IQ_PER_BLOCK + fast::DISCARD)?;
+        self.fast = Some(f);
+        self.lo = None;
+        Ok(())
+    }
+
     /// Apply a command and return its reply line.
     fn apply(&mut self, cmd: Result<Cmd, String>) -> String {
         let r = match cmd {
             Err(e) => Err(e),
             Ok(Cmd::Config { rate, bw, gain }) => {
+                self.release();
                 self.plan = None;
                 self.lo = None;
                 self.radio.configure(rate, bw, gain).map(|_| format!("OK CONFIG rate={} bw={bw} gain={gain}", self.radio.rate))
             }
-            Ok(Cmd::Gain(db)) => self.radio.set_gain(db).map(|_| format!("OK GAIN {db}")),
+            Ok(Cmd::Gain(db)) => match self.fast.as_mut() {
+                Some(f) => {
+                    self.radio.gain_db = db.clamp(0, 73);
+                    f.set_gain(self.radio.gain_db).map(|_| format!("OK GAIN {db}"))
+                }
+                None => self.radio.set_gain(db).map(|_| format!("OK GAIN {db}")),
+            },
             Ok(Cmd::Stop) => {
+                self.release();
                 self.plan = None;
                 self.radio.stop_capture();
                 Ok("OK STOP".into())
             }
-            Ok(Cmd::Sweep(p)) => self.radio.start_capture().map(|_| {
+            Ok(Cmd::Sweep(p)) => self.start(p).map(|mode| {
                 self.plan = Some(p);
                 self.sweep = self.sweep.wrapping_add(1);
                 self.pass = 0;
                 self.t0 = Instant::now();
-                format!("OK SWEEP f0={} step={} n={} dwell={} skip={} order={}", p.f0, p.step, p.n, p.dwell, p.skip, if p.bounce { "bounce" } else { "asc" })
+                let note = self.fast_note.as_ref().map(|n| format!(" note=\"{n}\"")).unwrap_or_default();
+                format!(
+                    "OK SWEEP f0={} step={} n={} dwell={} settle={} order={} mode={mode} pack={}{note}",
+                    p.f0,
+                    p.step,
+                    p.n,
+                    p.dwell,
+                    p.settle,
+                    if p.bounce { "bounce" } else { "asc" },
+                    if p.pack12 { 12 } else { 16 }
+                )
             }),
         };
         r.unwrap_or_else(|e| format!("ERR {e}"))
+    }
+
+    /// A frame for one block. `scratch` (IQ_BYTES) is where samples from the uncached capture buffer are
+    /// copied in bulk before packing; None when `iq` is ordinary memory already.
+    fn frame(&self, iq: &[u8], step: u32, b: u16, f: u64, locked: bool, scratch: Option<&mut [u8]>) -> Vec<u8> {
+        let block_s = IQ_PER_BLOCK as f64 / self.radio.rate.max(1) as f64;
+        let dma = (self.t0.elapsed().as_secs_f64() / block_s) as u32;
+        let tag = Tag { step: step as u16, block: b, sweep: self.sweep, freq_hz: f as u32, dma_count: dma, lock: if locked { 0 } else { 0x8000 } };
+        if self.plan.is_some_and(|p| p.pack12) {
+            let src = match scratch {
+                Some(sc) => {
+                    sc[..IQ_BYTES].copy_from_slice(&iq[..IQ_BYTES]);
+                    &sc[..IQ_BYTES]
+                }
+                None => &iq[..IQ_BYTES],
+            };
+            let mut buf = vec![0u8; 8 + PACKED_BYTES];
+            buf[..4].copy_from_slice(&FRAME_PACKED.to_le_bytes());
+            buf[4..8].copy_from_slice(&(PACKED_BYTES as u32).to_le_bytes());
+            make_packed(src, &tag, &mut buf[8..]);
+            buf
+        } else {
+            let mut buf = vec![0u8; 8 + BLOCK_BYTES];
+            buf[..4].copy_from_slice(&FRAME_BLOCK.to_le_bytes());
+            buf[4..8].copy_from_slice(&(BLOCK_BYTES as u32).to_le_bytes());
+            make_block(iq, &tag, &mut buf[8..]);
+            buf
+        }
     }
 
     /// One pass of the current plan. Commands are checked every few steps: a gain change applies in
     /// place, anything else ends the pass.
     fn pass(&mut self, cmds: &Receiver<Result<Cmd, String>>, out: &SyncSender<Vec<u8>>, alive: &AtomicBool) -> Result<(), String> {
         let Some(p) = self.plan else { return Ok(()) };
-        let block_s = IQ_PER_BLOCK as f64 / self.radio.rate.max(1) as f64;
+        if let Some(c) = self.pending.take() {
+            let gain = matches!(c, Ok(Cmd::Gain(_)));
+            let _ = out.send(text(&self.apply(c)));
+            if !gain {
+                return Ok(());
+            }
+        }
+        if self.fast.is_some() {
+            return self.fast_pass(p, cmds, out, alive);
+        }
         for i in 0..p.n {
             if !alive.load(Ordering::Relaxed) {
                 return Ok(());
@@ -290,16 +469,12 @@ impl Sweeper<'_> {
                 self.radio.tune(f)?;
                 self.lo = Some(f);
             }
-            for _ in 0..p.skip {
+            for _ in 0..p.driver_skip() {
                 self.radio.read_iq(&mut self.iq)?;
             }
             for b in 0..p.dwell {
                 self.radio.read_iq(&mut self.iq)?;
-                let dma = (self.t0.elapsed().as_secs_f64() / block_s) as u32;
-                let mut buf = vec![0u8; 8 + BLOCK_BYTES];
-                buf[..4].copy_from_slice(&FRAME_BLOCK.to_le_bytes());
-                buf[4..8].copy_from_slice(&(BLOCK_BYTES as u32).to_le_bytes());
-                make_block(&self.iq, &Tag { step: step as u16, block: b, sweep: self.sweep, freq_hz: f as u32, dma_count: dma }, &mut buf[8..]);
+                let buf = self.frame(&self.iq, step, b, f, true, None);
                 if out.send(buf).is_err() {
                     return Ok(());
                 }
@@ -320,6 +495,75 @@ impl Sweeper<'_> {
         }
         self.pass += 1;
         self.sweep = self.sweep.wrapping_add(1);
+        Ok(())
+    }
+
+    fn fast_pass(&mut self, p: SweepPlan, cmds: &Receiver<Result<Cmd, String>>, out: &SyncSender<Vec<u8>>, alive: &AtomicBool) -> Result<(), String> {
+        let steps: Vec<u32> = (0..p.n).map(|i| p.index(self.pass, i)).collect();
+        let freqs: Vec<u64> = steps.iter().map(|&s| p.freq(s)).collect();
+        let mut unlocked = Vec::new();
+        let mut pending = None;
+        let mut fast = self.fast.take().unwrap();
+        let mut scratch = vec![0u8; IQ_BYTES];
+        let r = fast.pass(&freqs, self.profiles, p.settle as usize, p.dwell as usize, |i, b, iq, locked| {
+            if !alive.load(Ordering::Relaxed) {
+                return false;
+            }
+            if !locked && b == 0 {
+                unlocked.push(freqs[i]);
+            }
+            if out.send(self.frame(iq, steps[i], b, freqs[i], locked, Some(&mut scratch))).is_err() {
+                return false;
+            }
+            if b == 0 && i % 16 == 15 {
+                match cmds.try_recv() {
+                    Ok(c) => {
+                        pending = Some(c);
+                        return false;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => return false,
+                }
+            }
+            true
+        });
+        let bus_ok = fast.bus_ok();
+        self.fast = Some(fast);
+        self.lo = freqs.last().copied();
+        let complete = match r {
+            Ok(c) => c,
+            Err(e) => {
+                self.release();
+                self.radio.start_capture()?;
+                let _ = out.send(text(&format!("NOTE fast mode off: {e}")));
+                return Ok(());
+            }
+        };
+        if !bus_ok {
+            // something else drove the SPI bus during the pass: give the radio back, carry on via the driver
+            self.release();
+            self.radio.start_capture()?;
+            let _ = out.send(text("NOTE fast mode off: another program used the radio"));
+            return Ok(());
+        }
+        if let Some(c) = pending {
+            self.pending = Some(c);
+        }
+        if complete {
+            self.pass += 1;
+            self.sweep = self.sweep.wrapping_add(1);
+        }
+        if !unlocked.is_empty() || self.profiles.stale(&p.freqs()) {
+            // recalibrate unlocked or old profiles through the driver, then take the radio again
+            for f in &unlocked {
+                self.profiles.forget(*f);
+            }
+            self.release();
+            if let Err(e) = self.take_fast(&p) {
+                self.radio.start_capture()?;
+                let _ = out.send(text(&format!("NOTE fast mode off: {e}")));
+            }
+        }
         Ok(())
     }
 }
@@ -364,7 +608,7 @@ fn bench() -> Result<(), String> {
         println!("  {:>6.1} MHz: {}", f as f64 / 1e6, p.join(" "));
     }
 
-    let plan = SweepPlan { f0: 70_000_000, step: 40_000_000, n: 149, dwell: 1, skip: 2, bounce: false };
+    let plan = SweepPlan { f0: 70_000_000, step: 40_000_000, n: 149, dwell: 1, settle: 0, bounce: false, fast: false, pack12: false };
     for bounce in [false, true] {
         let p = SweepPlan { bounce, ..plan };
         let mut lo = None;
@@ -376,7 +620,7 @@ fn bench() -> Result<(), String> {
                     r.tune(f)?;
                     lo = Some(f);
                 }
-                for _ in 0..=p.skip {
+                for _ in 0..=p.driver_skip() {
                     r.read_iq(&mut iq)?;
                 }
             }
@@ -385,6 +629,41 @@ fn bench() -> Result<(), String> {
         println!("70-6000 MHz, 40 MHz steps, {}: {steps:.0} steps/s, {:.1} GHz/s", if bounce { "back and forth" } else { "ascending     " }, steps * 0.04);
     }
     r.stop_capture();
+
+    // fast mode: the same plan, back and forth, with the per-block work it does when serving
+    match fast::unavailable(&r.phy) {
+        Some(why) => println!("fast mode unavailable: {why}"),
+        None => {
+            let mut profiles = Profiles::default();
+            let freqs = plan.freqs();
+            let t = Instant::now();
+            profiles.calibrate(&r, &freqs)?;
+            println!("fast mode: calibrated {} profiles in {:.2} s", freqs.len(), t.elapsed().as_secs_f64());
+            let gain = r.gain_db;
+            let mut f = Fast::take(&mut r, freqs[0], gain, IQ_PER_BLOCK + fast::DISCARD)?;
+            let mut frame = vec![0u8; 8 + BLOCK_BYTES];
+            for (what, work) in [("no work per block", 0), ("+ copy out of the DMA block", 1), ("+ build the frame", 2)] {
+                let t = Instant::now();
+                let mut steps = 0u64;
+                for pass in 0..10u32 {
+                    let order: Vec<u64> = (0..plan.n).map(|i| plan.freq(SweepPlan { bounce: true, ..plan }.index(pass, i))).collect();
+                    f.pass(&order, &profiles, 0, 1, |i, _, iq, _| {
+                        match work {
+                            1 => frame[8..8 + IQ_BYTES].copy_from_slice(iq),
+                            2 => make_block(iq, &Tag { step: i as u16, block: 0, sweep: pass, freq_hz: 0, dma_count: 0, lock: 0 }, &mut frame[8..]),
+                            _ => {}
+                        }
+                        steps += 1;
+                        true
+                    })?;
+                }
+                let sps = steps as f64 / t.elapsed().as_secs_f64();
+                println!("fast mode, {what:28}: {sps:.0} steps/s, {:.1} GHz/s, {:.0} us per step", sps * 0.04, 1e6 / sps);
+            }
+            println!("  synthesizer unlocked after a switch: {} times; bus stayed ours: {}", f.unlocked, f.bus_ok());
+            f.release(&mut r, lo0.parse().unwrap_or(1_000_000_000))?;
+        }
+    }
     let _ = write_attr(&r.phy.join("out_altvoltage0_RX_LO_frequency"), &lo0);
     Ok(())
 }
@@ -414,8 +693,11 @@ fn parse_cmd(line: &str) -> Result<Cmd, String> {
             step: need("step")?,
             n: need("n")?.clamp(1, 65_535) as u32,
             dwell: num("dwell").unwrap_or(1).clamp(1, 64) as u16,
-            skip: num("skip").unwrap_or(2).min(64) as u16,
+            // settle=, or the older skip= (which counted the driver path's two stale blocks)
+            settle: num("settle").or(num("skip").map(|k| k.saturating_sub(2))).unwrap_or(0).min(62) as u16,
             bounce: kv(&w, "order") != Some("asc"),
+            fast: kv(&w, "mode") != Some("driver"),
+            pack12: kv(&w, "pack") == Some("12"),
         })),
         Some("GAIN") => w.get(1).and_then(|v| v.parse().ok()).map(Cmd::Gain).ok_or("GAIN <dB>".into()),
         Some("STOP") => Ok(Cmd::Stop),
@@ -432,7 +714,7 @@ fn text(s: &str) -> Vec<u8> {
 }
 
 /// One client: commands in on one thread, frames out on another, the radio on this one.
-fn session(stream: TcpStream, radio: &mut Radio) {
+fn session(stream: TcpStream, radio: &mut Radio, profiles: &mut Profiles) {
     let _ = stream.set_nodelay(true);
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     eprintln!("client {peer}");
@@ -443,10 +725,21 @@ fn session(stream: TcpStream, radio: &mut Radio) {
         let mut s = stream.try_clone().expect("clone stream");
         let alive = alive.clone();
         std::thread::spawn(move || {
-            for buf in out_rx {
-                if s.write_all(&buf).is_err() {
+            // next to the network interrupt (CPU0); several frames per write when they queue up
+            pin_to_cpu(0);
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(16);
+            while let Ok(first) = out_rx.recv() {
+                batch.push(first);
+                while batch.len() < 16 {
+                    match out_rx.try_recv() {
+                        Ok(b) => batch.push(b),
+                        Err(_) => break,
+                    }
+                }
+                if write_all_vectored(&mut s, &batch).is_err() {
                     break;
                 }
+                batch.clear();
             }
             alive.store(false, Ordering::Relaxed);
         })
@@ -466,8 +759,10 @@ fn session(stream: TcpStream, radio: &mut Radio) {
         })
     };
 
+    // the sweep loop spins while capture blocks fill: keep it off the core that takes the interrupts
+    pin_to_cpu(1);
     let _ = out.send(text(&format!("HELLO {}", radio.describe())));
-    let mut sw = Sweeper { radio, plan: None, sweep: 0, pass: 0, t0: Instant::now(), lo: None, iq: vec![0u8; IQ_BYTES] };
+    let mut sw = Sweeper { radio, plan: None, sweep: 0, pass: 0, t0: Instant::now(), lo: None, iq: vec![0u8; IQ_BYTES], fast: None, profiles, fast_note: None, pending: None };
     while alive.load(Ordering::Relaxed) {
         let cmd = if sw.plan.is_some() {
             match cmds.try_recv() {
@@ -490,11 +785,13 @@ fn session(stream: TcpStream, radio: &mut Radio) {
         }
         if let Err(e) = sw.pass(&cmds, &out, &alive) {
             let _ = out.send(text(&format!("ERR {e}")));
+            sw.release();
             sw.plan = None;
             sw.lo = None;
             sw.radio.stop_capture();
         }
     }
+    sw.release();
     sw.radio.stop_capture();
     drop(out);
     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -503,13 +800,63 @@ fn session(stream: TcpStream, radio: &mut Radio) {
     eprintln!("client {peer} gone");
 }
 
+/// CPUs online, from sysfs ("0-1"). Not available_parallelism() or musl's sysconf: both follow the calling
+/// thread's own affinity, which is one CPU once the sweep loop is pinned.
+fn cpus() -> usize {
+    let s = std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
+    s.trim()
+        .split(',')
+        .map(|r| match r.split_once('-') {
+            Some((a, b)) => b.parse::<usize>().unwrap_or(0).saturating_sub(a.parse().unwrap_or(0)) + 1,
+            None => usize::from(!r.is_empty()),
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Pin the calling thread to one CPU (no-op on a single-core board).
+fn pin_to_cpu(cpu: usize) {
+    if cpu < cpus() {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+}
+
+/// Write every buffer, gathering them into as few syscalls as the socket takes.
+fn write_all_vectored(s: &mut TcpStream, bufs: &[Vec<u8>]) -> std::io::Result<()> {
+    let (mut i, mut off) = (0, 0);
+    while i < bufs.len() {
+        let mut slices: Vec<std::io::IoSlice> = Vec::with_capacity(bufs.len() - i);
+        slices.push(std::io::IoSlice::new(&bufs[i][off..]));
+        slices.extend(bufs[i + 1..].iter().map(|b| std::io::IoSlice::new(b)));
+        let mut n = s.write_vectored(&slices)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        while i < bufs.len() && n >= bufs[i].len() - off {
+            n -= bufs[i].len() - off;
+            i += 1;
+            off = 0;
+        }
+        off += n;
+    }
+    Ok(())
+}
+
 fn serve(port: u16) -> Result<(), String> {
     let mut radio = Radio::open()?;
+    let mut profiles = Profiles::default();
+    if let Some(why) = fast::unavailable(&radio.phy) {
+        eprintln!("fast mode unavailable: {why}");
+    }
     let listener = TcpListener::bind(("0.0.0.0", port)).map_err(|e| format!("listen on {port}: {e}"))?;
     eprintln!("{} listening on {port}", radio.describe());
     for stream in listener.incoming() {
         match stream {
-            Ok(s) => session(s, &mut radio),
+            Ok(s) => session(s, &mut radio, &mut profiles),
             Err(e) => eprintln!("accept: {e}"),
         }
     }
@@ -539,10 +886,14 @@ mod tests {
 
     #[test]
     fn commands_parse() {
-        let Ok(Cmd::Sweep(p)) = parse_cmd("SWEEP f0=70000000 step=40000000 n=149 dwell=2 skip=3") else { panic!() };
-        assert_eq!((p.f0, p.step, p.n, p.dwell, p.skip, p.bounce), (70_000_000, 40_000_000, 149, 2, 3, true));
-        let Ok(Cmd::Sweep(p)) = parse_cmd("SWEEP f0=1 step=2 n=3 order=asc") else { panic!() };
-        assert!(!p.bounce && p.skip == 2 && p.dwell == 1);
+        let Ok(Cmd::Sweep(p)) = parse_cmd("SWEEP f0=70000000 step=40000000 n=149 dwell=2 settle=1") else { panic!() };
+        assert_eq!((p.f0, p.step, p.n, p.dwell, p.settle, p.bounce, p.fast), (70_000_000, 40_000_000, 149, 2, 1, true, true));
+        assert_eq!(p.driver_skip(), 3);
+        // older clients: skip= counted the two stale blocks
+        let Ok(Cmd::Sweep(p)) = parse_cmd("SWEEP f0=1 step=2 n=3 skip=3 order=asc mode=driver") else { panic!() };
+        assert!(!p.bounce && p.settle == 1 && p.dwell == 1 && !p.fast);
+        let Ok(Cmd::Sweep(p)) = parse_cmd("SWEEP f0=1 step=2 n=3") else { panic!() };
+        assert_eq!(p.settle, 0);
         assert!(matches!(parse_cmd("CONFIG rate=61440000 bw=56000000 gain=40"), Ok(Cmd::Config { rate: 61_440_000, bw: 56_000_000, gain: 40 })));
         assert!(matches!(parse_cmd("GAIN 33"), Ok(Cmd::Gain(33))));
         assert!(parse_cmd("SWEEP f0=1 n=3").is_err());
@@ -550,8 +901,31 @@ mod tests {
     }
 
     #[test]
+    fn packed_blocks_unpack_to_the_same_samples() {
+        let mut iq = vec![0u8; IQ_BYTES];
+        let vals: Vec<i16> = (0..2 * IQ_PER_BLOCK).map(|k| ((k as i32 * 37 % 4096) - 2048) as i16).collect();
+        for (k, v) in vals.iter().enumerate() {
+            iq[2 * k..2 * k + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        let t = Tag { step: 3, block: 0, sweep: 9, freq_hz: 0x1234_5678, dma_count: 77, lock: 0 };
+        let mut packed = vec![0u8; PACKED_BYTES];
+        make_packed(&iq, &t, &mut packed);
+        let mut full = vec![0u8; BLOCK_BYTES];
+        make_block(&iq, &t, &mut full);
+        assert_eq!(&packed[..16], &full[..16]);
+        assert_eq!(&packed[PACKED_BYTES - 16..], &full[BLOCK_BYTES - 16..]);
+        let body = &packed[16..PACKED_BYTES - 16];
+        for (k, c) in body.chunks_exact(3).enumerate() {
+            let i = (c[0] as u16 | ((c[1] as u16 & 0xF) << 8)) as i16;
+            let q = ((c[1] as u16 >> 4) | ((c[2] as u16) << 4)) as i16;
+            let sx = |v: i16| (v << 4) >> 4;
+            assert_eq!((sx(i), sx(q)), (vals[2 * k], vals[2 * k + 1]), "pair {k}");
+        }
+    }
+
+    #[test]
     fn bounce_walks_back_and_repeats_the_turnaround() {
-        let p = SweepPlan { f0: 0, step: 1, n: 4, dwell: 1, skip: 2, bounce: true };
+        let p = SweepPlan { f0: 0, step: 1, n: 4, dwell: 1, settle: 0, bounce: true, fast: false, pack12: false };
         let seq: Vec<u32> = (0..3).flat_map(|pass| (0..4).map(move |i| p.index(pass, i))).collect();
         assert_eq!(seq, [0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2, 3]);
     }
@@ -560,10 +934,10 @@ mod tests {
     fn block_tags_match_the_firmware_layout() {
         let iq = vec![0x11u8; IQ_BYTES];
         let mut out = vec![0u8; BLOCK_BYTES];
-        make_block(&iq, &Tag { step: 7, block: 1, sweep: 0x0001_0002, freq_hz: 0x4321_8765, dma_count: 0xABCD_0123 }, &mut out);
+        make_block(&iq, &Tag { step: 7, block: 1, sweep: 0x0001_0002, freq_hz: 0x4321_8765, dma_count: 0xABCD_0123, lock: 0x8000 }, &mut out);
         let w: Vec<u16> = out.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
         assert_eq!(&w[..8], &[0xA55A, 0x5357, 7, 1, 2, 1, 0x8765, 0x4321]);
-        assert_eq!(&w[BLOCK_WORDS - 8..], &[0x5AA5, 0, 7, 1, 0x0123, 0xABCD, 0x8765, 0x4321]);
+        assert_eq!(&w[BLOCK_WORDS - 8..], &[0x5AA5, 0x8000, 7, 1, 0x0123, 0xABCD, 0x8765, 0x4321]);
         assert_eq!(w[8], 0x1111);
     }
 }

@@ -5,6 +5,10 @@
 //!
 //! The board is reached at --pluto HOST[:PORT] (or CORVUS_PLUTO); the default is the address a Pluto gives
 //! itself on its USB network link, 192.168.2.1. corvus-pluto listens on port 30433.
+//!
+//! corvus-pluto 0.2 sweeps in fast mode when the board allows it (fastlock profiles over direct SPI, ~4x the
+//! steps/s) and falls back to the driver path otherwise; CORVUS_PLUTO_MODE=driver asks for the driver path.
+//! Blocks come 12-bit packed (pack=12) to save network bandwidth, unpacked here into the usual layout.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
@@ -24,6 +28,10 @@ pub const DEFAULT_HOST: &str = "192.168.2.1";
 
 const FRAME_BLOCK: u32 = 1;
 const FRAME_TEXT: u32 = 2;
+/// A block with 12-bit packed samples: 8 header words, 4088 I, Q pairs in 3 bytes each, 8 trailer words.
+const FRAME_PACKED: u32 = 3;
+const TAG_BYTES: usize = 2 * crate::hydra::TAG_WORDS;
+const PACKED_BYTES: usize = 2 * TAG_BYTES + (BLOCK_WORDS - 2 * crate::hydra::TAG_WORDS) / 2 * 3;
 /// The two DMA blocks still holding the previous step after a retune (measured: block 3 is the new band).
 const FLUSH_BLOCKS: u8 = 2;
 
@@ -74,6 +82,31 @@ pub struct PlutoDevice {
     rx: RxSettings,
     /// What the board was last configured with (rate, gain).
     configured: Option<(Rate, i32)>,
+    /// How the board sweeps ("fast", "driver"; empty before the first plan), and why not fast if it isn't.
+    pub mode: Arc<parking_lot::Mutex<(String, String)>>,
+}
+
+/// A FRAME_PACKED payload back into the block's 16-bit words (samples sign-extended from 12 bits).
+fn unpack12(p: &[u8]) -> Vec<u16> {
+    let mut w = Vec::with_capacity(BLOCK_WORDS);
+    let word = |b: &[u8; 2]| u16::from_le_bytes(*b);
+    w.extend(p[..TAG_BYTES].as_chunks::<2>().0.iter().map(word));
+    for c in p[TAG_BYTES..PACKED_BYTES - TAG_BYTES].as_chunks::<3>().0 {
+        let i = c[0] as u16 | ((c[1] as u16 & 0xF) << 8);
+        let q = (c[1] as u16 >> 4) | ((c[2] as u16) << 4);
+        w.push((((i << 4) as i16) >> 4) as u16);
+        w.push((((q << 4) as i16) >> 4) as u16);
+    }
+    w.extend(p[PACKED_BYTES - TAG_BYTES..PACKED_BYTES].as_chunks::<2>().0.iter().map(word));
+    w
+}
+
+fn reply_value(line: &str, key: &str) -> Option<String> {
+    let rest = line.split(&format!(" {key}=")).nth(1)?;
+    if let Some(q) = rest.strip_prefix('"') {
+        return q.split('"').next().map(str::to_string);
+    }
+    rest.split_whitespace().next().map(str::to_string)
 }
 
 fn read_frame(s: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<u32> {
@@ -89,7 +122,7 @@ fn read_frame(s: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<u32> {
     Ok(kind)
 }
 
-fn reader_loop(mut s: TcpStream, sink: Sink, replies: Sender<String>, alive: Arc<AtomicBool>) {
+fn reader_loop(mut s: TcpStream, sink: Sink, replies: Sender<String>, alive: Arc<AtomicBool>, mode: Arc<parking_lot::Mutex<(String, String)>>) {
     let mut buf = Vec::new();
     while alive.load(Ordering::Relaxed) {
         match read_frame(&mut s, &mut buf) {
@@ -97,10 +130,14 @@ fn reader_loop(mut s: TcpStream, sink: Sink, replies: Sender<String>, alive: Arc
                 let words: Vec<u16> = buf.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
                 sink.push(words);
             }
+            Ok(FRAME_PACKED) if buf.len() == PACKED_BYTES => sink.push(unpack12(&buf)),
             Ok(FRAME_TEXT) => {
                 let t = String::from_utf8_lossy(&buf).into_owned();
-                if t.starts_with("ERR") {
+                if t.starts_with("ERR") || t.starts_with("NOTE") {
                     log::warn!("corvus-pluto: {t}");
+                }
+                if let Some(why) = t.strip_prefix("NOTE fast mode off: ") {
+                    *mode.lock() = ("driver".into(), why.to_string());
                 }
                 let _ = replies.send(t);
             }
@@ -143,10 +180,12 @@ impl PlutoDevice {
         let version = if fw.is_empty() { format!("Pluto {prog}") } else { format!("Pluto {prog} ({fw})") };
         let (tx, replies) = channel();
         let alive = Arc::new(AtomicBool::new(true));
+        let mode = Arc::new(parking_lot::Mutex::new((String::new(), String::new())));
         let reader = {
             let s = stream.try_clone().map_err(|e| e.to_string())?;
             let alive = alive.clone();
-            std::thread::Builder::new().name("pluto-rx".into()).spawn(move || reader_loop(s, sink, tx, alive)).map_err(|e| e.to_string())?
+            let mode = mode.clone();
+            std::thread::Builder::new().name("pluto-rx".into()).spawn(move || reader_loop(s, sink, tx, alive, mode)).map_err(|e| e.to_string())?
         };
         let stop = stream.try_clone().map_err(|e| e.to_string())?;
         let stop = parking_lot::Mutex::new(stop);
@@ -154,7 +193,7 @@ impl PlutoDevice {
             let _ = stop.lock().write_all(b"STOP\n");
         }));
         log::info!("{version} at {addr}");
-        Ok(PlutoDevice { stream, version, lib_path: PathBuf::from(format!("network {addr}")), replies, alive, reader: Some(reader), plan: None, rx, configured: None })
+        Ok(PlutoDevice { stream, version, lib_path: PathBuf::from(format!("network {addr}")), replies, alive, reader: Some(reader), plan: None, rx, configured: None, mode })
     }
 
     /// Send one command and wait for its reply ("OK ..." or "ERR ...").
@@ -188,18 +227,28 @@ impl PlutoDevice {
 
     pub fn sweep(&mut self, plan: &Plan) -> Result<(), String> {
         self.configure(plan.rate)?;
-        self.cmd(
+        let want = if std::env::var("CORVUS_PLUTO_MODE").is_ok_and(|m| m == "driver") { "driver" } else { "fast" };
+        // settle= for corvus-pluto 0.2 (it adds its own flush where it needs one); skip= for 0.1, which ignores
+        // settle, mode and pack. Fast mode calibrates its profiles on a new plan first (~0.7 s).
+        let reply = self.cmd(
             &format!(
-                "SWEEP f0={} step={} n={} dwell={} skip={} order={}",
+                "SWEEP f0={} step={} n={} dwell={} settle={} skip={} order={} mode={want} pack=12",
                 plan.f0,
                 plan.step_hz,
                 plan.n_steps,
                 plan.dwell.max(1),
+                plan.skip,
                 FLUSH_BLOCKS + plan.skip,
                 if plan.order == crate::plan::Order::VcoContinuous { "bounce" } else { "asc" }
             ),
-            Duration::from_secs(3),
+            Duration::from_secs(10),
         )?;
+        let mode = reply_value(&reply, "mode").unwrap_or_else(|| "driver".into());
+        let note = reply_value(&reply, "note").unwrap_or_default();
+        if !note.is_empty() {
+            log::warn!("corvus-pluto sweeps through the driver: {note}");
+        }
+        *self.mode.lock() = (mode, note);
         self.plan = Some(plan.clone());
         Ok(())
     }
@@ -249,6 +298,31 @@ mod tests {
         for v in 0..=21 {
             assert!((0..=71).contains(&gain_db(Gain::Linearity(v))));
         }
+    }
+
+    #[test]
+    fn packed_blocks_unpack_to_words() {
+        let mut p = vec![0u8; PACKED_BYTES];
+        p[0] = 0x5A;
+        p[1] = 0xA5;
+        // first pair: I = -1 (0xFFF), Q = 0x123
+        p[TAG_BYTES] = 0xFF;
+        p[TAG_BYTES + 1] = 0x0F | (0x3 << 4);
+        p[TAG_BYTES + 2] = 0x12;
+        p[PACKED_BYTES - TAG_BYTES] = 0xA5;
+        let w = unpack12(&p);
+        assert_eq!(w.len(), BLOCK_WORDS);
+        assert_eq!(w[0], 0xA55A);
+        assert_eq!((w[8] as i16, w[9]), (-1, 0x123));
+        assert_eq!(w[BLOCK_WORDS - 8], 0x00A5);
+    }
+
+    #[test]
+    fn sweep_reply_values() {
+        let r = "OK SWEEP f0=1 step=2 n=3 dwell=1 settle=0 order=bounce mode=driver pack=12 note=\"the AD936x isn't on e0006000.spi\"";
+        assert_eq!(reply_value(r, "mode").as_deref(), Some("driver"));
+        assert_eq!(reply_value(r, "note").as_deref(), Some("the AD936x isn't on e0006000.spi"));
+        assert_eq!(reply_value("OK SWEEP f0=1", "mode"), None);
     }
 
     #[test]

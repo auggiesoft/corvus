@@ -15,14 +15,16 @@ spectrum: on the RFOne, **24–1800 MHz about five times a second (8.6 GHz/s), l
 | Airspy R2 | `firmware/airspy/`, `…-sweep5` | 10 MSPS | up to 9 MHz | 6.5 GHz/s, ~3.65 passes/s | `--board airspy` |
 | Airspy Mini | the same image as the R2 | 6 MSPS | up to 4 MHz | 2.9 GHz/s, ~1.6 passes/s | `--board mini` |
 | HackRF One | **stock** (its own sweep mode, no flashing) | 20 MSPS IQ | 5 MHz slices | 8.1 GHz/s, ~4.6 passes/s (1–6000 MHz: 1.36) | `--board hackrf` |
-| Pluto+ / PlutoSDR | its own firmware + `firmware/pluto/` (a program on the board) | 61.44 MSPS IQ (or 30.72) | up to 50 MHz | 70–6000 MHz: 17–19 GHz/s, ~3 passes/s | `--pluto HOST` |
+| Pluto+ / PlutoSDR | its own firmware + `firmware/pluto/` (a program on the board) | 61.44 MSPS IQ (or 30.72) | up to 50 MHz | 70–6000 MHz: ~130 GHz/s, ~22 passes/s (Ethernet) | `--pluto HOST` |
 
 The three Corvus boards speak the same sweep protocol, and the same API is added to their host
 libraries (libhydrasdr for the RFOne, libairspy for the Airspys). The R2/Mini image detects which board
 it's on at boot. The HackRF already has a firmware sweep, so Corvus Sweep drives it as it is, from
 1 MHz to 6 GHz. A Pluto runs Linux, so its sweep is a small program on the board (`corvus-pluto`) that
 retunes, captures and tags blocks in the same format and serves them over the network: Ethernet on a
-Pluto+, or any Pluto's USB network link.
+Pluto+, or any Pluto's USB network link. In its fast mode it drives the AD936x directly (the chip's
+fastlock profiles, switched over SPI in about a microsecond each), about five times the steps of
+retuning through the Linux driver, which stays as the fallback.
 
 **Corvus Sweep needs no library or driver install.** It talks to every board over USB itself (a
 built-in driver ported from the boards' libraries), so it's one file on Linux and one `.exe` on

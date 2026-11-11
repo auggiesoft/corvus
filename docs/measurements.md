@@ -195,9 +195,37 @@ One Pluto+ (Zynq 7010, AD9363 run as an AD9364) on F5OEO's PlutoDVB2 0.5.16.7 fi
 - **Speed:** 70–6000 MHz in 40 MHz steps, dwell 1: 425–483 steps/s, 17–19.3 GHz/s, about 3 passes/s, no
   torn blocks or gaps. Back-and-forth passes are 11 % faster than ascending ones (no wrap across both
   gain-table edges).
-- **Tried and left out:** the AD936x's fastlock profiles through the driver (0.77 ms instead of 1.09 ms
-  per retune, but step levels moved by about 0.5 dB), and toggling the buffer instead of reading the
-  stale blocks (1 ms per step against 0.4).
+- **Tried and left out:** toggling the buffer instead of reading the stale blocks (1 ms per step against
+  0.4).
+
+### Fast mode (corvus-pluto 0.2)
+
+Where the time above goes, and what replaced it:
+
+| | through the kernel | direct |
+|---|---|---|
+| one AD936x register write | 44 µs (debugfs) | 2.1 µs (SPI0 at /8; reads verified to /4, 1.6 µs) |
+| one retune | 1.1 ms (driver) | one fastlock profile switch: one register write |
+| settling after the switch | | ~1 µs (1.07 ms contiguous captures, 12 of 12 transitions within one 0.5 µs window) |
+| stale blocks per step | 2 (blocks fill when queued) | 0 (mmap blocks queued after the switch) |
+| gain-table change | ~20 ms | ~0.5 ms |
+
+- **Fastlock levels:** within 0.05 dB of a driver retune on steady bands *when the loaded gain table suits
+  the frequency*, 2.6–6.5 dB off when it doesn't: fastlock doesn't reload the gain table, which is what the
+  earlier "fastlock moves levels ~0.5 dB" was. Fast mode writes the table at the band edges.
+- **On the board, no network:** 9,690 steps/s with no per-block work (103 µs per step), 6,050 copying each
+  block out of the (uncached) DMA buffer, 6,004 building the frame.
+- **Served over Gigabit Ethernet to Corvus Sweep:** 2,730 steps/s at first; 3,340 (134 GHz/s, 22.4
+  passes/s) after pinning the sweep loop and the capture DMA interrupt to CPU1 and the sending to CPU0 with
+  the Ethernet interrupt (on CPU0 the DMA interrupt queued behind the network work). Both cores are busy; the
+  network side (TCP at ~45 MB/s, ~30 % soft interrupts, no TSO or interrupt coalescing on this controller) is
+  the limit. 12-bit packed blocks: 25 % fewer bytes.
+- **Over the USB network link:** ~1,900 steps/s (76 GHz/s). **30.72 MSPS, 20 MHz steps:** 2,727 steps/s
+  (54.5 GHz/s). **Driver path for comparison:** ~650 steps/s.
+- **Levels against the driver path** (112 steady steps of 149): median +0.05 dB, 90 % within
+  −0.03…+0.27 dB; two fast runs agree to 0.01 dB; packed and unpacked blocks agree to 0.00 dB (median).
+- **Profiles:** calibrating 149 steps through the driver takes 0.66 s. About 7 of a profile's 16 words differ
+  between steps 8 apart (6–11), so only those are rewritten.
 
 ## Restarts
 

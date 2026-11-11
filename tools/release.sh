@@ -77,9 +77,10 @@ licences "$S/$WA"
 # corvus-pluto: the sweep program for a Pluto (runs on the board), with its install script
 P=corvus-pluto-$VER-armv7
 mkdir -p "$S/$P"
-cp "$R/firmware/pluto/target/armv7-unknown-linux-musleabihf/release/corvus-pluto" "$R/firmware/pluto/install.sh" "$S/$P/"
+cp "$R/firmware/pluto/target/armv7-unknown-linux-musleabihf/release/corvus-pluto" "$R/firmware/pluto/install.sh" "$R/firmware/pluto/plutodvb2-quiet.sh" "$S/$P/"
 cp "$R/firmware/pluto/README.md" "$S/$P/README-corvus-pluto.md"
 cp "$R/LICENSE" "$S/$P/LICENSE"
+cp "$R/firmware/pluto/LICENSE-no-OS.txt" "$S/$P/LICENSE-no-OS.txt"
 tar -C "$S" -czf "$OUT/$P.tar.gz" "$P"
 
 # host libraries and tools for Linux (libhydrasdr + hydrasdr_* tools, libairspy + airspy_* tools)

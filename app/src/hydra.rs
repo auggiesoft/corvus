@@ -548,6 +548,14 @@ impl Device {
         }
     }
 
+    /// How a Pluto sweeps ("fast", "driver"; None for other boards or before its first plan).
+    pub fn pluto_mode(&self) -> Option<String> {
+        match self {
+            Device::Pluto(d) => Some(d.mode.lock().0.clone()).filter(|m| !m.is_empty()),
+            _ => None,
+        }
+    }
+
     pub fn fw_revision(&self) -> i32 {
         match self {
             Device::R82x(d) => d.fw_revision,

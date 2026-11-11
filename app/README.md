@@ -55,8 +55,12 @@ itself, two words per 12-bit IQ sample, and serves them over TCP; Corvus Sweep o
 the gain (`src/pluto.rs`). 61.44 MSPS (steps up to 50 MHz, 40 by default) or 30.72 MSPS (up to 25 MHz),
 70 MHz to 6 GHz, passes back and forth (no wrap). Every gain mode sets the AD936x's one manual gain
 (0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. The bins
-around DC are bridged from their neighbours. Over 70–6000 MHz on a Pluto+ over Ethernet: about 450 steps
-a second, 17–19 GHz/s, 3 passes a second. A Pluto seen on USB shows in the device picker; one given by
+around DC are bridged from their neighbours. corvus-pluto 0.2 sweeps in **fast mode** where the board
+allows it (fastlock profiles over direct SPI; the device chip says "fast sweep", or "driver sweep" and why);
+`CORVUS_PLUTO_MODE=driver` asks for the driver path. Blocks arrive 12-bit packed and are unpacked into the
+usual layout. Over 70–6000 MHz on a Pluto+ over Ethernet: about 3,300 steps a second, 130 GHz/s, 22 passes a
+second (USB network link: ~1,900 steps/s; driver path: ~650). A new plan takes ~0.7 s while the board
+calibrates its profiles (cached for 10 minutes). A Pluto seen on USB shows in the device picker; one given by
 address shows there too.
 
 **Stock RFOne and Airspy firmware** (no Corvus sweep mode) gets a PC-driven sweep automatically: the

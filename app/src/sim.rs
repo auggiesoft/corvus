@@ -156,16 +156,12 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         let mut over = 2 + plan.skip as u32; // retune, the block in flight, then settle blocks
         let mut polls = rng.range(2, 8) as u16;
         if plan.rate.iq16() {
-            // corvus-pluto (measured on a Pluto+): ~1.1 ms per retune plus ~0.4 ms of capture overhead, ~20 ms
-            // where the driver reloads its gain table (1.3, 4 GHz), no retune at the turnaround; it always
-            // drops 2 blocks plus the settle ones
-            let ms = match prev_rf {
-                Some(p) if p == rf => 0.3,
-                Some(p) if (p < 1.3e9) != (rf < 1.3e9) || (p < 4e9) != (rf < 4e9) => 20.0,
-                Some(_) => 1.4,
-                None => 0.3,
-            };
-            over = (ms * 1e-3 / plan.rate.block_s()).round() as u32 + 2 + plan.skip as u32;
+            // corvus-pluto's fast mode (measured on a Pluto+ over Ethernet): a fastlock switch settles in ~1 us,
+            // and each step costs ~0.23 ms beyond its block, mostly the board's network sending; ~0.5 ms more
+            // where it writes a gain table (1.3, 4 GHz). Settle blocks are dropped as asked; no stale ones.
+            let edge = prev_rf.is_some_and(|p| (p <= 1.3e9) != (rf <= 1.3e9) || (p <= 4e9) != (rf <= 4e9));
+            let ms = 0.23 + if edge { 0.5 } else { 0.0 };
+            over = (ms * 1e-3 / plan.rate.block_s()).round() as u32 + plan.skip as u32;
             polls = 0;
         } else if complex {
             over = if side == 0 { 2 } else { 0 };

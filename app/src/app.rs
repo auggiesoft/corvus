@@ -917,6 +917,11 @@ impl App {
         });
     }
 
+    /// A Pluto sweeping in corvus-pluto's fast mode.
+    fn pluto_fast(&self) -> bool {
+        matches!(&self.src, Src::Device(d) if d.pluto_mode().as_deref() == Some("fast"))
+    }
+
     /// What's connected and how it sweeps: (dot colour, short text, details for the hover).
     fn device_status(&self) -> (Color32, String, String) {
         let board = crate::hydra::board().name();
@@ -925,8 +930,20 @@ impl App {
             Src::Offline(e) => (theme::ALARM, format!("{board} · not open"), if e.is_empty() { "Not connected.".into() } else { e.clone() }),
             Src::Device(d) => {
                 let serial = if self.serial == 0 { "first one found".to_string() } else { format!("{:016X}", self.serial) };
-                if let crate::hydra::Device::Pluto(_) = d {
-                    return (theme::OK, format!("{board} · corvus-pluto sweep"), format!("{}\n{}", d.version(), d.lib_path().display()));
+                if let crate::hydra::Device::Pluto(p) = d {
+                    let (mode, note) = p.mode.lock().clone();
+                    let how = match mode.as_str() {
+                        "fast" => "fast sweep (fastlock, direct SPI)".to_string(),
+                        "driver" if !note.is_empty() => format!("driver sweep. Fast mode is off: {note}"),
+                        "driver" => "driver sweep".to_string(),
+                        _ => "corvus-pluto sweep".to_string(),
+                    };
+                    let short = match mode.as_str() {
+                        "fast" => "fast sweep",
+                        "driver" => "driver sweep",
+                        _ => "corvus-pluto sweep",
+                    };
+                    return (theme::OK, format!("{board} · {short}"), format!("{}\n{}\n{how}", d.version(), d.lib_path().display()));
                 }
                 let how = match d {
                     crate::hydra::Device::HackRF(_) => "stock firmware sweep".to_string(),
@@ -1129,7 +1146,14 @@ impl App {
                 Order::Interleaved => Card { label: "Visit order", value: "Interleaved".into(), unit: "", sub: "two 5 MHz slices per tune".into(), flag: false, spark: false },
             },
             if p.rate.iq16() {
-                Card { label: "Settling", value: format!("{}", 2 + p.skip), unit: "blocks", sub: format!("dropped after each retune · {:.0} µs", (2 + p.skip) as f64 * p.rate.block_s() * 1e6), flag: false, spark: false }
+                // corvus-pluto's fast mode drops only the settle blocks; its driver path two stale ones as well
+                let drop = if self.pluto_fast() { p.skip } else { 2 + p.skip };
+                let sub = if self.pluto_fast() && drop == 0 {
+                    "none: fastlock settles in ~1 µs".to_string()
+                } else {
+                    format!("dropped after each retune · {:.0} µs", drop as f64 * p.rate.block_s() * 1e6)
+                };
+                Card { label: "Settling", value: format!("{drop}"), unit: "blocks", sub, flag: false, spark: false }
             } else if p.rate.complex() {
                 Card { label: "Settling", value: "Fixed".into(), unit: "", sub: "the HackRF firmware waits 0.8 ms per tune".into(), flag: false, spark: false }
             } else if self.host_driven() {
@@ -1293,8 +1317,9 @@ impl App {
                         theme::caption(
                             ui,
                             format!(
-                                "The board sweeps back and forth, so it never wraps. Dwell averages more blocks per step. Settle drops extra {:.0} µs blocks after each retune, on top of the two the board always drops.",
-                                self.cfg.rate.block_s() * 1e6
+                                "The board sweeps back and forth, so it never wraps. Dwell averages more blocks per step. Settle drops extra {:.0} µs blocks after each retune{}.",
+                                self.cfg.rate.block_s() * 1e6,
+                                if self.pluto_fast() { "; in fast mode none are needed (fastlock settles in ~1 µs)" } else { ", on top of the two the board drops through its driver" }
                             ),
                         );
                     } else if !complex && !host {

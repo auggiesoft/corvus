@@ -1,16 +1,16 @@
 # corvus-pluto
 
 The Corvus sweep for the PlutoSDR family (ADALM-Pluto and clones such as the Pluto+). Unlike the RFOne and
-Airspy firmware, this isn't firmware: it's a small Linux program (one static ARM binary, about 480 KB, std
-Rust, no libiio) that runs on the board's own processor next to whatever firmware the board has. It
-retunes the AD936x step by step, captures a block right after each retune, and sends ready-made Corvus
-sweep blocks to Corvus Sweep over TCP, tagged exactly like the RFOne firmware's (with two 16-bit words
-per IQ sample). Corvus Sweep reaches it with `--pluto HOST`.
+Airspy firmware, this isn't firmware: it's a small Linux program (one static ARM binary, about 530 KB, Rust,
+no libiio) that runs on the board's own processor next to whatever firmware the board has. It retunes the
+AD936x step by step, captures a block right after each retune, and sends ready-made Corvus sweep blocks to
+Corvus Sweep over TCP, tagged exactly like the RFOne firmware's (with two 16-bit words per IQ sample).
+Corvus Sweep reaches it with `--pluto HOST`.
 
 Measured on a Pluto+ (Zynq 7010, AD9363 run as an AD9364) over Gigabit Ethernet, 61.44 MSPS, 40 MHz steps,
-70–6000 MHz: **about 450 steps/s (420–480), 17–19 GHz/s, about 3 full passes a second**, no torn
-blocks or gaps. That's
-more than twice the RFOne's 8.6 GHz/s, over a range more than three times wider.
+70–6000 MHz: **about 3,300 steps/s, 130 GHz/s, 22 full passes a second** in fast mode, no torn blocks, gaps
+or unlocked steps. Over the board's USB network link, about 1,900 steps/s (76 GHz/s). The driver path (the
+fallback) does about 650 steps/s.
 
 > **Unofficial.** Not affiliated with, endorsed by or supported by Analog Devices or any Pluto clone's
 > maker. Product names only say what hardware this works with.
@@ -23,41 +23,81 @@ more than twice the RFOne's 8.6 GHz/s, over a range more than three times wider.
   can't hand samples to a program (Maia's own docs say a Pluto running Maia "can't send or receive IQ
   samples to a PC").
 - A network link to the PC: Ethernet (Pluto+), or the USB network link every Pluto has (the board at
-  192.168.2.1, the default here).
+  192.168.2.1, the default here). Fast mode sends 40–50 MB/s, so Ethernet gets the most out of it.
 - SSH access (root; the stock password is `analog`) to install it.
+- For fast mode, also: root access to `/dev/mem`, the AD936x on the Zynq's SPI0 (as on every Pluto), the ADI
+  kernel's IIO mmap block interface and the driver's fastlock attributes (both in ADI's kernels), and **nothing
+  else using the AD936x while it sweeps** (see below). Without them it sweeps through the driver instead.
 
 ## Build and install
 
 ```
 firmware/pluto/build.sh                          # rustup target armv7-unknown-linux-musleabihf, rust-lld
 PLUTO_PASS=analog firmware/pluto/install.sh 192.168.1.50    # or with no PLUTO_PASS, type the password
+STOP_DATV=1 firmware/pluto/install.sh 192.168.1.50           # on PlutoDVB2: also stop its DATV services (fast mode)
 ```
 
-`install.sh` copies the binary to `/mnt/jffs2` (the board's small persistent flash area; about 480 KB of
+`install.sh` copies the binary to `/mnt/jffs2` (the board's small persistent flash area; about 530 KB of
 its 896 KB) and starts it. On firmware that runs `/mnt/jffs2/backdoor.sh` at boot (PlutoDVB2), it adds a
 line there so it also starts at every boot. Elsewhere it runs until the next reboot.
 
 Then, on the PC: `corvus-sweep --pluto 192.168.1.50` (or `CORVUS_PLUTO=192.168.1.50`), or just `--board pluto`
-for a Pluto on USB at 192.168.2.1.
+for a Pluto on USB at 192.168.2.1. `CORVUS_PLUTO_MODE=driver` asks for the driver path.
 
-## How it sweeps
+## Fast mode
 
-- **Retune**: a write to the driver's `out_altvoltage0_RX_LO_frequency`, about 1.1 ms (the driver's
-  synthesizer writes, VCO calibration and lock wait). Where the LO crosses about 1.3 GHz or 4 GHz the
-  driver reloads its RX gain table, about 20 ms.
-- **Flush**: the capture has two DMA blocks of 4088 samples each. After a retune both still hold the
-  previous step (measured with a busy band and a quiet one: the third block is the new band), so each
-  step reads and drops two blocks, plus any extra `skip` (Corvus Sweep's "Settle").
-- **Capture**: 4088 IQ samples per block (66.5 µs at 61.44 MSPS), `dwell` blocks per step.
+The AD936x itself retunes in about a microsecond when it doesn't have to recalibrate; the time goes in the
+driver (~20 SPI transfers through the kernel at ~45 µs each, plus sleeps while it polls for lock) and in the
+capture (blocks queued before a retune hold the previous band). Fast mode skips both:
+
+- **Fastlock profiles.** On a new plan, each step's synthesizer settings are calibrated once through the
+  driver (a normal retune, then its fastlock store and save: ~0.7 s for 149 steps, cached for 10 minutes).
+  Sweeping, each step is one register write switching to the step's profile; the level is right within
+  about a microsecond. The chip holds 8 profiles, so the one 7 steps ahead is written into the slot just
+  left (only the words that differ, ~7 of 16) while the current block fills.
+- **Direct SPI.** Registers are written over the Zynq's SPI0 controller directly (`/dev/mem`), ~2 µs per
+  transfer. Fast mode only takes the bus when the controller is idle the way the kernel leaves it and no
+  SPI interrupts arrive for 30 ms, and checks after every pass that the kernel hasn't used the bus since; if it
+  has, it hands the radio back and carries on through the driver (`NOTE fast mode off: ...`).
+- **Gain tables.** The driver loads a different RX gain table below 1.3 GHz, to 4 GHz and above; fastlock
+  doesn't, so the sweep writes the table where a pass crosses a band edge (~0.5 ms), with the table index
+  that gives the same gain in dB. The tables are Analog Devices' (from their no-OS driver, BSD-3-Clause:
+  `LICENSE-no-OS.txt`); one read back from a Pluto matched them.
+- **mmap capture blocks.** The ADI kernel's IIO block interface lets the sweep queue each block itself,
+  after the switch, so nothing is captured before the retune and nothing needs dropping.
+- **Two cores.** The sweep loop runs on CPU1 with the capture DMA interrupt; the network sending runs on
+  CPU0 with the Ethernet interrupt. On a Pluto+ the network side is the limit: ~45 MB/s of TCP keeps CPU0 busy.
+  Blocks travel 12-bit packed when the client asks (`pack=12`, as Corvus Sweep does): 25 % fewer bytes.
+- **Handing back.** On STOP, a new CONFIG or plan, or a disconnect: the SPI controller's settings and the DMA
+  interrupt restored, then two driver retunes in different bands, so the driver leaves fastlock mode and
+  reloads the gain table it believes is loaded.
+- **Checks.** Each step reads the synthesizer's lock bit; an unlocked step is flagged in its block's trailer
+  (bit 15 of word 1, as the RFOne firmware does) and its profile calibrated again after the pass.
+
+Measured levels against the driver path at the same frequencies (112 steady steps of 149): median +0.05 dB,
+90 % within −0.03…+0.27 dB. Two fast runs agree to 0.01 dB.
+
+**Nothing else may drive the AD936x while fast mode sweeps:** another program reading or writing the radio
+through iiod or sysfs uses the same SPI bus. Fast mode notices after the pass and drops to the driver path,
+but a transfer that collides with one of its own can misconfigure the chip until the next CONFIG. PlutoDVB2's
+MQTT control daemon polls the chip ~24 times a second, which keeps fast mode off. `STOP_DATV=1 install.sh HOST`
+also installs `plutodvb2-quiet.sh`, which stops PlutoDVB2's DATV services at every boot (the MQTT control daemon
+and broker, the DATV streamer, its LO/TX watcher scripts and its NFS server) and keeps iiod, SSH, DHCP and the
+web server. To undo it, delete its line from `/mnt/jffs2/backdoor.sh` and reboot.
+
+## The driver path
+
+What runs when fast mode can't (`mode=driver`, or a board without the above):
+
+- **Retune**: a write to the driver's `out_altvoltage0_RX_LO_frequency`, about 1.1 ms. Where the LO crosses
+  about 1.3 GHz or 4 GHz the driver reloads its RX gain table, about 20 ms.
+- **Flush**: the capture has two DMA blocks of 4088 samples each, filled when they're queued. After a retune
+  both still hold the previous step, so each step reads and drops them first, plus any extra `settle` blocks.
 - **Back and forth**: odd passes walk the steps backwards and the turnaround step isn't retuned, so a pass
   never wraps from 6 GHz to 70 MHz (the wrap crosses both gain-table edges). +11 % over ascending.
-- **Fixed settings**: manual gain, DC and quadrature tracking on, the TX LO powered down (its leakage
-  lands in the RX band). RF bandwidth 56 MHz at 61.44 MSPS, 28 MHz at 30.72.
 
-Tried and left out: the AD936x's fastlock profiles (calibrated synthesizer settings replayed without a
-VCO calibration) only cut an in-octave retune from 1.09 to 0.77 ms through the driver, and moved step
-levels by about 0.5 dB. Toggling the buffer instead of reading the stale blocks costs 1 ms per step
-against 0.4.
+Both paths: manual gain, DC and quadrature tracking on, the TX LO powered down (its leakage lands in the RX
+band), RF bandwidth 56 MHz at 61.44 MSPS, 28 MHz at 30.72; 4088 IQ samples per block (66.5 µs at 61.44 MSPS).
 
 At 61.44 MSPS the noise floor rises towards the band edges (the AD936x's noise-shaped ADC): within 1 dB
 over ±20 MHz, +3.5 dB at ±25 MHz. Hence the 40 MHz default step (50 is offered); Corvus Sweep's learned
@@ -65,7 +105,8 @@ flatness correction takes the per-step ripple from about 3.7 dB to 0.5 dB peak t
 DC (the residual LO leakage after DC tracking) are bridged from their neighbours.
 
 `corvus-pluto bench` on the board measures all of this: block timing, retunes by jump size, the stale
-blocks, and full sweeps in both orders.
+blocks, full sweeps through the driver in both orders, then fast mode (calibration, and steps/s with no
+per-block work, with the copy out of the DMA block, and with the frame built).
 
 ## Protocol
 
@@ -73,16 +114,23 @@ TCP port 30433. The PC sends text lines:
 
 ```
 CONFIG rate=<Hz> bw=<Hz> gain=<dB>
-SWEEP f0=<Hz> step=<Hz> n=<steps> [dwell=<blocks>] [skip=<blocks>] [order=bounce|asc]
+SWEEP f0=<Hz> step=<Hz> n=<steps> [dwell=<blocks>] [settle=<blocks>] [order=bounce|asc] [mode=fast|driver] [pack=12]
 GAIN <dB>
 STOP
 ```
 
+`settle` counts extra blocks dropped after each retune, beyond what the board needs itself. corvus-pluto 0.1
+took `skip=<2 + settle>` instead; 0.2 still accepts it, and Corvus Sweep sends both so it works with either.
+`mode` defaults to fast.
+
 The board sends frames of `[u32 type][u32 length][payload]` (little-endian): type 1 is one 16384-byte
-sweep block, type 2 a text line (`HELLO corvus-pluto <version> model="..." fw="..."` on connect, then
-`OK ...` or `ERR ...` per command). The block's tags are the RFOne firmware's (`host/README.md`): step,
-block within the step, a pass counter, the LO (low 32 bits), and a block clock (time since the sweep
-started, in units of one block). One client at a time.
+sweep block, type 2 a text line (`HELLO corvus-pluto <version> model="..." fw="..." modes=fast|driver` on
+connect, then `OK ...` or `ERR ...` per command, and `NOTE ...` when fast mode stops on its own), type 3 one
+sweep block with 12-bit packed samples (12296 bytes: the 8 header words, 4088 I, Q pairs in 3 bytes each,
+I bits 0–7, then I bits 8–11 | Q bits 0–3 << 4, then Q bits 4–11, then the 8 trailer words). `OK SWEEP` says
+which `mode` it runs, and with `note="..."` why not fast when it was asked for. The block's tags are the RFOne
+firmware's (`host/README.md`): step, block within the step, a pass counter, the LO (low 32 bits), a block
+clock (time since the sweep started, in units of one block), and the lock flag. One client at a time.
 
 ## Recovery note for Pluto+ boards
 
