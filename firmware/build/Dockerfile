@@ -5,7 +5,7 @@
 FROM ubuntu:24.04
 # If Ubuntu's own archive is unreachable (it was, with Launchpad, on 2026-11-11), retry on the kernel.org
 # mirror of it: the same packages, still checked against Ubuntu's signing keys.
-RUN (apt-get update -qq || { sed -i 's@http://\(archive\|security\)\.ubuntu\.com/ubuntu@http://mirrors.edge.kernel.org/ubuntu@g' /etc/apt/sources.list.d/ubuntu.sources && apt-get update -qq; }) \
+RUN (apt-get update -qq --error-on=any || { sed -i 's@http://\(archive\|security\)\.ubuntu\.com/ubuntu@http://mirrors.edge.kernel.org/ubuntu@g' /etc/apt/sources.list.d/ubuntu.sources && apt-get update -qq --error-on=any; }) \
  && apt-get install -y --no-install-recommends gcc-multilib make bzip2 python3 ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY gcc-arm-none-eabi-4_7-2013q3-20130916-linux.tar.bz2 /tmp/
