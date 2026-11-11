@@ -25,7 +25,9 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   [ -f "$B/dl/$TC" ] || curl -fL --retry 2 --connect-timeout 20 -o "$B/dl/$TC" "$TC_URL" ||
     curl -fL --retry 3 --connect-timeout 30 -o "$B/dl/$TC" "$TC_MIRROR"
   echo "$TC_MD5  $B/dl/$TC" | md5sum -c --quiet -
-  docker build -q -t "$IMAGE" -f "$B/Dockerfile" "$B/dl" >/dev/null
+  LOG=$(mktemp)
+  docker build --progress=plain -t "$IMAGE" -f "$B/Dockerfile" "$B/dl" > "$LOG" 2>&1 || { tail -40 "$LOG"; exit 1; }
+  rm -f "$LOG"
 fi
 
 rm -rf "$WORK"; mkdir -p "$WORK"
