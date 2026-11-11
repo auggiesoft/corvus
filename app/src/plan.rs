@@ -26,6 +26,12 @@ pub enum Rate {
     /// HackRF One: 20 MSPS complex (8-bit IQ) in its stock firmware sweep. Each tune yields two 5 MHz
     /// slices, 7.5 MHz either side of its LO's 0 Hz, which the app treats as two steps of a 5 MHz grid.
     H20,
+    /// PlutoSDR family (corvus-pluto on the board): 61.44 MSPS complex, 12-bit IQ (two words per sample),
+    /// RF bandwidth 56 MHz. The noise floor rises towards the edges (the AD936x's noise-shaped ADC):
+    /// within 1 dB over ±20 MHz, +3.5 dB at ±25 MHz.
+    P61,
+    /// PlutoSDR family at 30.72 MSPS: half the step width, twice the frequency resolution.
+    P31,
 }
 
 impl Rate {
@@ -36,20 +42,51 @@ impl Rate {
             Rate::M12 => 12,
             Rate::M6 => 6,
             Rate::H20 => 20,
+            Rate::P61 => 61,
+            Rate::P31 => 31,
         }
     }
 
-    /// Sample rate of the raw block: real ADC samples for the R82x boards, complex IQ for the HackRF.
+    /// The rate as shown: "12 MSPS", "61.44 MSPS".
+    pub fn label(self) -> &'static str {
+        match self {
+            Rate::M10 => "10 MSPS",
+            Rate::M12 => "12 MSPS",
+            Rate::M6 => "6 MSPS",
+            Rate::H20 => "20 MSPS",
+            Rate::P61 => "61.44 MSPS",
+            Rate::P31 => "30.72 MSPS",
+        }
+    }
+
+    /// Sample rate of the raw block: real ADC samples for the R82x boards, complex IQ for the HackRF and Pluto.
     pub fn adc_hz(self) -> f64 {
         match self {
             Rate::H20 => 20e6,
+            Rate::P61 => 61.44e6,
+            Rate::P31 => 30.72e6,
             _ => 2e6 * self.msps() as f64,
         }
     }
 
     /// Complex (IQ) samples rather than real ones.
     pub fn complex(self) -> bool {
+        matches!(self, Rate::H20 | Rate::P61 | Rate::P31)
+    }
+
+    /// The HackRF's stock sweep: two slices per tune, either side of its LO.
+    pub fn sliced(self) -> bool {
         self == Rate::H20
+    }
+
+    /// 12-bit IQ in two words per sample (the Pluto); otherwise one word per sample.
+    pub fn iq16(self) -> bool {
+        matches!(self, Rate::P61 | Rate::P31)
+    }
+
+    /// Samples a block holds, tags included (a block is BLOCK_WORDS words).
+    pub fn block_samples(self) -> usize {
+        if self.iq16() { BLOCK_WORDS / 2 } else { BLOCK_WORDS }
     }
 
     /// R82x IF; LO = RF + IF. Zero for the HackRF (zero-IF, complex).
@@ -61,13 +98,14 @@ impl Rate {
     pub fn f_range(self) -> (f64, f64) {
         match self {
             Rate::H20 => (1e6, 6000e6),
+            Rate::P61 | Rate::P31 => (70e6, 6000e6),
             _ => (F_MIN_HZ, F_MAX_HZ),
         }
     }
 
     /// One DMA block: the tick of the device's block counter.
     pub fn block_s(self) -> f64 {
-        BLOCK_WORDS as f64 / self.adc_hz()
+        self.block_samples() as f64 / self.adc_hz()
     }
 
     /// Widest step slice the passband allows (measured; the flatness correction removes the ripple).
@@ -77,6 +115,8 @@ impl Rate {
             Rate::M12 => 10.0e6,
             Rate::M6 => 4.4e6,
             Rate::H20 => 5.0e6,
+            Rate::P61 => 50.0e6,
+            Rate::P31 => 25.0e6,
         }
     }
 
@@ -87,6 +127,8 @@ impl Rate {
             Rate::M12 => &[(4.0, "4"), (6.0, "6"), (8.0, "8"), (10.0, "10 MHz")],
             Rate::M6 => &[(2.0, "2"), (3.0, "3"), (4.0, "4 MHz")],
             Rate::H20 => &[(5.0, "5 MHz")],
+            Rate::P61 => &[(20.0, "20"), (30.0, "30"), (40.0, "40"), (50.0, "50 MHz")],
+            Rate::P31 => &[(10.0, "10"), (15.0, "15"), (20.0, "20"), (25.0, "25 MHz")],
         }
     }
 
@@ -96,6 +138,8 @@ impl Rate {
             Rate::M12 => 10.0,
             Rate::M6 => 4.0,
             Rate::H20 => 5.0,
+            Rate::P61 => 40.0,
+            Rate::P31 => 20.0,
         }
     }
 }
@@ -136,6 +180,9 @@ impl Plan {
         if rate == Rate::H20 {
             return Plan::hackrf(start_mhz, stop_mhz, dwell);
         }
+        // the Pluto (corvus-pluto) walks back and forth: every pass reversed, like the VCO-continuous order
+        // over a single divider run, so it never wraps from 6 GHz to 70 MHz
+        let order = if rate.iq16() { Order::VcoContinuous } else { order };
         let (fmin, fmax) = rate.f_range();
         let step = (step_mhz.clamp(1.0, rate.max_window_hz() / 1e6) * 1e6).round();
         let mut start = (start_mhz * 1e6).clamp(fmin, fmax - 0.2e6);

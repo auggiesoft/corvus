@@ -146,7 +146,7 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         let rf = plan.centre(idx as usize);
         // HackRF: steps 4g, 4g+1 are slices below a tune's LO, 4g+2, 4g+3 the ones above; the two slices of
         // a tune share its block (sides 0 and 1), and each tune costs 2 discarded blocks.
-        let complex = plan.rate.complex();
+        let complex = plan.rate.sliced();
         let side: u16 = if complex && idx % 4 >= 2 { 1 } else { 0 };
         // hop cost: 2 blocks of retune + lock at either rate (measured), more in the low band, ~10 ms
         // across a divider switch between neighbours, ~0.5 ms for a VCO-continuous join, ~8 ms for
@@ -155,7 +155,19 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         let fi = plan.rate.if_hz();
         let mut over = 2 + plan.skip as u32; // retune, the block in flight, then settle blocks
         let mut polls = rng.range(2, 8) as u16;
-        if complex {
+        if plan.rate.iq16() {
+            // corvus-pluto (measured on a Pluto+): ~1.1 ms per retune plus ~0.4 ms of capture overhead, ~20 ms
+            // where the driver reloads its gain table (1.3, 4 GHz), no retune at the turnaround; it always
+            // drops 2 blocks plus the settle ones
+            let ms = match prev_rf {
+                Some(p) if p == rf => 0.3,
+                Some(p) if (p < 1.3e9) != (rf < 1.3e9) || (p < 4e9) != (rf < 4e9) => 20.0,
+                Some(_) => 1.4,
+                None => 0.3,
+            };
+            over = (ms * 1e-3 / plan.rate.block_s()).round() as u32 + 2 + plan.skip as u32;
+            polls = 0;
+        } else if complex {
             over = if side == 0 { 2 } else { 0 };
             polls = side;
         } else if let Some(p) = prev_rf {
@@ -188,9 +200,11 @@ fn run(ctl: Arc<Mutex<Ctl>>, stop: Arc<AtomicBool>, sink: Sink) {
         for b in 0..plan.dwell {
             let start = batch.len();
             batch.resize(start + BLOCK_WORDS, 0);
-            if complex {
+            if plan.rate.iq16() {
+                synth_iq(&mut batch[start..start + BLOCK_WORDS], rf, plan.rate, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
+            } else if complex {
                 let lo = if side == 0 { rf + crate::dsp::HACKRF_SLICE_HZ } else { rf - crate::dsp::HACKRF_SLICE_HZ };
-                synth_iq(&mut batch[start..], lo, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
+                synth_iq(&mut batch[start..], lo, plan.rate, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
             } else {
                 synth(&mut batch[start..], rf, plan.rate, t, &rx, &bands, &mut spec, &mut scratch, &*ifft, &mut rng);
             }
@@ -416,17 +430,40 @@ fn hackrf_passband_db(off: f64) -> f32 {
     db as f32
 }
 
-/// One HackRF block: 8-bit IQ around `lo` (I in the low byte, Q in the high byte).
+/// The Pluto at 61.44 MSPS (56 MHz RF bandwidth): flat in the middle, the analog filter past ±27 MHz.
+fn pluto_passband_db(off: f64, rate: Rate) -> f32 {
+    let edge = 0.44 * rate.adc_hz();
+    let a = off.abs();
+    let mut db = 0.25 * (off / 3.1e6).sin();
+    if a > edge {
+        db -= (a - edge) / 1.0e6 * 2.5;
+    }
+    db as f32
+}
+
+/// The AD936x's noise-shaped ADC floor: it rises towards the band edges (+5 dB at ±30 MHz, 61.44 MSPS).
+fn pluto_floor_shape(off: f64, rate: Rate) -> f32 {
+    let x = off / (rate.adc_hz() / 2.0);
+    10f32.powf((5.4 * x * x) as f32 / 10.0)
+}
+
+/// One complex block around `lo`. HackRF: 8-bit IQ, I in the low byte and Q in the high byte of each word.
+/// Pluto: 12-bit IQ, I and Q in a word each (4096 samples per block).
 #[allow(clippy::too_many_arguments)]
-fn synth_iq(out: &mut [u16], lo: f64, t: f64, rx: &RxSettings, bands: &[Sig], spec: &mut [Complex32], scratch: &mut [Complex32], ifft: &dyn rustfft::Fft<f32>, rng: &mut Rng) {
+fn synth_iq(out: &mut [u16], lo: f64, rate: Rate, t: f64, rx: &RxSettings, bands: &[Sig], spec: &mut [Complex32], scratch: &mut [Complex32], ifft: &dyn rustfft::Fft<f32>, rng: &mut Rng) {
     let n = BLOCK_WORDS;
-    let df = 20e6 / n as f64;
+    let pluto = rate.iq16();
+    let df = rate.adc_hz() / n as f64;
     let g = gain_db(&rx.gain);
-    let floor = 10f32.powf((-88.0 + g * 0.6) / 10.0);
-    let adc_floor = 10f32.powf(-52.0 / 10.0) / n as f32; // 8-bit quantisation spread over the bins
+    let (floor, adc_floor, half) = if pluto {
+        // 12-bit ADC: a much lower quantisation floor than the HackRF's 8 bits
+        (10f32.powf((-104.0 + g * 0.75) / 10.0), 10f32.powf(-78.0 / 10.0) / n as f32, rate.adc_hz() / 2.0)
+    } else {
+        (10f32.powf((-88.0 + g * 0.6) / 10.0), 10f32.powf(-52.0 / 10.0) / n as f32, 10.2e6)
+    };
     let active: Vec<(&Sig, f32)> = bands
         .iter()
-        .filter(|s| (s.f - lo).abs() < 10.2e6 + s.reach())
+        .filter(|s| (s.f - lo).abs() < half + s.reach())
         .filter_map(|s| {
             let on = match s.burst {
                 None => true,
@@ -464,13 +501,24 @@ fn synth_iq(out: &mut [u16], lo: f64, t: f64, rx: &RxSettings, bands: &[Sig], sp
             }
         }
         if off.abs() < df * 1.5 {
-            p += floor * 300.0; // the DC spike
+            p += floor * if pluto { 6.0 } else { 300.0 }; // the DC spike (small after the AD936x's DC tracking)
         }
-        let p = p * 10f32.powf(hackrf_passband_db(off) / 10.0) + adc_floor;
-        let a = 128.0 * (p / 3.0).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
+        let (p, fs) = if pluto {
+            (p * 10f32.powf(pluto_passband_db(off, rate) / 10.0) + adc_floor * pluto_floor_shape(off, rate), 2048.0)
+        } else {
+            (p * 10f32.powf(hackrf_passband_db(off) / 10.0) + adc_floor, 128.0)
+        };
+        let a = fs * (p / 3.0).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
         *c = Complex32::new(a * rng.gauss(), a * rng.gauss());
     }
     ifft.process_with_scratch(spec, scratch);
+    if pluto {
+        for (o, c) in out.as_chunks_mut::<2>().0.iter_mut().zip(spec.iter()) {
+            o[0] = c.re.round().clamp(-2047.0, 2047.0) as i16 as u16;
+            o[1] = c.im.round().clamp(-2047.0, 2047.0) as i16 as u16;
+        }
+        return;
+    }
     for (o, c) in out.iter_mut().zip(spec.iter()) {
         let i = c.re.round().clamp(-127.0, 127.0) as i8;
         let q = c.im.round().clamp(-127.0, 127.0) as i8;

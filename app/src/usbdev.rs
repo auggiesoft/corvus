@@ -605,6 +605,10 @@ pub fn params_bytes(p: &SweepParams) -> [u8; 16] {
     b
 }
 
+/// ADALM-Pluto and its clones in their normal (not DFU) mode.
+const PLUTO_VID: u16 = 0x0456;
+const PLUTO_PID: u16 = 0xB673;
+
 /// Boards on USB (all platforms): RFOne, Airspy R2/Mini, HackRF, by vendor/product ID and serial string.
 pub fn list() -> Vec<crate::hydra::Found> {
     use crate::hydra::{Board, Found};
@@ -618,6 +622,8 @@ pub fn list() -> Vec<crate::hydra::Found> {
                 (AIRSPY_VID, AIRSPY_PID) if sn.starts_with("HYDRASDR") => Some(Found { board: Board::RFOne, serial, label: "HydraSDR RFOne (old firmware ID)".into() }),
                 (AIRSPY_VID, AIRSPY_PID) => Some(Found { board: Board::Airspy, serial, label: "Airspy (R2 or Mini)".into() }),
                 (HACKRF_VID, pid) if HACKRF_PIDS.contains(&pid) => Some(Found { board: Board::HackRF, serial, label: "HackRF One".into() }),
+                // a Pluto on USB (its network link); Corvus reaches it over the network, not this device
+                (PLUTO_VID, PLUTO_PID) => Some(Found { board: Board::Pluto, serial, label: "Pluto".into() }),
                 _ => None,
             }
         })

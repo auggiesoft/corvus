@@ -180,6 +180,25 @@ source (a cycle counter around the retune, written into each block's header).
 - **The MAX2837 is the slow synthesizer:** holding it at a fixed IF and moving only the RFFC5072 mixer
   settles in ~510 µs; moving only the MAX2837 leaves a long tail.
 
+## Pluto+
+
+One Pluto+ (Zynq 7010, AD9363 run as an AD9364) on F5OEO's PlutoDVB2 0.5.16.7 firmware, running
+`corvus-pluto` (`../firmware/pluto/`), Gigabit Ethernet, 61.44 MSPS, RF bandwidth 56 MHz, manual gain.
+
+- **The driver's retune sets the pace:** writing the RX LO takes ~1.1 ms (synthesizer writes, VCO
+  calibration, lock wait), and ~20 ms where the LO crosses about 1.3 or 4 GHz and the driver reloads its
+  RX gain table. Reading a 4088-sample block takes 162 µs, so capture and network are not the limit.
+- **Two stale blocks:** the capture buffer is two DMA blocks; after a retune both still hold the previous
+  step (busy band → quiet band: the third block is the first of the new band).
+- **Noise floor across the band:** within 1 dB of the centre over ±20 MHz, +3.5 dB at ±25 MHz. Hence
+  40 MHz steps by default, 50 at most.
+- **Speed:** 70–6000 MHz in 40 MHz steps, dwell 1: 425–483 steps/s, 17–19.3 GHz/s, about 3 passes/s, no
+  torn blocks or gaps. Back-and-forth passes are 11 % faster than ascending ones (no wrap across both
+  gain-table edges).
+- **Tried and left out:** the AD936x's fastlock profiles through the driver (0.77 ms instead of 1.09 ms
+  per retune, but step levels moved by about 0.5 dB), and toggling the buffer instead of reading the
+  stale blocks (1 ms per step against 0.4).
+
 ## Restarts
 
 Changing gain or port mid-sweep means SWEEP_STOP, the setting, then SWEEP_START, because the firmware

@@ -1,7 +1,8 @@
 # Corvus
 
 Firmware sweep mode and a live wideband spectrum analyser for the HydraSDR RFOne, the Airspy R2 and
-the Airspy Mini, and the same analyser for the HackRF One on its stock firmware.
+the Airspy Mini, the same analyser for the HackRF One on its stock firmware, and an on-board sweep
+program for the PlutoSDR family (Pluto+, ADALM-Pluto).
 
 The board retunes itself and streams only blocks captured after the tuner's PLL has locked, each
 tagged with the step it belongs to. On the host, Corvus Sweep stitches those steps into one seamless
@@ -14,15 +15,19 @@ spectrum: on the RFOne, **24–1800 MHz about five times a second (8.6 GHz/s), l
 | Airspy R2 | `firmware/airspy/`, `…-sweep5` | 10 MSPS | up to 9 MHz | 6.5 GHz/s, ~3.65 passes/s | `--board airspy` |
 | Airspy Mini | the same image as the R2 | 6 MSPS | up to 4 MHz | 2.9 GHz/s, ~1.6 passes/s | `--board mini` |
 | HackRF One | **stock** (its own sweep mode, no flashing) | 20 MSPS IQ | 5 MHz slices | 8.1 GHz/s, ~4.6 passes/s (1–6000 MHz: 1.36) | `--board hackrf` |
+| Pluto+ / PlutoSDR | its own firmware + `firmware/pluto/` (a program on the board) | 61.44 MSPS IQ (or 30.72) | up to 50 MHz | 70–6000 MHz: 17–19 GHz/s, ~3 passes/s | `--pluto HOST` |
 
 The three Corvus boards speak the same sweep protocol, and the same API is added to their host
 libraries (libhydrasdr for the RFOne, libairspy for the Airspys). The R2/Mini image detects which board
 it's on at boot. The HackRF already has a firmware sweep, so Corvus Sweep drives it as it is, from
-1 MHz to 6 GHz.
+1 MHz to 6 GHz. A Pluto runs Linux, so its sweep is a small program on the board (`corvus-pluto`) that
+retunes, captures and tags blocks in the same format and serves them over the network: Ethernet on a
+Pluto+, or any Pluto's USB network link.
 
 **Corvus Sweep needs no library or driver install.** It talks to every board over USB itself (a
 built-in driver ported from the boards' libraries), so it's one file on Linux and one `.exe` on
-Windows, where all four boards use WinUSB, which their firmware asks Windows for.
+Windows, where all four USB boards use WinUSB, which their firmware asks Windows for. The Pluto is
+reached over the network.
 
 **Stock firmware works too, just slower.** On an RFOne or Airspy without the Corvus firmware, Corvus
 Sweep retunes the board from the PC step by step: about 30–60 steps a second (0.1–0.6 GHz/s), roughly
@@ -31,14 +36,14 @@ Sweep retunes the board from the PC step by step: about 30–60 steps a second (
 ![Corvus Sweep on the full 24–1800 MHz range, running on its simulator](docs/corvus-sweep.png)
 
 > **Unofficial.** Corvus is an independent project. It is not affiliated with, endorsed by or
-> supported by HydraSDR or Airspy. Product names are used only to say what hardware Corvus works
+> supported by HydraSDR, Airspy, Great Scott Gadgets or Analog Devices. Product names are used only to say what hardware Corvus works
 > with. For official firmware, tools and support, go to the manufacturer.
 
 ## What's here
 
 | Directory | |
 |---|---|
-| [`firmware/`](firmware/) | the Corvus firmware: sweep mode on top of the RFOne firmware v1.0.2 (`rfone/`) and the Airspy R2/Mini firmware (`airspy/`). Protocol, building, flashing, recovery |
+| [`firmware/`](firmware/) | the Corvus firmware: sweep mode on top of the RFOne firmware v1.0.2 (`rfone/`) and the Airspy R2/Mini firmware (`airspy/`). Protocol, building, flashing, recovery. [`pluto/`](firmware/pluto/): `corvus-pluto`, the sweep program for a Pluto |
 | [`host/`](host/) | libhydrasdr (`hydrasdr-host/`) and libairspy (`airspyone-host/`) with the sweep API added (drop-in supersets), builds, on-device tests |
 | [`app/`](app/) | **Corvus Sweep**, the spectrum analyser (Rust, egui) |
 | [`tools/`](tools/) | `corvus_sweep.py`, a command-line sweep client (rates, integrity, CSV) |
@@ -59,11 +64,11 @@ cargo run --release -- --sim
 
 With a board (everything builds in Docker):
 
-| | RFOne | Airspy R2 or Mini | HackRF One |
-|---|---|---|---|
-| 1. Build the firmware | `firmware/build/build.sh rfone` | `firmware/build/build.sh airspy` | not needed: stock firmware |
-| 2. Flash it (with the board's tools: `host/build/build.sh linux` / `airspy-linux` builds them) | [firmware/README.md](firmware/README.md#flashing) | the same section, with the airspy tools | not needed |
-| 3. Run Corvus Sweep (in `app/`) | `cargo run --release` | `cargo run --release` (it finds the R2 or Mini) | `cargo run --release` |
+| | RFOne | Airspy R2 or Mini | HackRF One | Pluto+ / PlutoSDR |
+|---|---|---|---|---|
+| 1. Build the firmware | `firmware/build/build.sh rfone` | `firmware/build/build.sh airspy` | not needed: stock firmware | `firmware/pluto/build.sh` (Rust, no Docker) |
+| 2. Flash it (with the board's tools: `host/build/build.sh linux` / `airspy-linux` builds them) | [firmware/README.md](firmware/README.md#flashing) | the same section, with the airspy tools | not needed | install, no flashing: `firmware/pluto/install.sh HOST` ([needs firmware with ADI's capture path](firmware/pluto/README.md)) |
+| 3. Run Corvus Sweep (in `app/`) | `cargo run --release` | `cargo run --release` (it finds the R2 or Mini) | `cargo run --release` | `cargo run --release -- --pluto HOST` |
 
 Steps 1–2 are optional for the RFOne and the Airspys: on stock firmware Corvus Sweep falls back to the
 slower PC-driven sweep. With more than one board plugged in, pick one with `--board` or `--serial`.
@@ -86,6 +91,10 @@ and how to recover a board if a flash goes wrong (that means opening the case).
   ([measurements](docs/measurements.md#airspy-mini)).
 - The other R2 hasn't been flashed. Boards on the Corvus firmware still work as normal receivers with
   other software.
+- The Pluto was added on 2026-11-11 and tested on one Pluto+ over Gigabit Ethernet (F5OEO's PlutoDVB2
+  0.5.16.7 firmware): about 450 steps/s at 40 MHz over 70–6000 MHz, clean integrity, the
+  `real_boards` test passing, `corvus-pluto` starting at boot. The board keeps working with other
+  software: libiio, SDR apps and its own web pages are untouched while Corvus isn't connected.
 
 ## Licensing
 
@@ -99,7 +108,7 @@ parts below that keep their own licences:
 | `host/hydrasdr-host/` | libhydrasdr: MIT, with `hydrasdr.c`/`hydrasdr.h` BSD-3-Clause (`libhydrasdr/LICENSE.md`); tools: GPL-2.0 (`hydrasdr-tools/LICENSE.md`) |
 | `host/airspyone-host/` | libairspy: BSD-3-Clause (file headers); tools: see their headers |
 | `app/assets/fonts/` | SIL Open Font License 1.1 (`app/assets/fonts/`) |
-| everything else (`app/`, `tools/`, the build scripts, the docs) | MIT ([`LICENSE`](LICENSE)) |
+| everything else (`app/`, `firmware/pluto/`, `tools/`, the build scripts, the docs) | MIT ([`LICENSE`](LICENSE)) |
 
 `firmware/rfone/`, `firmware/airspy/`, `host/hydrasdr-host/` and `host/airspyone-host/` each started as
 an unmodified import of the upstream source (see the import commits). The files Corvus changed carry a notice saying so, and `git log` shows every

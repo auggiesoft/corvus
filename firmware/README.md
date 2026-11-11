@@ -16,6 +16,9 @@ import first, then every change. `airspy/` is built the same way on the Airspy f
 RFOne firmware descends from, so the port is nearly line for line. Normal (non-sweep) operation is
 unchanged on both, so the boards still work with the stock host tools and other software.
 
+The PlutoSDR family has its own sweep in [`pluto/`](pluto/): not firmware but a program that runs on the
+board's Linux next to its firmware, serving blocks in the same tag format over the network.
+
 Both boards speak the same protocol below. Differences: the R2 has no 12 MSPS setting (10 MSPS is its
 fastest) and one antenna input, and its host library is libairspy (`../host/airspyone-host/`).
 

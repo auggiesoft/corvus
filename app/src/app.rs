@@ -820,7 +820,8 @@ impl App {
                     let same_family = f.board == cur_board || (f.board == crate::hydra::Board::Airspy && cur_board == crate::hydra::Board::Mini);
                     let current = live && same_family && (f.serial == self.serial || self.serial == 0);
                     let label = if f.board == crate::hydra::Board::Airspy && current { cur_board.name().to_string() } else { f.label.clone() };
-                    let text = RichText::new(format!("{label}   {:016X}", f.serial)).font(theme::num(theme::SM));
+                    let id = if f.board.networked() { crate::pluto::addr() } else { format!("{:016X}", f.serial) };
+                    let text = RichText::new(format!("{label}   {id}")).font(theme::num(theme::SM));
                     if ui.add(egui::Button::selectable(current, text)).clicked() && !current {
                         pick = Some(Some((f.board, f.serial)));
                     }
@@ -839,7 +840,7 @@ impl App {
                         close = true;
                     }
                 });
-                theme::caption(ui, "Boards on Corvus firmware sweep on the board; stock firmware is swept from the PC, more slowly. A board another program is using won't open.");
+                theme::caption(ui, "Boards on Corvus firmware sweep on the board; stock firmware is swept from the PC, more slowly. A board another program is using won't open. A Pluto is reached over the network (--pluto HOST).");
             });
         });
         if let Some(t) = pick {
@@ -924,6 +925,9 @@ impl App {
             Src::Offline(e) => (theme::ALARM, format!("{board} · not open"), if e.is_empty() { "Not connected.".into() } else { e.clone() }),
             Src::Device(d) => {
                 let serial = if self.serial == 0 { "first one found".to_string() } else { format!("{:016X}", self.serial) };
+                if let crate::hydra::Device::Pluto(_) = d {
+                    return (theme::OK, format!("{board} · corvus-pluto sweep"), format!("{}\n{}", d.version(), d.lib_path().display()));
+                }
                 let how = match d {
                     crate::hydra::Device::HackRF(_) => "stock firmware sweep".to_string(),
                     _ if d.host_driven() => "stock firmware · PC-driven sweep".to_string(),
@@ -1119,11 +1123,14 @@ impl App {
             },
             Card { label: "Span", value: span_v, unit: span_u, sub: format!("{} steps · {:.1} kHz bins", p.n_steps, dsp::bin_hz(self.cfg.nfft, p.rate) / 1e3), flag: false, spark: false },
             match p.order {
+                Order::VcoContinuous if p.rate.iq16() => Card { label: "Visit order", value: "Back and forth".into(), unit: "", sub: "every pass reversed · no wrap".into(), flag: false, spark: false },
                 Order::VcoContinuous => Card { label: "Visit order", value: "VCO".into(), unit: "continuous", sub: format!("{fast} fast joins · {slow} slow per pass"), flag: false, spark: false },
                 Order::Ascending => Card { label: "Visit order", value: "Ascending".into(), unit: "", sub: format!("{slow} slow crossings per pass"), flag: false, spark: false },
                 Order::Interleaved => Card { label: "Visit order", value: "Interleaved".into(), unit: "", sub: "two 5 MHz slices per tune".into(), flag: false, spark: false },
             },
-            if p.rate.complex() {
+            if p.rate.iq16() {
+                Card { label: "Settling", value: format!("{}", 2 + p.skip), unit: "blocks", sub: format!("dropped after each retune · {:.0} µs", (2 + p.skip) as f64 * p.rate.block_s() * 1e6), flag: false, spark: false }
+            } else if p.rate.complex() {
                 Card { label: "Settling", value: "Fixed".into(), unit: "", sub: "the HackRF firmware waits 0.8 ms per tune".into(), flag: false, spark: false }
             } else if self.host_driven() {
                 Card { label: "Settling", value: "PC-timed".into(), unit: "", sub: "2 USB transfers skipped per step".into(), flag: false, spark: false }
@@ -1140,7 +1147,7 @@ impl App {
                 flag: recent,
                 spark: false,
             },
-            Card { label: "USB", value: format!("{:.1}", s.usb_mb_s), unit: "MB/s", sub: format!("{} blocks", s.blocks), flag: false, spark: false },
+            Card { label: if crate::hydra::board().networked() { "Network" } else { "USB" }, value: format!("{:.1}", s.usb_mb_s), unit: "MB/s", sub: format!("{} blocks", s.blocks), flag: false, spark: false },
         ];
         let gap = 6.0;
         let w = ((ui.available_width() - gap * (cards.len() as f32 - 1.0)) / cards.len() as f32).max(110.0);
@@ -1242,13 +1249,19 @@ impl App {
                 }
                 theme::more(ui, "engine-more", "Rate, order, dwell and lock check", |ui| {
                     let mut rate = self.cfg.rate;
-                    let rate_hint = "10 MSPS: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.\n12 MSPS: 24 MSPS real, tuner filter wide open, steps up to 10 MHz, about a third more GHz/s.";
-                    if crate::hydra::board().rates().len() > 1 {
-                        if theme::row_hint(ui, "Rate", rate_hint, |ui| theme::segmented(ui, &mut rate, &[(Rate::M10, "10 MSPS"), (Rate::M12, "12 MSPS")])) {
+                    let rate_hint = if crate::hydra::board() == crate::hydra::Board::Pluto {
+                        "61.44 MSPS: steps up to 50 MHz (the noise floor stays within 1 dB over 40), the fastest sweep.\n30.72 MSPS: steps up to 25 MHz, bins half as wide."
+                    } else {
+                        "10 MSPS: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.\n12 MSPS: 24 MSPS real, tuner filter wide open, steps up to 10 MHz, about a third more GHz/s."
+                    };
+                    let rates = crate::hydra::board().rates();
+                    if rates.len() > 1 {
+                        let opts: Vec<(Rate, &str)> = rates.iter().map(|&r| (r, r.label())).collect();
+                        if theme::row_hint(ui, "Rate", rate_hint, |ui| theme::segmented(ui, &mut rate, &opts)) {
                             self.cfg.set_rate(rate);
                         }
                     } else {
-                        let only = if self.cfg.rate.complex() {
+                        let only = if self.cfg.rate.sliced() {
                             "The HackRF firmware's sweep rate: 20 MSPS complex (8-bit IQ). Each tune gives two 5 MHz slices, either side of the tuner's DC.".to_string()
                         } else {
                             format!(
@@ -1260,7 +1273,7 @@ impl App {
                             )
                         };
                         theme::row_hint(ui, "Rate", &only, |ui| {
-                            ui.label(RichText::new(format!("{} MSPS", self.cfg.rate.msps())).size(theme::SM).color(INK));
+                            ui.label(RichText::new(self.cfg.rate.label()).size(theme::SM).color(INK));
                             false
                         });
                     }
@@ -1275,7 +1288,16 @@ impl App {
                         );
                     }
                     theme::slider_u8(ui, "Dwell", &mut self.cfg.dwell, &Slide::int(1.0, 8.0, 1.0, "blk"));
-                    if !complex && !host {
+                    if self.cfg.rate.iq16() {
+                        theme::slider_u8(ui, "Settle", &mut self.cfg.skip, &Slide::int(0.0, 8.0, 0.0, "blk"));
+                        theme::caption(
+                            ui,
+                            format!(
+                                "The board sweeps back and forth, so it never wraps. Dwell averages more blocks per step. Settle drops extra {:.0} µs blocks after each retune, on top of the two the board always drops.",
+                                self.cfg.rate.block_s() * 1e6
+                            ),
+                        );
+                    } else if !complex && !host {
                         theme::slider_u8(ui, "Lock reads", &mut self.cfg.lock_reads, &Slide::int(0.0, 3.0, 2.0, ""));
                         theme::slider_u8(ui, "Settle", &mut self.cfg.skip, &Slide::int(0.0, 8.0, 0.0, "blk"));
                         theme::caption(ui, &format!("Dwell averages more blocks per step (less noise, slower). Settle discards extra {:.0} µs blocks after lock.", self.cfg.rate.block_s() * 1e6));
@@ -1297,7 +1319,12 @@ impl App {
                     Gain::Sensitivity(_) => 1,
                     Gain::Manual { .. } => 2,
                 };
-                let gain_hint = "Linearity 10 keeps FM and TV out of clipping. Gain and port changes stop the sweep for a moment (the firmware refuses tuner commands mid-sweep). The bias tee stays off.";
+                let pluto = crate::hydra::board() == crate::hydra::Board::Pluto;
+                let gain_hint = if pluto {
+                    "The Pluto has one manual RX gain (0–71 dB): every mode here sets it, Gain 10 is 34 dB. It changes mid-sweep without stopping."
+                } else {
+                    "Linearity 10 keeps FM and TV out of clipping. Gain and port changes stop the sweep for a moment (the firmware refuses tuner commands mid-sweep). The bias tee stays off."
+                };
                 if theme::row_hint(ui, "Gain mode", gain_hint, |ui| theme::segmented(ui, &mut mode, &[(0, "Linearity"), (1, "Sensitivity"), (2, "Manual")])) {
                     self.cfg.gain = match mode {
                         0 => Gain::Linearity(10),
@@ -1314,6 +1341,9 @@ impl App {
                         theme::slider_u8(ui, "Mixer", mixer, &Slide::int(0.0, 15.0, 8.0, ""));
                         theme::slider_u8(ui, "VGA", vga, &Slide::int(0.0, 15.0, 8.0, ""));
                     }
+                }
+                if pluto {
+                    theme::caption(ui, format!("{} dB of RX gain on the AD936x.", crate::pluto::gain_db(self.cfg.gain)));
                 }
             });
             ui.add_space(gap);
@@ -1435,6 +1465,7 @@ impl App {
     fn footer(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
             let src = match &self.src {
+                Src::Device(d) if crate::hydra::board().networked() => format!("{} · {}", d.version(), d.lib_path().display()),
                 Src::Device(d) => format!("{} · {} · {} · rev {}", d.version(), if self.serial == 0 { format!("first {}", crate::hydra::board().name()) } else { format!("{:016X}", self.serial) }, d.lib_path().display(), d.fw_revision()),
                 Src::Sim(_) => "Simulator".to_string(),
                 Src::Offline(_) => format!("{} not open", crate::hydra::board().name()),
@@ -2644,8 +2675,10 @@ impl App {
                     self.toast(format!("Step {} MHz", fmt_trim(self.cfg.step_mhz, 1)), false);
                 }
                 Key::M if crate::hydra::board().rates().len() > 1 => {
-                    self.cfg.set_rate(if self.cfg.rate == Rate::M10 { Rate::M12 } else { Rate::M10 });
-                    self.toast(format!("{} MSPS, {} MHz steps", self.cfg.rate.msps(), fmt_trim(self.cfg.step_mhz, 1)), false);
+                    let rates = crate::hydra::board().rates();
+                    let i = rates.iter().position(|&r| r == self.cfg.rate).unwrap_or(0);
+                    self.cfg.set_rate(rates[(i + 1) % rates.len()]);
+                    self.toast(format!("{}, {} MHz steps", self.cfg.rate.label(), fmt_trim(self.cfg.step_mhz, 1)), false);
                 }
                 Key::O => {
                     self.cfg.order = if self.cfg.order == Order::VcoContinuous { Order::Ascending } else { Order::VcoContinuous };
@@ -2892,8 +2925,8 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
         Src::Sim(_) => println!("simulator"),
     }
     println!(
-        "plan: {:.3}–{:.3} MHz, {} MSPS, {} steps × {} MHz, {:?}, dwell {}, lock reads {}, bins {:.2} kHz",
-        plan.start_hz / 1e6, plan.stop_hz / 1e6, plan.rate.msps(), plan.n_steps, plan.step_hz as f64 / 1e6, plan.order, plan.dwell, plan.lock_reads, dsp::bin_hz(cfg.nfft, plan.rate) / 1e3
+        "plan: {:.3}–{:.3} MHz, {}, {} steps × {} MHz, {:?}, dwell {}, lock reads {}, bins {:.2} kHz",
+        plan.start_hz / 1e6, plan.stop_hz / 1e6, plan.rate.label(), plan.n_steps, plan.step_hz as f64 / 1e6, plan.order, plan.dwell, plan.lock_reads, dsp::bin_hz(cfg.nfft, plan.rate) / 1e3
     );
     let t0 = Instant::now();
     let mut next = 1.0;
@@ -3010,7 +3043,7 @@ fn mode_change((a, na): &(Plan, usize), (b, nb): &(Plan, usize), cfg: &Config) -
         parts.push(PROFILES[i].name.to_string());
     } else {
         if a.rate != b.rate {
-            parts.push(format!("{} MSPS", b.rate.msps()));
+            parts.push(b.rate.label().to_string());
         }
         if a.step_hz != b.step_hz {
             parts.push(format!("{} MHz steps", fmt_trim(b.step_hz as f64 / 1e6, 2)));
@@ -3227,6 +3260,7 @@ fn connect_label() -> &'static str {
         crate::hydra::Board::Airspy => "Connect the Airspy R2",
         crate::hydra::Board::Mini => "Connect the Airspy Mini",
         crate::hydra::Board::HackRF => "Connect the HackRF",
+        crate::hydra::Board::Pluto => "Connect the Pluto",
     }
 }
 

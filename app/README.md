@@ -20,6 +20,7 @@ cargo run --release -- --range 400:470 --order asc
 cargo run --release -- --msps 10                 # the older 10 MSPS setting (8 MHz steps)
 cargo run --release -- --headless 10 --csv /tmp/spectrum.csv   # no window: rates, seam ripple, CSV
 cargo run --release -- --board airspy   # an Airspy R2 (--board mini, --board hackrf)
+cargo run --release -- --pluto 192.168.1.50         # a Pluto+ or PlutoSDR running corvus-pluto
 cargo run --release -- --usb lib        # through the board's C library instead (see below)
 build/build.sh windows                  # corvus-sweep.exe for Windows (MinGW, in Docker)
 ```
@@ -30,7 +31,7 @@ libhackrf, ported one for one. One binary, nothing to install, the same on Linux
 side by side against each library on an RFOne, an R2, a Mini and a HackRF: the same noise floor
 (within 0.1 dB), the same signal levels within run-to-run drift, the same steps/s, no integrity issues,
 in firmware and PC-driven sweeps; `cargo test --release -- --ignored real_boards` (with
-`CORVUS_TEST_SERIALS`) drives each board through gain changes, pause/resume, replans and reopening.
+`CORVUS_TEST_SERIALS`; a Pluto as `pluto:<host>`) drives each board through gain changes, pause/resume, replans and reopening.
 `--usb lib` (or `CORVUS_USB=lib`) uses the board's C library instead: libhydrasdr or libairspy with the
 Corvus sweep API (`../host/build/build.sh linux` / `airspy-linux`), or the system libhackrf.
 
@@ -47,13 +48,24 @@ the other boards, from 1 MHz to 6 GHz. While it's open, the PortaPack's screen (
 turned off, because it redraws the frequency on every retune; the RF amp and the antenna port power
 stay off. Gain presets and the manual sliders map onto the HackRF's LNA (0–40 dB) and VGA (0–62 dB).
 
+`--pluto HOST[:PORT]` (or `CORVUS_PLUTO`, or `--board pluto` for 192.168.2.1, a Pluto's own USB network
+link) drives a **Pluto+ or PlutoSDR** through `corvus-pluto`, a small program on the board
+(`../firmware/pluto/`, installed with its `install.sh`). The board retunes, captures and tags the blocks
+itself, two words per 12-bit IQ sample, and serves them over TCP; Corvus Sweep only sends the plan and
+the gain (`src/pluto.rs`). 61.44 MSPS (steps up to 50 MHz, 40 by default) or 30.72 MSPS (up to 25 MHz),
+70 MHz to 6 GHz, passes back and forth (no wrap). Every gain mode sets the AD936x's one manual gain
+(0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. The bins
+around DC are bridged from their neighbours. Over 70–6000 MHz on a Pluto+ over Ethernet: about 450 steps
+a second, 17–19 GHz/s, 3 passes a second. A Pluto seen on USB shows in the device picker; one given by
+address shows there too.
+
 **Stock RFOne and Airspy firmware** (no Corvus sweep mode) gets a PC-driven sweep automatically: the
 app retunes with `set_freq`, skips two USB transfers for settling, and tags the next blocks itself, in
 the same order and format as the firmware. It runs at 30–60 steps a second, which the status bar
 explains. `--host-sweep` forces it on Corvus firmware too, for comparison.
 
-Other options: `--board rfone|airspy|mini|hackrf` (or `CORVUS_BOARD`), `--host-sweep`, `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
-`--msps 10|12`, `--step MHZ`, `--bin-khz K`, `--profile NAME`, `--fresh` (ignore saved settings);
+Other options: `--board rfone|airspy|mini|hackrf|pluto` (or `CORVUS_BOARD`), `--pluto HOST` (or `CORVUS_PLUTO`), `--host-sweep`, `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
+`--msps 10|12|61|31`, `--step MHZ`, `--bin-khz K`, `--profile NAME`, `--fresh` (ignore saved settings);
 `--help` lists them all. Settings persist between runs via eframe storage
 (`~/.local/share/corvus-sweep/`). The learned passband correction is stored in
 `~/.cache/corvus-sweep/`.
@@ -240,6 +252,7 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 | `src/hydra.rs` | libloading FFI to libhydrasdr/libairspy, block tags, `Device` (open, configure, sweep, stop → set → start) |
 | `src/usbdev.rs` | the built-in USB driver for every board (libhydrasdr's, libairspy's and libhackrf's requests in Rust, nusb), and board discovery on any platform |
 | `src/hackrf.rs` | the HackRF's stock sweep: setup and re-tagging its blocks as 5 MHz steps (built-in driver or libhackrf) |
+| `src/pluto.rs` | the Pluto over the network: corvus-pluto's protocol (plan, gain, stop), its blocks into the engine |
 | `build/` | `build.sh windows`: the Windows cross-build (MinGW in Docker) |
 | `src/plan.rs` | sample rate, range → step grid, firmware visiting order, VCO divider model, presets |
 | `src/dsp.rs` | raw block → dBFS power on the RF offset grid (rustfft, Hann, Welch) |
@@ -251,7 +264,7 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 | `assets/fonts/` | Barlow, Barlow Semi Condensed, Auggie Mono (SIL OFL), compiled in |
 | `DESIGN.md` | how the UI follows the auggiesoft guide, and its exceptions |
 
-`cargo test` runs offline checks: tag parsing, tone placement and level at every FFT size and both rates,
+`cargo test` runs offline checks: tag parsing, tone placement and level at every FFT size and rate (the Pluto's DC bridge too),
 plan geometry, divider switch points (and their 1 MHz shift at 12 MSPS) and transitions, and the worker's
 stitching and pass counting.
 

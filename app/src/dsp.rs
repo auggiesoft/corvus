@@ -3,7 +3,9 @@
 //! R82x boards: the block is real-valued at the ADC rate (12, 20 or 24 MSPS) with the IF at a quarter of
 //! it, and the spectrum is inverted: RF offset = -(f_if - IF). HackRF: each word is one 8-bit IQ sample
 //! (I in the low byte) at 20 MSPS around the tune's LO; a step is the slice 5 MHz below the LO (side 0)
-//! or 5 MHz above it (side 1). Samples are words 8..8184 either way.
+//! or 5 MHz above it (side 1). Samples are words 8..8184 either way. Pluto: each sample is two words, I then
+//! Q (12-bit, sign-extended), 4088 of them, at 61.44 or 30.72 MSPS around the tune's LO; the few bins
+//! around DC (the residual LO leakage) are bridged from their neighbours.
 
 use std::sync::Arc;
 
@@ -14,6 +16,16 @@ use crate::hydra::{BLOCK_WORDS, TAG_WORDS};
 use crate::plan::Rate;
 
 pub const N_SAMPLES: usize = BLOCK_WORDS - 2 * TAG_WORDS;
+
+/// Samples in a block's payload at this rate.
+pub fn n_samples(rate: Rate) -> usize {
+    if rate.iq16() { (BLOCK_WORDS - 2 * TAG_WORDS) / 2 } else { N_SAMPLES }
+}
+
+/// Pluto: bins this close to DC are bridged (the residual LO leakage after the AD936x's DC tracking).
+fn dc_notch_hz(nfft: usize, rate: Rate) -> f64 {
+    1.6 * bin_hz(nfft, rate)
+}
 /// FFT sizes offered as resolution choices. Below 8192, Welch-averaged (50 % overlap) over the block.
 pub const NFFTS: [usize; 5] = [8192, 4096, 2048, 1024, 512];
 /// Largest |offset| kept on the grid: a little beyond the widest usable step.
@@ -33,11 +45,13 @@ pub fn grid(nfft: usize, rate: Rate) -> Vec<(f64, usize)> {
     let df = bin_hz(nfft, rate);
     let half = grid_half_hz(rate);
     if rate.complex() {
-        // side 0: the step's centre is 5 MHz below the LO, so offset = bin frequency + 5 MHz
+        // HackRF side 0: the step's centre is 5 MHz below the LO, so offset = bin frequency + 5 MHz.
+        // Pluto: the step is centred on the LO.
+        let shift = if rate.sliced() { HACKRF_SLICE_HZ } else { 0.0 };
         let mut g: Vec<(f64, usize)> = (0..nfft)
             .map(|k| {
                 let f = if k < nfft / 2 { k as f64 } else { k as f64 - nfft as f64 } * df;
-                (f + HACKRF_SLICE_HZ, k)
+                (f + shift, k)
             })
             .filter(|(off, _)| off.abs() <= half)
             .collect();
@@ -60,6 +74,10 @@ pub fn window(grid_off: &[f64], width_hz: f64) -> std::ops::Range<usize> {
 pub struct Dsp {
     pub nfft: usize,
     pub rate: Rate,
+    /// Samples per block payload (8176, or 4088 for the Pluto's two-word IQ).
+    n: usize,
+    /// Pluto: grid indices whose bins sit on DC (bridged from their neighbours).
+    dc: std::ops::Range<usize>,
     fft: Arc<dyn Fft<f32>>,
     win: Vec<f32>,
     seg_len: usize,
@@ -81,9 +99,10 @@ pub struct Dsp {
 
 impl Dsp {
     pub fn new(nfft: usize, rate: Rate) -> Dsp {
-        let seg_len = nfft.min(N_SAMPLES);
+        let n = n_samples(rate);
+        let seg_len = nfft.min(n);
         let hop = (seg_len / 2).max(1);
-        let n_seg = if seg_len == N_SAMPLES { 1 } else { (N_SAMPLES - seg_len) / hop + 1 };
+        let n_seg = if seg_len == n { 1 } else { (n - seg_len) / hop + 1 };
         let win: Vec<f32> = (0..seg_len)
             .map(|i| {
                 let a = std::f64::consts::TAU * i as f64 / (seg_len - 1) as f64;
@@ -93,7 +112,9 @@ impl Dsp {
         let sum: f64 = win.iter().map(|&w| w as f64).sum();
         // A full-scale real tone (amplitude 2048 counts) reads 0 dBFS in its bin; a full-scale complex
         // tone (amplitude 128) likewise.
-        let scale = if rate.complex() {
+        let scale = if rate.iq16() {
+            ((1.0 / (sum * 2048.0)).powi(2) / n_seg as f64) as f32
+        } else if rate.complex() {
             ((1.0 / (sum * 128.0)).powi(2) / n_seg as f64) as f32
         } else {
             ((2.0 / (sum * 2048.0)).powi(2) / n_seg as f64) as f32
@@ -101,9 +122,18 @@ impl Dsp {
         let fft = FftPlanner::new().plan_fft_forward(nfft);
         let scratch = vec![Complex32::default(); fft.get_inplace_scratch_len()];
         let grid = grid(nfft, rate);
+        let dc = if rate.iq16() {
+            let h = dc_notch_hz(nfft, rate);
+            let lo = grid.partition_point(|g| g.0 < -h);
+            lo..grid.partition_point(|g| g.0 <= h)
+        } else {
+            0..0
+        };
         Dsp {
             nfft,
             rate,
+            n,
+            dc,
             fft,
             win,
             seg_len,
@@ -112,8 +142,8 @@ impl Dsp {
             scale,
             buf: vec![Complex32::default(); nfft],
             scratch,
-            x: vec![0.0; N_SAMPLES],
-            xi: if rate.complex() { vec![Complex32::default(); N_SAMPLES] } else { Vec::new() },
+            x: if rate.complex() { Vec::new() } else { vec![0.0; n] },
+            xi: if rate.complex() { vec![Complex32::default(); n] } else { Vec::new() },
             grid_k: grid.iter().map(|g| g.1).collect(),
             grid_k_hi: grid.iter().map(|g| (g.1 + nfft / 2) % nfft).collect(),
             grid_off: grid.iter().map(|g| g.0).collect(),
@@ -133,6 +163,9 @@ impl Dsp {
     /// Power (linear, dBFS scale) of one block on grid[range] into `out`. `side` picks the HackRF slice
     /// (0 below the LO, 1 above); the R82x boards ignore it.
     pub fn power(&mut self, words: &[u16], range: std::ops::Range<usize>, out: &mut [f32], side: u8) {
+        if self.rate.iq16() {
+            return self.power_iq16(words, range, out);
+        }
         if self.rate.complex() {
             return self.power_iq(words, range, out, side);
         }
@@ -142,7 +175,7 @@ impl Dsp {
             *x = (w & 0x0FFF) as f32;
             mean += *x;
         }
-        mean /= N_SAMPLES as f32;
+        mean /= self.n as f32;
         out.iter_mut().for_each(|o| *o = 0.0);
         for seg in 0..self.n_seg {
             let x = &self.x[seg * self.hop..seg * self.hop + self.seg_len];
@@ -164,7 +197,7 @@ impl Dsp {
             *x = Complex32::new((w & 0xFF) as u8 as i8 as f32, (w >> 8) as u8 as i8 as f32);
             mean += *x;
         }
-        mean /= N_SAMPLES as f32;
+        mean /= self.n as f32;
         let ks = if side == 0 { &self.grid_k[range.clone()] } else { &self.grid_k_hi[range.clone()] };
         out.iter_mut().for_each(|o| *o = 0.0);
         for seg in 0..self.n_seg {
@@ -178,6 +211,41 @@ impl Dsp {
             }
         }
         out.iter_mut().for_each(|o| *o *= self.scale);
+    }
+
+    /// The Pluto's blocks: I, Q word pairs (12-bit, sign-extended), centred on the LO, DC bridged.
+    fn power_iq16(&mut self, words: &[u16], range: std::ops::Range<usize>, out: &mut [f32]) {
+        let s = &words[TAG_WORDS..BLOCK_WORDS - TAG_WORDS];
+        let mut mean = Complex32::default();
+        for (x, w) in self.xi.iter_mut().zip(s.as_chunks::<2>().0) {
+            *x = Complex32::new(w[0] as i16 as f32, w[1] as i16 as f32);
+            mean += *x;
+        }
+        mean /= self.n as f32;
+        out.iter_mut().for_each(|o| *o = 0.0);
+        for seg in 0..self.n_seg {
+            let x = &self.xi[seg * self.hop..seg * self.hop + self.seg_len];
+            for (i, b) in self.buf.iter_mut().enumerate() {
+                *b = if i < self.seg_len { (x[i] - mean) * self.win[i] } else { Complex32::default() };
+            }
+            self.fft.process_with_scratch(&mut self.buf, &mut self.scratch);
+            for (o, &k) in out.iter_mut().zip(&self.grid_k[range.clone()]) {
+                *o += self.buf[k].norm_sqr();
+            }
+        }
+        out.iter_mut().for_each(|o| *o *= self.scale);
+        // bridge the DC bins that fall inside this range, from the nearest bins outside the notch
+        let (a, b) = (self.dc.start.max(range.start), self.dc.end.min(range.end));
+        if a < b {
+            let left = (self.dc.start > range.start).then(|| out[self.dc.start - 1 - range.start]);
+            let right = (self.dc.end < range.end).then(|| out[self.dc.end - range.start]);
+            let v = match (left, right) {
+                (Some(l), Some(r)) => 0.5 * (l + r),
+                (Some(x), None) | (None, Some(x)) => x,
+                (None, None) => return,
+            };
+            out[a - range.start..b - range.start].iter_mut().for_each(|o| *o = v);
+        }
     }
 }
 
@@ -239,6 +307,57 @@ mod tests {
                 let db = 10.0 * max.log10();
                 // -6 dBFS tone (64 of 128); Hann scalloping up to 1.4 dB, plus 8-bit rounding
                 assert!((-7.8..=-5.5).contains(&db), "nfft {nfft}: {db} dBFS");
+            }
+        }
+    }
+
+    /// A Pluto block (I, Q word pairs) holding a complex tone `lo_off` Hz from the LO, plus a DC offset.
+    fn pluto_tone_block(lo_off: f64, amp: f64, rate: Rate, dc: f64) -> Vec<u16> {
+        let mut w = vec![0u16; BLOCK_WORDS];
+        for n in 0..BLOCK_WORDS / 2 {
+            let ph = std::f64::consts::TAU * lo_off / rate.adc_hz() * n as f64;
+            w[2 * n] = (dc + amp * ph.cos()).round() as i16 as u16;
+            w[2 * n + 1] = (dc + amp * ph.sin()).round() as i16 as u16;
+        }
+        w
+    }
+
+    #[test]
+    fn pluto_tone_lands_on_its_offset_at_the_right_level() {
+        for rate in [Rate::P61, Rate::P31] {
+            for nfft in NFFTS {
+                let mut d = Dsp::new(nfft, rate);
+                let r = d.window(rate.max_window_hz());
+                let mut p = vec![0.0; r.len()];
+                for off in [7_654_321.0, -0.46 * rate.max_window_hz(), 0.31 * rate.max_window_hz()] {
+                    d.power(&pluto_tone_block(off, 1024.0, rate, 40.0), r.clone(), &mut p, 0);
+                    let (i, &max) = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+                    let got = d.grid_off[r.start + i];
+                    assert!((got - off).abs() <= bin_hz(nfft, rate), "{rate:?} nfft {nfft}: {got} vs {off}");
+                    let db = 10.0 * max.log10();
+                    assert!((-7.6..=-5.8).contains(&db), "{rate:?} nfft {nfft}: {db} dBFS");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pluto_dc_is_bridged() {
+        let rate = Rate::P61;
+        for nfft in NFFTS {
+            let mut d = Dsp::new(nfft, rate);
+            let r = d.window(rate.max_window_hz());
+            let mut p = vec![0.0; r.len()];
+            // LO leakage just off DC (the mean doesn't remove it)
+            d.power(&pluto_tone_block(1.5e3, 200.0, rate, 0.0), r.clone(), &mut p, 0);
+            let off = &d.grid_off[r];
+            let h = dc_notch_hz(nfft, rate);
+            let inside: Vec<f32> = p.iter().zip(off).filter(|(_, o)| o.abs() <= h).map(|(v, _)| *v).collect();
+            assert!(!inside.is_empty(), "nfft {nfft}: no DC bins");
+            let first = off.iter().position(|o| o.abs() <= h).unwrap();
+            let (l, r) = (p[first - 1], p[first + inside.len()]);
+            for v in &inside {
+                assert!((v - 0.5 * (l + r)).abs() <= 1e-6 * (l + r), "nfft {nfft}: DC bin {v} not bridged from {l}, {r}");
             }
         }
     }

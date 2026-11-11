@@ -10,6 +10,7 @@ mod engine;
 mod hackrf;
 mod hydra;
 mod plan;
+mod pluto;
 mod sim;
 mod theme;
 mod usbdev;
@@ -70,10 +71,13 @@ fn install_signal_handlers() {
 const USAGE: &str = "\
 corvus-sweep [options]
 
-  --board rfone|airspy|mini|hackrf  which board (default: env CORVUS_BOARD, else the first
-                        one plugged in, else rfone):
+  --board rfone|airspy|mini|hackrf|pluto  which board (default: env CORVUS_BOARD, else the
+                        first one plugged in, else rfone):
                         airspy is the Airspy R2 (10 MSPS), mini the Airspy Mini (6 MSPS),
-                        hackrf a HackRF One (stock firmware sweep, 1 MHz to 6 GHz)
+                        hackrf a HackRF One (stock firmware sweep, 1 MHz to 6 GHz),
+                        pluto a PlutoSDR or Pluto+ running corvus-pluto (70 MHz to 6 GHz)
+  --pluto HOST[:PORT]   the Pluto's address (implies --board pluto; default: env
+                        CORVUS_PLUTO, else 192.168.2.1, its USB network link; port 30433)
   --3d                  start with the 3D waterfall
   --host-sweep          RFOne/Airspy: let the PC retune each step even on Corvus firmware
                         (what stock firmware gets automatically; much slower)
@@ -92,8 +96,9 @@ corvus-sweep [options]
   --headless SECS       no window: sweep for SECS, print rates and seam ripple, then exit
   --csv PATH            with --headless: write the stitched spectrum as CSV
   --bin-khz K           bin width: 2.4, 4.9, 9.8, 19.5 or 39 kHz at 10 MSPS (x1.2 at 12)
-  --msps 10|12          sample rate (default 12: 24 MSPS real, wider steps)
-  --step MHZ            step size (default 10 at 12 MSPS, 8 at 10 MSPS)
+  --msps 10|12|61|31    sample rate (default 12: 24 MSPS real, wider steps; the Pluto:
+                        61 = 61.44 MSPS, the default, or 31 = 30.72 MSPS)
+  --step MHZ            step size (default 10 at 12 MSPS, 8 at 10 MSPS, 40 at 61.44)
   --profile NAME        scan profile: fastest, quality, weak or bursts
                         (sets rate, step, dwell, lock reads, settle; later options override it)
   --screenshot PATH     save a PNG of the window after --after seconds, then exit
@@ -134,7 +139,12 @@ fn main() -> eframe::Result {
             "--3d" => opts.overrides.push(Box::new(|c| c.wf3d = true)),
             "--lib" => lib = Some(PathBuf::from(val("--lib"))),
             "--board" => {
-                board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini|hackrf"));
+                board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini|hackrf|pluto"));
+                board_given = true;
+            }
+            "--pluto" => {
+                pluto::set_addr(&val("--pluto"));
+                board = hydra::Board::Pluto;
                 board_given = true;
             }
             "--serial" => {
@@ -173,7 +183,9 @@ fn main() -> eframe::Result {
                     "10" => plan::Rate::M10,
                     "12" => plan::Rate::M12,
                     "6" => plan::Rate::M6,
-                    _ => die("--msps 10|12|6"),
+                    "61" | "61.44" => plan::Rate::P61,
+                    "31" | "30.72" => plan::Rate::P31,
+                    _ => die("--msps 10|12|6|61|31"),
                 };
                 opts.overrides.push(Box::new(move |c| c.set_rate(r)));
             }

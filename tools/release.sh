@@ -20,10 +20,12 @@ echo "== Corvus Sweep"
 (cd "$R/app" && cargo build --release --locked)
 echo "== Corvus Sweep for Windows"
 "$R/app/build/build.sh" windows
+echo "== corvus-pluto (the Pluto's on-board sweep, ARMv7 static)"
+"$R/firmware/pluto/build.sh"
 
 notice() { # what the archive holds and where its source and licences are
   cat <<EOF
-Corvus $VER (unofficial; not affiliated with, endorsed by or supported by HydraSDR or Airspy)
+Corvus $VER (unofficial; not affiliated with, endorsed by or supported by HydraSDR, Airspy, Great Scott Gadgets or Analog Devices)
 Source for everything in this archive: $SRC_URL
 
 Licences:
@@ -72,6 +74,14 @@ cp "$R/app/target/x86_64-pc-windows-gnu/release/corvus-sweep-stripped.exe" "$S/$
 cp "$R/app/README.md" "$S/$WA/README-corvus-sweep.md"
 licences "$S/$WA"
 (cd "$S" && python3 -m zipfile -c "$OUT/$WA.zip" "$WA")
+# corvus-pluto: the sweep program for a Pluto (runs on the board), with its install script
+P=corvus-pluto-$VER-armv7
+mkdir -p "$S/$P"
+cp "$R/firmware/pluto/target/armv7-unknown-linux-musleabihf/release/corvus-pluto" "$R/firmware/pluto/install.sh" "$S/$P/"
+cp "$R/firmware/pluto/README.md" "$S/$P/README-corvus-pluto.md"
+cp "$R/LICENSE" "$S/$P/LICENSE"
+tar -C "$S" -czf "$OUT/$P.tar.gz" "$P"
+
 # host libraries and tools for Linux (libhydrasdr + hydrasdr_* tools, libairspy + airspy_* tools)
 H=corvus-host-$VER-linux-x86_64
 mkdir -p "$S/$H/hydrasdr" "$S/$H/airspy"

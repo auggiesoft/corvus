@@ -27,6 +27,8 @@ pub enum Board {
     Mini,
     /// HackRF One, with its stock firmware sweep (libhackrf): 1 MHz to 6 GHz.
     HackRF,
+    /// PlutoSDR family (ADALM-Pluto, Pluto+), over the network to corvus-pluto on the board: 70 MHz to 6 GHz.
+    Pluto,
 }
 
 impl Board {
@@ -36,6 +38,7 @@ impl Board {
             "airspy" | "r2" => Some(Board::Airspy),
             "mini" | "airspy-mini" => Some(Board::Mini),
             "hackrf" => Some(Board::HackRF),
+            "pluto" | "plutoplus" | "pluto+" => Some(Board::Pluto),
             _ => None,
         }
     }
@@ -47,7 +50,13 @@ impl Board {
             Board::Airspy => "Airspy R2",
             Board::Mini => "Airspy Mini",
             Board::HackRF => "HackRF One",
+            Board::Pluto => "Pluto",
         }
+    }
+
+    /// Reached over the network rather than USB (no library, no serial).
+    pub fn networked(self) -> bool {
+        self == Board::Pluto
     }
 
     fn prefix(self) -> &'static str {
@@ -55,6 +64,7 @@ impl Board {
             Board::RFOne => "hydrasdr_",
             Board::Airspy | Board::Mini => "airspy_",
             Board::HackRF => "hackrf_",
+            Board::Pluto => "",
         }
     }
 
@@ -70,6 +80,7 @@ impl Board {
             Board::Airspy => &[Rate::M10],
             Board::Mini => &[Rate::M6],
             Board::HackRF => &[Rate::H20],
+            Board::Pluto => &[Rate::P61, Rate::P31],
         }
     }
 
@@ -82,6 +93,7 @@ impl Board {
             Board::RFOne => "libhydrasdr.so.1.1.4",
             Board::Airspy | Board::Mini => "libairspy.so.1.0.10",
             Board::HackRF => "libhackrf.so.0",
+            Board::Pluto => "",
         }
     }
 
@@ -91,6 +103,7 @@ impl Board {
             Board::RFOne => os.to_string(),
             Board::Airspy | Board::Mini => format!("airspy-{os}"),
             Board::HackRF => format!("hackrf-{os}"), // not built here: the system libhackrf is used
+            Board::Pluto => "none".into(),
         };
         format!("../host/build/out/{dir}/{}", self.lib_file())
     }
@@ -101,6 +114,7 @@ impl Board {
             Board::RFOne => "libhydrasdr.so.1",
             Board::Airspy | Board::Mini => "libairspy.so.0",
             Board::HackRF => "libhackrf.so.0",
+            Board::Pluto => "",
         }
     }
 
@@ -111,6 +125,7 @@ impl Board {
             Board::Airspy => "airspy-",
             Board::Mini => "airspy-mini-",
             Board::HackRF => "hackrf-",
+            Board::Pluto => "pluto-",
         }
     }
 }
@@ -139,7 +154,12 @@ pub struct Found {
 
 /// Boards on USB, by vendor/product ID and serial string (any platform).
 pub fn list_devices() -> Vec<Found> {
-    crate::usbdev::list()
+    let mut found = crate::usbdev::list();
+    // a Pluto given by address (--pluto, CORVUS_PLUTO) may not be on this PC's USB at all
+    if crate::pluto::addr_given() && !found.iter().any(|f| f.board == Board::Pluto) {
+        found.push(Found { board: Board::Pluto, serial: 0, label: "Pluto".into() });
+    }
+    found
 }
 
 /// CORVUS_BOARD if it names a board.
@@ -504,16 +524,18 @@ pub(crate) fn native_for(_board: Board, _lib_path: &Path) -> bool {
     *USB_MODE.lock() == UsbMode::Native
 }
 
-/// The open board: an R82x board (RFOne or Airspy; firmware or PC-driven sweep) or a HackRF.
+/// The open board: an R82x board (RFOne or Airspy; firmware or PC-driven sweep), a HackRF or a Pluto.
 pub enum Device {
     R82x(R82xDevice),
     HackRF(crate::hackrf::HackrfDevice),
+    Pluto(crate::pluto::PlutoDevice),
 }
 
 impl Device {
     pub fn open(lib_path: &Path, serial: u64, sink: Sink, rx: RxSettings, rate: Rate) -> Result<Device, String> {
         match board() {
             Board::HackRF => crate::hackrf::HackrfDevice::open(lib_path, serial, sink, rx).map(Device::HackRF),
+            Board::Pluto => crate::pluto::PlutoDevice::open(sink, rx).map(Device::Pluto),
             _ => R82xDevice::open(lib_path, serial, sink, rx, rate).map(Device::R82x),
         }
     }
@@ -522,13 +544,14 @@ impl Device {
         match self {
             Device::R82x(d) => &d.version,
             Device::HackRF(d) => &d.version,
+            Device::Pluto(d) => &d.version,
         }
     }
 
     pub fn fw_revision(&self) -> i32 {
         match self {
             Device::R82x(d) => d.fw_revision,
-            Device::HackRF(_) => 0,
+            Device::HackRF(_) | Device::Pluto(_) => 0,
         }
     }
 
@@ -536,6 +559,7 @@ impl Device {
         match self {
             Device::R82x(d) => &d.lib_path,
             Device::HackRF(d) => &d.lib_path,
+            Device::Pluto(d) => &d.lib_path,
         }
     }
 
@@ -548,6 +572,7 @@ impl Device {
         match self {
             Device::R82x(d) => d.sweep(plan),
             Device::HackRF(d) => d.sweep(plan),
+            Device::Pluto(d) => d.sweep(plan),
         }
     }
 
@@ -555,6 +580,7 @@ impl Device {
         match self {
             Device::R82x(d) => d.set_rx(rx),
             Device::HackRF(d) => d.set_rx(rx),
+            Device::Pluto(d) => d.set_rx(rx),
         }
     }
 
@@ -562,6 +588,7 @@ impl Device {
         match self {
             Device::R82x(d) => d.pause(),
             Device::HackRF(d) => d.pause(),
+            Device::Pluto(d) => d.pause(),
         }
     }
 
@@ -569,6 +596,7 @@ impl Device {
         match self {
             Device::R82x(d) => d.resume(),
             Device::HackRF(d) => d.resume(),
+            Device::Pluto(d) => d.resume(),
         }
     }
 }
@@ -977,7 +1005,8 @@ mod tests {
 
     /// On real boards, through the built-in driver: sweep, change gain mid-sweep, pause and resume, change
     /// the plan (and the RFOne's rate), close and reopen, checking that tagged blocks keep coming.
-    /// `CORVUS_TEST_SERIALS=board:hex,...` (e.g. rfone:36B4...,airspy:7358...,hackrf:081c...);
+    /// `CORVUS_TEST_SERIALS=board:hex,...` (e.g. rfone:<serial>,airspy:<serial>,hackrf:<serial>; a Pluto
+    /// takes its address instead: pluto:<host>);
     /// run with `cargo test --release -- --ignored real_boards --nocapture`.
     #[test]
     #[ignore]
@@ -987,7 +1016,12 @@ mod tests {
         for item in list.split(',') {
             let (b, sn) = item.split_once(':').expect("board:serial");
             let board = Board::parse(b).expect("board");
-            let serial = u64::from_str_radix(sn.trim_start_matches("0x"), 16).expect("hex serial");
+            let serial = if board.networked() {
+                crate::pluto::set_addr(sn);
+                0
+            } else {
+                u64::from_str_radix(sn.trim_start_matches("0x"), 16).expect("hex serial")
+            };
             let rates = board.rates();
             let plan = |r: Rate, lo: f64, hi: f64| Plan::new(lo, hi, if r == Rate::H20 { 5.0 } else { r.max_window_hz() / 1e6 - 1.0 }, 1, 0, 2, Order::VcoContinuous, r);
             let blocks = |rx: &std::sync::mpsc::Receiver<Vec<u16>>, ms: u64| {
@@ -1017,7 +1051,7 @@ mod tests {
                 let r2 = *rates.last().unwrap();
                 d.sweep(&plan(r2, 400.0, 1000.0)).unwrap();
                 let p2 = blocks(&rx, 900);
-                eprintln!("{b} round {round} ({}): blocks {a} sweeping, {g} after a gain change, {paused} paused, {res} resumed, {p2} after a new plan at {} MSPS", d.version(), r2.msps());
+                eprintln!("{b} round {round} ({}): blocks {a} sweeping, {g} after a gain change, {paused} paused, {res} resumed, {p2} after a new plan at {}", d.version(), r2.label());
                 assert!(a > 50 && g > 50 && res > 50 && p2 > 50, "{b}: blocks stopped coming");
                 assert!(paused < 20, "{b}: still streaming while paused ({paused})");
                 drop(d);
