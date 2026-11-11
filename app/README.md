@@ -64,7 +64,9 @@ lowest rate that covers it, so the bins are the finest the span allows. The boar
 streams: ~3,800 updates/s at 61.44 and 30.72 MSPS (network-bound), and at 15.36 MSPS and below about 94 % of
 the signal captured, nearly gapless. Shift+arrows move it a span; L or Sweep goes back to the sweep it came
 from. Every gain mode sets the AD936x's one manual gain
-(0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. The bins
+(0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. **Input**
+(Receiver card, or `--port RX2`) picks RX1 or RX2 (corvus-pluto 0.2.3 on a board in 1R1T); switching restarts
+the sweep. The bins
 around DC are bridged from their neighbours. corvus-pluto 0.2 sweeps in **fast mode** where the board
 allows it (fastlock profiles over direct SPI; the device chip says "fast sweep", or "driver sweep" and why);
 `CORVUS_PLUTO_MODE=driver` asks for the driver path. Blocks arrive 12-bit packed and are unpacked into the

@@ -77,8 +77,8 @@ pub struct PlutoDevice {
     reader: Option<JoinHandle<()>>,
     plan: Option<Plan>,
     rx: RxSettings,
-    /// What the board was last configured with (rate, gain).
-    configured: Option<(Rate, i32)>,
+    /// What the board was last configured with (rate, gain, input 1 or 2).
+    configured: Option<(Rate, i32, u8)>,
     /// How the board sweeps ("fast", "driver"; empty before the first plan), and why not fast if it isn't.
     pub mode: Arc<parking_lot::Mutex<(String, String)>>,
     /// Set while a new plan is on its way: blocks are dropped until the board answers it.
@@ -234,9 +234,14 @@ impl PlutoDevice {
 
     fn configure(&mut self, rate: Rate) -> Result<(), String> {
         let g = gain_db(self.rx.gain);
-        if self.configured != Some((rate, g)) {
-            self.cmd(&format!("CONFIG rate={} bw={} gain={g}", rate.adc_hz() as u64, rf_bandwidth(rate)), Duration::from_secs(5))?;
-            self.configured = Some((rate, g));
+        let input = self.rx.port.min(1) + 1;
+        if self.configured != Some((rate, g, input)) {
+            // rx= from corvus-pluto 0.2.3; older boards ignore it and answer without it
+            let reply = self.cmd(&format!("CONFIG rate={} bw={} gain={g} rx={input}", rate.adc_hz() as u64, rf_bandwidth(rate)), Duration::from_secs(5))?;
+            if input == 2 && reply_value(&reply, "rx").as_deref() != Some("2") {
+                return Err("this corvus-pluto has RX1 only: update it (firmware/pluto/install.sh) for RX2".into());
+            }
+            self.configured = Some((rate, g, input));
         }
         Ok(())
     }
@@ -270,13 +275,20 @@ impl PlutoDevice {
         Ok(())
     }
 
-    /// The gain changes while the board sweeps.
+    /// The gain changes while the board sweeps; another input reconfigures the board and restarts the plan.
     pub fn set_rx(&mut self, rx: RxSettings) -> Result<(), String> {
+        let new_input = rx.port != self.rx.port;
         self.rx = rx;
+        if new_input {
+            return match self.plan.clone() {
+                Some(plan) => self.sweep(&plan),
+                None => Ok(()),
+            };
+        }
         let g = gain_db(rx.gain);
         self.cmd(&format!("GAIN {g}"), Duration::from_secs(2))?;
-        if let Some((rate, _)) = self.configured {
-            self.configured = Some((rate, g));
+        if let Some((rate, _, input)) = self.configured {
+            self.configured = Some((rate, g, input));
         }
         Ok(())
     }

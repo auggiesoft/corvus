@@ -44,6 +44,7 @@ const GT_START_CLOCK: u8 = 1 << 1;
 const GT_WRITE: u8 = 1 << 2;
 const GT_RX1_RX2: u8 = 3 << 3;
 const REG_RX1_MANUAL_GAIN: u16 = 0x109;
+pub const REG_RX2_MANUAL_GAIN: u16 = 0x10C;
 const REG_RX_VCO_LOCK: u16 = 0x247;
 const VCO_LOCK: u8 = 1 << 1;
 const REG_RX_FAST_LOCK_SETUP: u16 = 0x25A;
@@ -82,6 +83,8 @@ pub struct Spi {
     base: *mut u32,
     cr_kernel: u32,
     cr: u32,
+    /// The manual gain index register of the receiver in use (RX1's, or RX2's when that input is selected).
+    gain_reg: u16,
 }
 
 // The mapping is only touched from the sweep thread.
@@ -101,7 +104,7 @@ impl Spi {
             }
             let base = p as *mut u32;
             let cr = std::ptr::read_volatile(base.add(CR / 4));
-            Ok(Spi { base, cr_kernel: cr, cr: (cr & !(7 << 3)) | (SPI_DIV << 3) })
+            Ok(Spi { base, cr_kernel: cr, cr: (cr & !(7 << 3)) | (SPI_DIV << 3), gain_reg: REG_RX1_MANUAL_GAIN })
         }
     }
 
@@ -201,8 +204,8 @@ impl Spi {
     }
 
     fn set_gain_index(&self, index: u8) -> Result<(), String> {
-        let v = self.read_reg(REG_RX1_MANUAL_GAIN)?;
-        self.write_reg(REG_RX1_MANUAL_GAIN, (v & 0x80) | (index & 0x7F))
+        let v = self.read_reg(self.gain_reg)?;
+        self.write_reg(self.gain_reg, (v & 0x80) | (index & 0x7F))
     }
 
     fn locked(&self) -> Result<bool, String> {
@@ -407,6 +410,8 @@ pub trait Driver {
     fn rx(&self) -> &Path;
     /// A normal driver retune.
     fn tune(&self, hz: u64) -> Result<(), String>;
+    /// The RX input in use (1 or 2; 1R1T has one receiver on the data port at a time).
+    fn input(&self) -> u8;
     fn stop_capture(&mut self);
 }
 
@@ -485,6 +490,7 @@ impl Fast {
     /// ours, and open the capture blocks.
     pub fn take(d: &mut impl Driver, f0: u64, gain_db: i32, samples: usize) -> Result<Fast, String> {
         let phy = d.phy().to_path_buf();
+        let input = d.input();
         d.stop_capture();
         d.tune(f0)?;
         let w = |a: &str, v: &str| fs::write(phy.join(a), v).map_err(|e| format!("{a}: {e}"));
@@ -498,7 +504,8 @@ impl Fast {
             if spi_irqs() != a {
                 return Err("another program is using the radio (SPI traffic)".into());
             }
-            let spi = Spi::open()?;
+            let mut spi = Spi::open()?;
+            spi.gain_reg = if input == 2 { REG_RX2_MANUAL_GAIN } else { REG_RX1_MANUAL_GAIN };
             if !spi.idle() {
                 return Err("the SPI controller is busy".into());
             }

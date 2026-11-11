@@ -139,6 +139,27 @@ What runs when fast mode can't (`mode=driver`, or a board without the above):
 Both paths: manual gain, DC and quadrature tracking on, the TX LO powered down (its leakage lands in the RX
 band), RF bandwidth 56 MHz at 61.44 MSPS, 28 MHz at 30.72; 4088 IQ samples per block (66.5 µs at 61.44 MSPS).
 
+## RX1 and RX2
+
+In 1R1T the AD936x puts one receiver on the data port; `CONFIG ... rx=2` picks RX2 (corvus-pluto 0.2.3; the
+Pluto+ has both on SMA connectors). HELLO says `inputs=2` where it's offered: register access, and the chip
+in 1R1T (in 2R2T both receivers share the port and the rate tops out at 30.72 MSPS). The switch is the one
+Tezuka's `switch_rfinput.sh` makes: the driver's `adi,1rx-1tx-mode-use-rx-num` (debugfs), so it keeps RX2
+enabled when it rewrites the register, and the channel enables (register 0x003 bits 7:6), with no
+reinitialisation. In 1R1T the driver refuses gain for RX2, so corvus-pluto sets RX2 to manual gain itself
+(register 0x0FA bits 3:2) and writes its gain index (0x10C) from the same tables, again wherever the LO
+crosses into another gain-table band; fast mode writes 0x10C instead of 0x109.
+
+RX2 is switched in only while a plan runs, with the radio pollers paused, and RX1 is back (with RX2's own
+gain mode restored) before they resume: on STOP, CONFIG, an error or a disconnect. Other programs, and the
+driver's gain controls, never see RX2 selected. (Driving RX2's gain through the driver in 1R1T was the step
+before a board reset in testing; the switch itself, done this way, ran clean.)
+
+Measured on a Pluto+ with an antenna on RX1 and nothing on RX2, 70–3000 MHz: the same noise floor on both
+in every gain-table band (−88 dBFS median at 40 dB), real signals 15–45 dB down on RX2 (strong FM leaks
+across); fast mode at the same speed (~2,720 steps/s); GAIN mid-stream moves RX2 as it moves RX1, in fast
+and driver mode alike.
+
 At 61.44 MSPS the noise floor rises towards the band edges (the AD936x's noise-shaped ADC): within 1 dB
 over ±20 MHz, +3.5 dB at ±25 MHz. Hence the 40 MHz default step (50 is offered); Corvus Sweep's learned
 flatness correction takes the per-step ripple from about 3.7 dB to 0.5 dB peak to peak. The bins around
@@ -153,7 +174,7 @@ per-block work, with the copy out of the DMA block, and with the frame built).
 TCP port 30433. The PC sends text lines:
 
 ```
-CONFIG rate=<Hz> bw=<Hz> gain=<dB>
+CONFIG rate=<Hz> bw=<Hz> gain=<dB> [rx=1|2]
 SWEEP f0=<Hz> step=<Hz> n=<steps> [dwell=<blocks>] [settle=<blocks>] [order=bounce|asc] [mode=fast|driver] [pack=12]
 GAIN <dB>
 STOP
@@ -161,10 +182,11 @@ STOP
 
 `settle` counts extra blocks dropped after each retune, beyond what the board needs itself. corvus-pluto 0.1
 took `skip=<2 + settle>` instead; 0.2 still accepts it, and Corvus Sweep sends both so it works with either.
-`mode` defaults to fast.
+`mode` defaults to fast. `rx` defaults to 1; `OK CONFIG` echoes it (boards before 0.2.3 ignore it and leave
+it out, which is how Corvus Sweep tells).
 
 The board sends frames of `[u32 type][u32 length][payload]` (little-endian): type 1 is one 16384-byte
-sweep block, type 2 a text line (`HELLO corvus-pluto <version> model="..." fw="..." modes=fast|driver lo=<min>-<max>` on
+sweep block, type 2 a text line (`HELLO corvus-pluto <version> model="..." fw="..." modes=fast|driver lo=<min>-<max> inputs=1|2` on
 connect, then `OK ...` or `ERR ...` per command, and `NOTE ...` when fast mode stops on its own), type 3 one
 sweep block with 12-bit packed samples (12296 bytes: the 8 header words, 4088 I, Q pairs in 3 bytes each,
 I bits 0–7, then I bits 8–11 | Q bits 0–3 << 4, then Q bits 4–11, then the 8 trailer words). `OK SWEEP` says

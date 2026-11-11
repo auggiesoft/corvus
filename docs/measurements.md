@@ -238,6 +238,11 @@ The same Pluto+ on F5OEO's Tezuka v0.3.24 (kernel 6.12, Maia SDR running alongsi
   bootloader (the pinning works the same; Maia's spectrometer adds ~15 interrupts/s): the newer kernel.
 - **Pollers:** Tezuka's dashboard telemetry and PTT watcher make 30–60 SPI transactions a second at idle;
   paused during a plan, the bus carries none (0 SPI interrupts in 2 s mid-sweep), and they resume after.
+- **RX2 (corvus-pluto 0.2.3),** antenna on RX1, nothing on RX2, 70–3000 MHz at 40 dB: RX1 2,758 steps/s,
+  RX2 2,720; noise floor −88 dBFS median on both in every gain-table band; real signals 15–45 dB down on
+  RX2 (700–900 MHz peak −37.6 → −72.3 dBFS, 2.4 GHz −36.1 → −79.9), FM leaking across (−42.4 → −47.2).
+  Parked at 98 MHz, GAIN 20/60/40 dB: RX1 −44.0/−10.0/−23.3 dBFS, RX2 −45.6/−21.0/−34.7 in fast mode and
+  the same in driver mode; back on RX1 with RX2's gain mode restored after every session.
 
 ## Restarts
 

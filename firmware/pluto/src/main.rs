@@ -12,7 +12,9 @@
 //! (around 1.3 and 4 GHz); passes go back and forth so the sweep never wraps from 6 GHz to 70 MHz.
 //!
 //! Protocol (TCP, default port 30433). Client to board, text lines:
-//!   CONFIG rate=<Hz> bw=<Hz> gain=<dB>                         sample rate, RF bandwidth, manual RX gain
+//!   CONFIG rate=<Hz> bw=<Hz> gain=<dB> [rx=1|2]                sample rate, RF bandwidth, manual RX gain, input
+//!         rx: the RX input (default 1). RX2 is switched in while a plan runs and RX1 back afterwards;
+//!         HELLO says inputs=2 where the board offers it (1R1T and register access).
 //!   SWEEP f0=<Hz> step=<Hz> n=<steps> [dwell=<blocks>] [settle=<blocks>] [order=bounce|asc] [mode=fast|driver]
 //!         settle: extra blocks dropped after each retune, beyond what the board needs itself (the driver
 //!         path's two stale blocks). Older clients send skip=<2 + settle> instead; that still works.
@@ -138,6 +140,11 @@ const RFPLL_MODULUS: f64 = 8_388_593.0;
 const REG_RFPLL_DIVIDERS: u16 = 0x005;
 const REG_RX_INTEGER_BYTE_0: u16 = 0x231;
 const REG_RX_VCO_LOCK: u16 = 0x247;
+/// Bits 7:6: the RX2 and RX1 channel enables (1R1T: the one enabled is the one on the data port).
+const REG_RX_ENABLE_FILTER_CTRL: u16 = 0x003;
+/// Bits 3:2: RX2's gain control mode (0 = manual).
+const REG_AGC_CONFIG_1: u16 = 0x0FA;
+const RX2_GC_MASK: u8 = 0x0C;
 
 /// The AD936x: the phy (tuning, gain, rates) and the RX capture core with its buffer.
 struct Radio {
@@ -153,6 +160,13 @@ struct Radio {
     lo_range: (u64, u64),
     /// Set while the synthesizer runs past the driver's range: the edge the driver believes it's at.
     ext_edge: std::cell::Cell<Option<u64>>,
+    /// The RX input in use (1 or 2), and the one CONFIG asked for: RX2 is selected only while a plan runs.
+    input: u8,
+    want_input: u8,
+    /// RX2's gain control mode bits before RX2 was taken (restored when it's handed back).
+    rx2_gc: Option<u8>,
+    /// The gain-table band RX2's gain index was last written for (the driver only keeps RX1's in step).
+    rx2_band: std::cell::Cell<Option<usize>>,
 }
 
 impl Radio {
@@ -163,7 +177,7 @@ impl Radio {
         let gain = FastAttr::open(phy.join("in_voltage0_hardwaregain"))?;
         let rate = read_attr(&phy.join("in_voltage_sampling_frequency")).parse().unwrap_or(0);
         let regs = Regs::open(&phy).ok();
-        let mut r = Radio { phy, rx, rx_lo, gain, dev: None, rate, gain_db: 40, regs, lo_range: DRIVER_LO, ext_edge: std::cell::Cell::new(None) };
+        let mut r = Radio { phy, rx, rx_lo, gain, dev: None, rate, gain_db: 40, regs, lo_range: DRIVER_LO, ext_edge: std::cell::Cell::new(None), input: 1, want_input: 1, rx2_gc: None, rx2_band: std::cell::Cell::new(None) };
         r.lo_range = r.probe_lo_range();
         let _ = r.tune(1_000_000_000);
         Ok(r)
@@ -194,12 +208,68 @@ impl Radio {
         let fw = fs::read_to_string("/opt/VERSIONS").ok().and_then(|v| v.lines().next().map(|l| l.trim().to_string())).unwrap_or_default();
         let model = fs::read_to_string("/sys/firmware/devicetree/base/model").unwrap_or_default().trim_end_matches('\0').trim().to_string();
         let fast = if fast::unavailable(&self.phy).is_none() { "fast" } else { "driver" };
-        format!("corvus-pluto {VERSION} model=\"{model}\" fw=\"{fw}\" modes={fast} lo={}-{}", self.lo_range.0, self.lo_range.1)
+        let inputs = if self.two_inputs() { 2 } else { 1 };
+        format!("corvus-pluto {VERSION} model=\"{model}\" fw=\"{fw}\" modes={fast} lo={}-{} inputs={inputs}", self.lo_range.0, self.lo_range.1)
+    }
+
+    /// A debugfs file of the phy (the driver's platform data and register access).
+    fn debugfs(&self, name: &str) -> PathBuf {
+        PathBuf::from(format!("/sys/kernel/debug/iio/{}/{name}", self.phy.file_name().unwrap_or_default().to_string_lossy()))
+    }
+
+    /// RX2 can be selected: register access, and the chip in 1R1T (in 2R2T both are on the data port).
+    fn two_inputs(&self) -> bool {
+        self.regs.is_some() && read_attr(&self.debugfs("adi,2rx-2tx-mode-enable")) == "0"
+    }
+
+    /// Switch the receiver on the data port, the way Tezuka's switch_rfinput.sh does: the driver's
+    /// 1rx-1tx-mode-use-rx-num (so it keeps that receiver enabled when it rewrites the register) and the
+    /// channel enables, no reinitialisation. RX2 also goes to manual gain, set by register: the driver
+    /// refuses gain for it in 1R1T. Nothing else may use the driver's gain controls while RX2 is selected.
+    fn select_input(&mut self, n: u8) -> Result<(), String> {
+        if n == self.input {
+            return Ok(());
+        }
+        if n == 2 && !self.two_inputs() {
+            return Err("this board offers RX1 only (no register access, or the AD936x is in 2R2T mode)".into());
+        }
+        let regs = self.regs.as_ref().ok_or("no register access (debugfs)")?;
+        write_attr(&self.debugfs("adi,1rx-1tx-mode-use-rx-num"), &n.to_string())?;
+        let en = regs.read(REG_RX_ENABLE_FILTER_CTRL)?;
+        regs.write(REG_RX_ENABLE_FILTER_CTRL, (en & !0xC0) | if n == 2 { 0x80 } else { 0x40 })?;
+        let agc = regs.read(REG_AGC_CONFIG_1)?;
+        if n == 2 {
+            self.rx2_gc = Some(agc & RX2_GC_MASK);
+            regs.write(REG_AGC_CONFIG_1, agc & !RX2_GC_MASK)?;
+        } else {
+            regs.write(REG_AGC_CONFIG_1, (agc & !RX2_GC_MASK) | self.rx2_gc.take().unwrap_or(agc & RX2_GC_MASK))?;
+        }
+        self.input = n;
+        self.rx2_band.set(None);
+        if n == 2 {
+            let lo = read_attr(&self.phy.join("out_altvoltage0_RX_LO_frequency")).parse().unwrap_or(1_000_000_000);
+            self.rx2_gain(fast::band(lo))?;
+        }
+        Ok(())
+    }
+
+    /// RX2's manual gain index for `gain_db` in the gain table of `band`.
+    fn rx2_gain(&self, band: usize) -> Result<(), String> {
+        let regs = self.regs.as_ref().ok_or("no register access (debugfs)")?;
+        let v = regs.read(fast::REG_RX2_MANUAL_GAIN)?;
+        regs.write(fast::REG_RX2_MANUAL_GAIN, (v & 0x80) | fast::gain_index(band, self.gain_db))?;
+        self.rx2_band.set(Some(band));
+        Ok(())
     }
 
     /// Sample rate, analog bandwidth and manual gain; DC and quadrature tracking on; the TX LO off (its
     /// leakage lands in the RX band).
-    fn configure(&mut self, rate: u32, bw: u32, gain_db: i32) -> Result<(), String> {
+    fn configure(&mut self, rate: u32, bw: u32, gain_db: i32, input: u8) -> Result<(), String> {
+        if input == 2 && !self.two_inputs() {
+            return Err("this board offers RX1 only (no register access, or the AD936x is in 2R2T mode)".into());
+        }
+        self.select_input(1)?;
+        self.want_input = input;
         self.stop_capture();
         write_attr(&self.phy.join("in_voltage_sampling_frequency"), &rate.to_string())?;
         write_attr(&self.phy.join("in_voltage_rf_bandwidth"), &bw.to_string())?;
@@ -215,6 +285,10 @@ impl Radio {
 
     fn set_gain(&mut self, db: i32) -> Result<(), String> {
         self.gain_db = db.clamp(0, 73);
+        if self.input == 2 {
+            let lo = read_attr(&self.phy.join("out_altvoltage0_RX_LO_frequency")).parse().unwrap_or(1_000_000_000);
+            return self.rx2_gain(self.rx2_band.get().unwrap_or(fast::band(lo)));
+        }
         self.gain.set(self.gain_db as u64)
     }
 
@@ -224,9 +298,15 @@ impl Radio {
             if hz < self.lo_range.0 || hz > self.lo_range.1 {
                 return Err(format!("{hz} Hz is outside this chip's LO range"));
             }
-            return self.tune_beyond(hz);
+            self.tune_beyond(hz)?;
+        } else {
+            self.driver_tune(hz)?;
         }
-        self.driver_tune(hz)
+        // the driver reloads the gain table at a band edge and keeps RX1's index in step; RX2's is ours
+        if self.input == 2 && self.rx2_band.get() != Some(fast::band(hz)) {
+            self.rx2_gain(fast::band(hz))?;
+        }
+        Ok(())
     }
 
     /// A driver retune that really happens: after tuning past the range the driver still believes it's at the
@@ -315,6 +395,9 @@ impl Driver for Radio {
     }
     fn tune(&self, hz: u64) -> Result<(), String> {
         Radio::tune(self, hz)
+    }
+    fn input(&self) -> u8 {
+        self.input
     }
     fn stop_capture(&mut self) {
         Radio::stop_capture(self)
@@ -503,6 +586,11 @@ impl Sweeper<'_> {
             }
             self.paused = Some(paused);
         }
+        // RX2 only while the pollers are paused: nothing else may touch the driver's gain controls then
+        if let Err(e) = self.radio.select_input(self.radio.want_input) {
+            self.unpause();
+            return Err(e);
+        }
         if p.fast {
             let why = fast::unavailable(&self.radio.phy);
             let r = match why {
@@ -519,6 +607,14 @@ impl Sweeper<'_> {
         }
         self.radio.start_capture()?;
         Ok("driver")
+    }
+
+    /// The plan is over: RX1 back on the data port, then the pollers resumed.
+    fn unpause(&mut self) {
+        if let Err(e) = self.radio.select_input(1) {
+            eprintln!("back to RX1: {e}");
+        }
+        self.paused = None;
     }
 
     fn take_fast(&mut self, p: &SweepPlan) -> Result<(), String> {
@@ -538,12 +634,12 @@ impl Sweeper<'_> {
     fn apply(&mut self, cmd: Result<Cmd, String>) -> String {
         let r = match cmd {
             Err(e) => Err(e),
-            Ok(Cmd::Config { rate, bw, gain }) => {
+            Ok(Cmd::Config { rate, bw, gain, rx }) => {
                 self.release();
                 self.plan = None;
-                self.paused = None;
+                self.unpause();
                 self.lo = None;
-                self.radio.configure(rate, bw, gain).map(|_| format!("OK CONFIG rate={} bw={bw} gain={gain}", self.radio.rate))
+                self.radio.configure(rate, bw, gain, rx).map(|_| format!("OK CONFIG rate={} bw={bw} gain={gain} rx={rx}", self.radio.rate))
             }
             Ok(Cmd::Gain(db)) => match self.fast.as_mut() {
                 Some(f) => {
@@ -555,8 +651,8 @@ impl Sweeper<'_> {
             Ok(Cmd::Stop) => {
                 self.release();
                 self.plan = None;
-                self.paused = None;
                 self.radio.stop_capture();
+                self.unpause();
                 Ok("OK STOP".into())
             }
             Ok(Cmd::Sweep(p)) => self.start(p).map(|mode| {
@@ -760,7 +856,7 @@ fn bench() -> Result<(), String> {
     let _paused = pollers::pause();
     println!("{}", r.describe());
     let lo0 = read_attr(&r.phy.join("out_altvoltage0_RX_LO_frequency"));
-    r.configure(61_440_000, 56_000_000, 40)?;
+    r.configure(61_440_000, 56_000_000, 40, 1)?;
     println!("rate {} bw {}", r.rate, read_attr(&r.phy.join("in_voltage_rf_bandwidth")));
     r.start_capture()?;
     let mut iq = vec![0u8; IQ_BYTES];
@@ -857,7 +953,7 @@ fn bench() -> Result<(), String> {
 // Server
 
 enum Cmd {
-    Config { rate: u32, bw: u32, gain: i32 },
+    Config { rate: u32, bw: u32, gain: i32, rx: u8 },
     Sweep(SweepPlan),
     Gain(i32),
     Stop,
@@ -872,7 +968,15 @@ fn parse_cmd(line: &str) -> Result<Cmd, String> {
     let num = |k: &str| kv(&w, k).and_then(|v| v.parse::<u64>().ok());
     let need = |k: &str| num(k).ok_or(format!("missing or bad {k}="));
     match w.first().copied() {
-        Some("CONFIG") => Ok(Cmd::Config { rate: need("rate")? as u32, bw: need("bw")? as u32, gain: need("gain")? as i32 }),
+        Some("CONFIG") => Ok(Cmd::Config {
+            rate: need("rate")? as u32,
+            bw: need("bw")? as u32,
+            gain: need("gain")? as i32,
+            rx: match num("rx").unwrap_or(1) {
+                n @ (1 | 2) => n as u8,
+                _ => return Err("rx= is 1 or 2".into()),
+            },
+        }),
         Some("SWEEP") => Ok(Cmd::Sweep(SweepPlan {
             f0: need("f0")?,
             step: need("step")?,
@@ -972,14 +1076,14 @@ fn session(stream: TcpStream, radio: &mut Radio, profiles: &mut Profiles) {
             let _ = out.send(text(&format!("ERR {e}")));
             sw.release();
             sw.plan = None;
-            sw.paused = None;
             sw.lo = None;
             sw.radio.stop_capture();
+            sw.unpause();
         }
     }
     sw.release();
     sw.radio.stop_capture();
-    sw.paused = None;
+    sw.unpause();
     drop(out);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = writer.join();
@@ -1085,7 +1189,9 @@ mod tests {
         assert!(!p.bounce && p.settle == 1 && p.dwell == 1 && !p.fast);
         let Ok(Cmd::Sweep(p)) = parse_cmd("SWEEP f0=1 step=2 n=3") else { panic!() };
         assert_eq!(p.settle, 0);
-        assert!(matches!(parse_cmd("CONFIG rate=61440000 bw=56000000 gain=40"), Ok(Cmd::Config { rate: 61_440_000, bw: 56_000_000, gain: 40 })));
+        assert!(matches!(parse_cmd("CONFIG rate=61440000 bw=56000000 gain=40"), Ok(Cmd::Config { rate: 61_440_000, bw: 56_000_000, gain: 40, rx: 1 })));
+        assert!(matches!(parse_cmd("CONFIG rate=61440000 bw=56000000 gain=40 rx=2"), Ok(Cmd::Config { rx: 2, .. })));
+        assert!(parse_cmd("CONFIG rate=61440000 bw=56000000 gain=40 rx=3").is_err());
         assert!(matches!(parse_cmd("GAIN 33"), Ok(Cmd::Gain(33))));
         assert!(parse_cmd("SWEEP f0=1 n=3").is_err());
         assert!(parse_cmd("NOPE").is_err());

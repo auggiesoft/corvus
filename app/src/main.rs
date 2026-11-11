@@ -92,6 +92,7 @@ corvus-sweep [options]
                         else the first one found)
   --range START:STOP    sweep range in MHz, e.g. 88:108
   --order vco|asc       visiting order (vco needs firmware sweep4+)
+  --port NAME           RF input: ANT, CABLE1, CABLE2 (RFOne) or RX1, RX2 (Pluto)
   --fresh               ignore saved settings
   --headless SECS       no window: sweep for SECS, print rates and seam ripple, then exit
   --csv PATH            with --headless: write the stitched spectrum as CSV
@@ -199,6 +200,15 @@ fn main() -> eframe::Result {
             "--step" => {
                 let v: f64 = val("--step").parse().unwrap_or_else(|_| die("bad --step"));
                 opts.overrides.push(Box::new(move |c| c.step_mhz = v));
+            }
+            "--port" => {
+                let p: u8 = match val("--port").to_ascii_uppercase().as_str() {
+                    "ANT" | "RX1" | "0" => 0,
+                    "CABLE1" | "RX2" | "1" => 1,
+                    "CABLE2" | "2" => 2,
+                    _ => die("--port ANT|CABLE1|CABLE2|RX1|RX2"),
+                };
+                opts.overrides.push(Box::new(move |c| c.port = p));
             }
             "--profile" => {
                 let v = val("--profile");

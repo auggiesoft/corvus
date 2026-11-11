@@ -75,7 +75,17 @@ impl Board {
     }
 
     pub fn has_ports(self) -> bool {
-        self == Board::RFOne
+        !self.ports().is_empty()
+    }
+
+    /// The RF inputs to choose from (RxSettings::port): the RFOne's ANT and cable inputs, the Pluto's RX1
+    /// and RX2 (on a board in 1R1T with corvus-pluto 0.2.3+). The others have one.
+    pub fn ports(self) -> &'static [(u8, &'static str)] {
+        match self {
+            Board::RFOne => &[(0, "ANT"), (1, "CABLE1"), (2, "CABLE2")],
+            Board::Pluto => &[(0, "RX1"), (1, "RX2")],
+            _ => &[],
+        }
     }
 
     /// The sample-rate settings the sweep can use on this board, default first.

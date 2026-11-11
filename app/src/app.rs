@@ -214,7 +214,7 @@ impl Config {
         if self.rate != board_rate(self.rate) {
             self.set_rate(board_rate(self.rate));
         }
-        if !crate::hydra::board().has_ports() {
+        if !crate::hydra::board().ports().iter().any(|&(p, _)| p == self.port) {
             self.port = 0;
         }
     }
@@ -1427,8 +1427,10 @@ impl App {
             ui.add_space(gap);
             theme::card(ui, |ui| {
                 theme::section(ui, "Receiver");
-                if crate::hydra::board().has_ports() {
-                    theme::row(ui, "Port", |ui| theme::segmented(ui, &mut self.cfg.port, &[(0, "ANT"), (1, "CABLE1"), (2, "CABLE2")]));
+                let ports = crate::hydra::board().ports();
+                if !ports.is_empty() {
+                    let label = if crate::hydra::board() == crate::hydra::Board::Pluto { "Input" } else { "Port" };
+                    theme::row(ui, label, |ui| theme::segmented(ui, &mut self.cfg.port, ports));
                 }
                 let mut mode = match self.cfg.gain {
                     Gain::Linearity(_) => 0,
@@ -1437,7 +1439,7 @@ impl App {
                 };
                 let pluto = crate::hydra::board() == crate::hydra::Board::Pluto;
                 let gain_hint = if pluto {
-                    "The Pluto has one manual RX gain (0–71 dB): every mode here sets it, Gain 10 is 34 dB. It changes mid-sweep without stopping."
+                    "The Pluto has one manual RX gain (0–71 dB): every mode here sets it, Gain 10 is 34 dB. It changes mid-sweep without stopping; switching between RX1 and RX2 restarts the sweep."
                 } else {
                     "Linearity 10 keeps FM and TV out of clipping. Gain and port changes stop the sweep for a moment (the firmware refuses tuner commands mid-sweep). The bias tee stays off."
                 };
