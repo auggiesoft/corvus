@@ -16,11 +16,14 @@ OUT=$B/out/$BOARD
 IMAGE=corvus-fw-gcc47
 TC=gcc-arm-none-eabi-4_7-2013q3-20130916-linux.tar.bz2
 TC_URL=https://launchpad.net/gcc-arm-embedded/4.7/4.7-2013-q3-update/+download/$TC
+# The Internet Archive's copy of the same file (identical MD5), for when Launchpad is unreachable.
+TC_MIRROR=https://web.archive.org/web/2020id_/$TC_URL
 TC_MD5=c35b662e371f369619cf202692a4d10b
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   mkdir -p "$B/dl"
-  [ -f "$B/dl/$TC" ] || curl -fL --retry 3 -o "$B/dl/$TC" "$TC_URL"
+  [ -f "$B/dl/$TC" ] || curl -fL --retry 2 --connect-timeout 20 -o "$B/dl/$TC" "$TC_URL" ||
+    curl -fL --retry 3 --connect-timeout 30 -o "$B/dl/$TC" "$TC_MIRROR"
   echo "$TC_MD5  $B/dl/$TC" | md5sum -c --quiet -
   docker build -q -t "$IMAGE" -f "$B/Dockerfile" "$B/dl" >/dev/null
 fi
