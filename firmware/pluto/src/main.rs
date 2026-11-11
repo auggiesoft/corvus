@@ -103,6 +103,41 @@ impl FastAttr {
     }
 }
 
+/// The AD936x's registers through the driver's debugfs file (kernel SPI, ~45 us per access): for tuning
+/// past the driver's range.
+struct Regs(File);
+
+impl Regs {
+    fn open(phy: &Path) -> Result<Regs, String> {
+        let dev = phy.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let p = format!("/sys/kernel/debug/iio/{dev}/direct_reg_access");
+        OpenOptions::new().read(true).write(true).open(&p).map(Regs).map_err(|e| format!("{p}: {e}"))
+    }
+
+    fn read(&self, reg: u16) -> Result<u8, String> {
+        self.0.write_at(format!("0x{reg:X}").as_bytes(), 0).map_err(|e| format!("register 0x{reg:X}: {e}"))?;
+        let mut b = [0u8; 16];
+        let n = self.0.read_at(&mut b, 0).map_err(|e| format!("register 0x{reg:X}: {e}"))?;
+        let t = std::str::from_utf8(&b[..n]).unwrap_or("").trim();
+        u8::from_str_radix(t.trim_start_matches("0x"), 16).map_err(|_| format!("register 0x{reg:X}: {t:?}"))
+    }
+
+    fn write(&self, reg: u16, val: u8) -> Result<(), String> {
+        self.0.write_at(format!("0x{reg:X} 0x{val:X}").as_bytes(), 0).map(|_| ()).map_err(|e| format!("register 0x{reg:X}: {e}"))
+    }
+}
+
+/// The driver's RX LO range: the VCO's 6-12 GHz divided by 2..128. It advertises 46_875_001 Hz but refuses it.
+const DRIVER_LO: (u64, u64) = (46_880_000, 6_000_000_000);
+/// How far past it the RX synthesizer is pushed (VCO outside 6-12 GHz) when the chip locks there, checked at
+/// start-up. Measured on a Pluto+: locks 45-6170 MHz; at 46 MHz the clock spurs sit where they should, at 45
+/// they don't. Beyond this range a step is taken at the nearest end and shifted digitally (see `phys`).
+const EXT_LO: (u64, u64) = (46_000_000, 6_150_000_000);
+const RFPLL_MODULUS: f64 = 8_388_593.0;
+const REG_RFPLL_DIVIDERS: u16 = 0x005;
+const REG_RX_INTEGER_BYTE_0: u16 = 0x231;
+const REG_RX_VCO_LOCK: u16 = 0x247;
+
 /// The AD936x: the phy (tuning, gain, rates) and the RX capture core with its buffer.
 struct Radio {
     phy: PathBuf,
@@ -112,6 +147,11 @@ struct Radio {
     dev: Option<File>,
     rate: u32,
     gain_db: i32,
+    regs: Option<Regs>,
+    /// The LO range this chip tunes (DRIVER_LO, or wider where it locks).
+    lo_range: (u64, u64),
+    /// Set while the synthesizer runs past the driver's range: the edge the driver believes it's at.
+    ext_edge: std::cell::Cell<Option<u64>>,
 }
 
 impl Radio {
@@ -121,14 +161,39 @@ impl Radio {
         let rx_lo = FastAttr::open(phy.join("out_altvoltage0_RX_LO_frequency"))?;
         let gain = FastAttr::open(phy.join("in_voltage0_hardwaregain"))?;
         let rate = read_attr(&phy.join("in_voltage_sampling_frequency")).parse().unwrap_or(0);
-        Ok(Radio { phy, rx, rx_lo, gain, dev: None, rate, gain_db: 40 })
+        let regs = Regs::open(&phy).ok();
+        let mut r = Radio { phy, rx, rx_lo, gain, dev: None, rate, gain_db: 40, regs, lo_range: DRIVER_LO, ext_edge: std::cell::Cell::new(None) };
+        r.lo_range = r.probe_lo_range();
+        let _ = r.tune(1_000_000_000);
+        Ok(r)
+    }
+
+    /// How far past the driver's range this chip's synthesizer locks (in 10 MHz / 0.2 MHz steps from EXT_LO).
+    fn probe_lo_range(&self) -> (u64, u64) {
+        if self.regs.is_none() {
+            return DRIVER_LO;
+        }
+        let mut hi = EXT_LO.1;
+        while hi > DRIVER_LO.1 && self.tune_beyond(hi).is_err() {
+            hi -= 10_000_000;
+        }
+        let mut lo = EXT_LO.0;
+        while lo < DRIVER_LO.0 && self.tune_beyond(lo).is_err() {
+            lo += 200_000;
+        }
+        (lo.min(DRIVER_LO.0), hi.max(DRIVER_LO.1))
+    }
+
+    /// The LO a step centred on `hz` is taken at: `hz` itself where the chip tunes, else the nearest end.
+    fn phys(&self, hz: u64) -> u64 {
+        hz.clamp(self.lo_range.0, self.lo_range.1)
     }
 
     fn describe(&self) -> String {
         let fw = fs::read_to_string("/opt/VERSIONS").ok().and_then(|v| v.lines().next().map(|l| l.trim().to_string())).unwrap_or_default();
         let model = fs::read_to_string("/sys/firmware/devicetree/base/model").unwrap_or_default().trim_end_matches('\0').trim().to_string();
         let fast = if fast::unavailable(&self.phy).is_none() { "fast" } else { "driver" };
-        format!("corvus-pluto {VERSION} model=\"{model}\" fw=\"{fw}\" modes={fast}")
+        format!("corvus-pluto {VERSION} model=\"{model}\" fw=\"{fw}\" modes={fast} lo={}-{}", self.lo_range.0, self.lo_range.1)
     }
 
     /// Sample rate, analog bandwidth and manual gain; DC and quadrature tracking on; the TX LO off (its
@@ -152,8 +217,55 @@ impl Radio {
         self.gain.set(self.gain_db as u64)
     }
 
+    /// Tune the RX LO: through the driver inside its range, past it by programming the synthesizer.
     fn tune(&self, hz: u64) -> Result<(), String> {
+        if hz < DRIVER_LO.0 || hz > DRIVER_LO.1 {
+            if hz < self.lo_range.0 || hz > self.lo_range.1 {
+                return Err(format!("{hz} Hz is outside this chip's LO range"));
+            }
+            return self.tune_beyond(hz);
+        }
+        self.driver_tune(hz)
+    }
+
+    /// A driver retune that really happens: after tuning past the range the driver still believes it's at the
+    /// edge, and it skips a retune to the frequency it believes is set.
+    fn driver_tune(&self, hz: u64) -> Result<(), String> {
+        if self.ext_edge.take() == Some(hz) {
+            self.rx_lo.set(if hz > DRIVER_LO.0 + 1_000_000 { hz - 1_000_000 } else { hz + 1_000_000 })?;
+        }
         self.rx_lo.set(hz)
+    }
+
+    /// Tune past the driver's range: the driver tunes the nearest edge (the VCO settings and divider for it),
+    /// then the integer and fractional words are written for `hz` with the same divider, the VCO now outside
+    /// 6-12 GHz; writing integer byte 0 starts the VCO calibration. Err if it doesn't lock within 5 ms.
+    fn tune_beyond(&self, hz: u64) -> Result<(), String> {
+        let regs = self.regs.as_ref().ok_or("no register access (debugfs)")?;
+        let edge = hz.clamp(DRIVER_LO.0, DRIVER_LO.1);
+        self.driver_tune(edge)?;
+        let rd = |a: u16| regs.read(a).map(|v| v as u32);
+        let div = (rd(REG_RFPLL_DIVIDERS)? & 0x0F) as i32; // RX: LO = VCO / 2^(div + 1)
+        let integer = rd(REG_RX_INTEGER_BYTE_0)? | ((rd(REG_RX_INTEGER_BYTE_0 + 1)? & 7) << 8);
+        let fract = rd(REG_RX_INTEGER_BYTE_0 + 2)? | (rd(REG_RX_INTEGER_BYTE_0 + 3)? << 8) | ((rd(REG_RX_INTEGER_BYTE_0 + 4)? & 0x7F) << 16);
+        let mult = (1u64 << (div + 1)) as f64;
+        let reference = edge as f64 * mult / (integer as f64 + fract as f64 / RFPLL_MODULUS);
+        let n = hz as f64 * mult / reference;
+        let (ni, nf) = (n.floor() as u32, ((n - n.floor()) * RFPLL_MODULUS).round() as u32);
+        let b1 = regs.read(REG_RX_INTEGER_BYTE_0 + 1)?;
+        regs.write(REG_RX_INTEGER_BYTE_0 + 4, ((nf >> 16) & 0x7F) as u8)?;
+        regs.write(REG_RX_INTEGER_BYTE_0 + 3, (nf >> 8) as u8)?;
+        regs.write(REG_RX_INTEGER_BYTE_0 + 2, nf as u8)?;
+        regs.write(REG_RX_INTEGER_BYTE_0 + 1, (b1 & !7) | ((ni >> 8) & 7) as u8)?;
+        self.ext_edge.set(Some(edge));
+        regs.write(REG_RX_INTEGER_BYTE_0, ni as u8)?;
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(5) {
+            if regs.read(REG_RX_VCO_LOCK)? & 2 != 0 {
+                return Ok(());
+            }
+        }
+        Err(format!("the synthesizer doesn't lock at {hz} Hz"))
     }
 
     /// Enable I and Q and the buffer: two DMA blocks of one sweep block's samples each.
@@ -303,6 +415,42 @@ impl SweepPlan {
     }
 }
 
+/// The LOs a plan's steps are taken at (each once): steps beyond the chip's range share its nearest end.
+fn phys_freqs(p: &SweepPlan, radio: &Radio) -> Vec<u64> {
+    let mut v: Vec<u64> = p.freqs().iter().map(|&f| radio.phys(f)).collect();
+    v.dedup();
+    v
+}
+
+/// Shift a block's spectrum by -`hz` (a tone at +`hz` moves to 0 Hz) in place: a step centred `hz` away from
+/// the LO it was taken at then looks as if the LO had been at its centre. 12-bit values, clipped.
+fn shift_iq(iq: &mut [u8], hz: f64, fs: f64) {
+    // the LO's leakage is DC before the shift and would land off centre after it (where Corvus Sweep doesn't
+    // bridge it): take the block's mean out first
+    let n = (IQ_BYTES / 4) as f32;
+    let (mut mi, mut mq) = (0.0f32, 0.0f32);
+    for smp in iq[..IQ_BYTES].as_chunks::<4>().0 {
+        mi += i16::from_le_bytes([smp[0], smp[1]]) as f32;
+        mq += i16::from_le_bytes([smp[2], smp[3]]) as f32;
+    }
+    let (mi, mq) = (mi / n, mq / n);
+    let w = -2.0 * std::f64::consts::PI * hz / fs;
+    let mut ph = (1.0f32, 0.0f32);
+    let (c, s) = (w.cos() as f32, w.sin() as f32);
+    for (k, smp) in iq[..IQ_BYTES].as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        if k % 256 == 0 {
+            ph = (((w * k as f64).cos()) as f32, ((w * k as f64).sin()) as f32); // no drift
+        }
+        let i = i16::from_le_bytes([smp[0], smp[1]]) as f32 - mi;
+        let q = i16::from_le_bytes([smp[2], smp[3]]) as f32 - mq;
+        let ni = (i * ph.0 - q * ph.1).round().clamp(-2048.0, 2047.0) as i16;
+        let nq = (i * ph.1 + q * ph.0).round().clamp(-2048.0, 2047.0) as i16;
+        smp[..2].copy_from_slice(&ni.to_le_bytes());
+        smp[2..].copy_from_slice(&nq.to_le_bytes());
+        ph = (ph.0 * c - ph.1 * s, ph.0 * s + ph.1 * c);
+    }
+}
+
 /// The sweep state of one connection, and the radio it drives.
 struct Sweeper<'a> {
     radio: &'a mut Radio,
@@ -322,6 +470,10 @@ struct Sweeper<'a> {
     fast_note: Option<String>,
     /// A command that arrived during a fast pass, to apply next.
     pending: Option<Result<Cmd, String>>,
+    /// Fast mode's bookkeeping between passes (a one-step plan makes thousands of passes a second): a reused
+    /// scratch block, and when the bus and the profiles' age were last checked.
+    scratch: Vec<u8>,
+    checked: Instant,
 }
 
 impl Sweeper<'_> {
@@ -360,7 +512,7 @@ impl Sweeper<'_> {
     }
 
     fn take_fast(&mut self, p: &SweepPlan) -> Result<(), String> {
-        let freqs = p.freqs();
+        let freqs = phys_freqs(p, self.radio);
         let t = Instant::now();
         let n = self.profiles.calibrate(self.radio, &freqs)?;
         if n > 0 {
@@ -464,16 +616,20 @@ impl Sweeper<'_> {
             }
             let step = p.index(self.pass, i);
             let f = p.freq(step);
-            if self.lo != Some(f) {
+            let lo = self.radio.phys(f);
+            if self.lo != Some(lo) {
                 self.lo = None;
-                self.radio.tune(f)?;
-                self.lo = Some(f);
+                self.radio.tune(lo)?;
+                self.lo = Some(lo);
             }
             for _ in 0..p.driver_skip() {
                 self.radio.read_iq(&mut self.iq)?;
             }
             for b in 0..p.dwell {
                 self.radio.read_iq(&mut self.iq)?;
+                if f != lo {
+                    shift_iq(&mut self.iq, f as f64 - lo as f64, self.radio.rate as f64);
+                }
                 let buf = self.frame(&self.iq, step, b, f, true, None);
                 if out.send(buf).is_err() {
                     return Ok(());
@@ -501,18 +657,28 @@ impl Sweeper<'_> {
     fn fast_pass(&mut self, p: SweepPlan, cmds: &Receiver<Result<Cmd, String>>, out: &SyncSender<Vec<u8>>, alive: &AtomicBool) -> Result<(), String> {
         let steps: Vec<u32> = (0..p.n).map(|i| p.index(self.pass, i)).collect();
         let freqs: Vec<u64> = steps.iter().map(|&s| p.freq(s)).collect();
+        let los: Vec<u64> = freqs.iter().map(|&f| self.radio.phys(f)).collect();
+        let fs = self.radio.rate as f64;
         let mut unlocked = Vec::new();
         let mut pending = None;
         let mut fast = self.fast.take().unwrap();
-        let mut scratch = vec![0u8; IQ_BYTES];
-        let r = fast.pass(&freqs, self.profiles, p.settle as usize, p.dwell as usize, |i, b, iq, locked| {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let r = fast.pass(&los, self.profiles, p.settle as usize, p.dwell as usize, |i, b, iq, locked| {
             if !alive.load(Ordering::Relaxed) {
                 return false;
             }
             if !locked && b == 0 {
-                unlocked.push(freqs[i]);
+                unlocked.push(los[i]);
             }
-            if out.send(self.frame(iq, steps[i], b, freqs[i], locked, Some(&mut scratch))).is_err() {
+            let frame = if freqs[i] != los[i] {
+                // a step past the chip's range: taken at its end, shifted to the step's centre
+                scratch[..IQ_BYTES].copy_from_slice(&iq[..IQ_BYTES]);
+                shift_iq(&mut scratch, freqs[i] as f64 - los[i] as f64, fs);
+                self.frame(&scratch, steps[i], b, freqs[i], locked, None)
+            } else {
+                self.frame(iq, steps[i], b, freqs[i], locked, Some(&mut scratch))
+            };
+            if out.send(frame).is_err() {
                 return false;
             }
             if b == 0 && i % 16 == 15 {
@@ -527,9 +693,15 @@ impl Sweeper<'_> {
             }
             true
         });
-        let bus_ok = fast.bus_ok();
+        // the bus and the profiles' age: checked every 100 ms, not every pass
+        let check = self.checked.elapsed() > Duration::from_millis(100);
+        if check {
+            self.checked = Instant::now();
+        }
+        let bus_ok = !check || fast.bus_ok();
         self.fast = Some(fast);
-        self.lo = freqs.last().copied();
+        self.scratch = scratch;
+        self.lo = los.last().copied();
         let complete = match r {
             Ok(c) => c,
             Err(e) => {
@@ -553,7 +725,7 @@ impl Sweeper<'_> {
             self.pass += 1;
             self.sweep = self.sweep.wrapping_add(1);
         }
-        if !unlocked.is_empty() || self.profiles.stale(&p.freqs()) {
+        if !unlocked.is_empty() || (check && self.profiles.stale(&phys_freqs(&p, self.radio))) {
             // recalibrate unlocked or old profiles through the driver, then take the radio again
             for f in &unlocked {
                 self.profiles.forget(*f);
@@ -762,7 +934,7 @@ fn session(stream: TcpStream, radio: &mut Radio, profiles: &mut Profiles) {
     // the sweep loop spins while capture blocks fill: keep it off the core that takes the interrupts
     pin_to_cpu(1);
     let _ = out.send(text(&format!("HELLO {}", radio.describe())));
-    let mut sw = Sweeper { radio, plan: None, sweep: 0, pass: 0, t0: Instant::now(), lo: None, iq: vec![0u8; IQ_BYTES], fast: None, profiles, fast_note: None, pending: None };
+    let mut sw = Sweeper { radio, plan: None, sweep: 0, pass: 0, t0: Instant::now(), lo: None, iq: vec![0u8; IQ_BYTES], fast: None, profiles, fast_note: None, pending: None, scratch: vec![0u8; IQ_BYTES], checked: Instant::now() };
     while alive.load(Ordering::Relaxed) {
         let cmd = if sw.plan.is_some() {
             match cmds.try_recv() {
@@ -920,6 +1092,23 @@ mod tests {
             let q = ((c[1] as u16 >> 4) | ((c[2] as u16) << 4)) as i16;
             let sx = |v: i16| (v << 4) >> 4;
             assert_eq!((sx(i), sx(q)), (vals[2 * k], vals[2 * k + 1]), "pair {k}");
+        }
+    }
+
+    #[test]
+    fn shift_moves_a_tone_to_dc() {
+        // a tone at +5 MHz (61.44 MSPS), shifted by 5 MHz, becomes DC: constant I and Q
+        let fs = 61.44e6;
+        let mut iq = vec![0u8; IQ_BYTES];
+        for (k, smp) in iq.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let a = 2.0 * std::f64::consts::PI * 5e6 * k as f64 / fs;
+            smp[..2].copy_from_slice(&((1000.0 * a.cos()).round() as i16).to_le_bytes());
+            smp[2..].copy_from_slice(&((1000.0 * a.sin()).round() as i16).to_le_bytes());
+        }
+        shift_iq(&mut iq, 5e6, fs);
+        for smp in iq.as_chunks::<4>().0.iter().step_by(97) {
+            let (i, q) = (i16::from_le_bytes([smp[0], smp[1]]), i16::from_le_bytes([smp[2], smp[3]]));
+            assert!((i - 1000).abs() <= 3 && q.abs() <= 3, "{i} {q}");
         }
     }
 

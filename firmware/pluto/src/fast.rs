@@ -468,6 +468,10 @@ pub struct Fast {
     irqs: Vec<(String, String)>,
     next_block: usize,
     pub unlocked: u32,
+    /// One-step plans (the live view) stream: the capture blocks stay queued back to back between passes, at
+    /// `streaming`'s LO, without switching profiles again.
+    queued: std::collections::VecDeque<usize>,
+    streaming: Option<u64>,
 }
 
 impl Fast {
@@ -510,7 +514,7 @@ impl Fast {
             }
         };
         let b = band(f0);
-        Ok(Fast { spi, blocks, power, irq, chip_band: b, driver_band: b, gain_db, last_alc: None, seq: 1, slots: [None; 8], irqs: dma_irqs_to_cpu1(), next_block: 0, unlocked: 0 })
+        Ok(Fast { spi, blocks, power, irq, chip_band: b, driver_band: b, gain_db, last_alc: None, seq: 1, slots: [None; 8], irqs: dma_irqs_to_cpu1(), next_block: 0, unlocked: 0, queued: Default::default(), streaming: None })
     }
 
     /// The bus stayed ours (no kernel SPI traffic since we took it).
@@ -542,6 +546,10 @@ impl Fast {
     /// One pass: visit `freqs` in order, `skip` blocks dropped and `dwell` kept per step; `emit(i, block,
     /// iq, locked)` gets each kept block's samples. Returns early (Ok(false)) when `emit` says stop.
     pub fn pass(&mut self, freqs: &[u64], profiles: &Profiles, skip: usize, dwell: usize, mut emit: impl FnMut(usize, u16, &[u8], bool) -> bool) -> Result<bool, String> {
+        if freqs.len() == 1 {
+            return self.stream(freqs[0], profiles, skip, dwell, emit);
+        }
+        self.drain()?;
         let n = freqs.len();
         let base = self.seq;
         let slot = |s: usize| (base + s) % 8;
@@ -592,6 +600,66 @@ impl Fast {
                     }
                 }
             }
+        }
+        Ok(true)
+    }
+
+    /// Wait out and drop the blocks still queued.
+    fn drain(&mut self) -> Result<(), String> {
+        while let Some(id) = self.queued.pop_front() {
+            let got = self.blocks.dequeue()?;
+            if got != id {
+                return Err(format!("capture blocks out of order ({got} for {id})"));
+            }
+        }
+        self.streaming = None;
+        Ok(())
+    }
+
+    /// One pass of a one-step plan: switch to `lo` only if not there yet (then drop `skip` blocks), keep
+    /// STREAM_DEPTH blocks queued so the capture runs on between blocks, and emit `dwell` of them.
+    fn stream(&mut self, lo: u64, profiles: &Profiles, skip: usize, dwell: usize, mut emit: impl FnMut(usize, u16, &[u8], bool) -> bool) -> Result<bool, String> {
+        const STREAM_DEPTH: usize = NBLOCKS / 2;
+        let mut drop = 0;
+        if self.streaming != Some(lo) {
+            self.drain()?;
+            let b = band(lo);
+            if b != self.chip_band {
+                self.spi.load_gain_table(b, gain_index(b, self.gain_db))?;
+                self.chip_band = b;
+            }
+            let slot = self.seq % 8;
+            self.seq += 1;
+            self.load(slot, profiles.get(lo))?;
+            self.spi.write_reg(REG_RX_FAST_LOCK_SETUP, ((slot as u8) << 5) | 1)?;
+            self.streaming = Some(lo);
+            drop = skip;
+        }
+        let locked = self.spi.locked()?;
+        if !locked {
+            self.unlocked += 1;
+        }
+        let mut kept = 0u16;
+        while (kept as usize) < dwell {
+            while self.queued.len() < STREAM_DEPTH {
+                self.blocks.enqueue(self.next_block)?;
+                self.queued.push_back(self.next_block);
+                self.next_block = (self.next_block + 1) % NBLOCKS;
+            }
+            let id = self.queued.pop_front().unwrap();
+            let got = self.blocks.dequeue()?;
+            if got != id {
+                return Err(format!("capture blocks out of order ({got} for {id})"));
+            }
+            if drop > 0 {
+                drop -= 1;
+                continue;
+            }
+            let d = self.blocks.data(id);
+            if !emit(0, kept, &d[DISCARD * 4..], locked) {
+                return Ok(false);
+            }
+            kept += 1;
         }
         Ok(true)
     }

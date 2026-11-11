@@ -21,6 +21,11 @@ pub struct Config {
     pub stop_mhz: f64,
     pub step_mhz: f64,
     pub rate: Rate,
+    /// The live view: the board parked on one frequency, one step `live_span_mhz` wide (see `set_live`).
+    pub live: bool,
+    pub live_span_mhz: f64,
+    /// The sweep settings to go back to from the live view: start, stop, step, rate.
+    pub live_back: Option<(f64, f64, f64, Rate)>,
     pub order: Order,
     pub dwell: u8,
     pub lock_reads: u8,
@@ -98,6 +103,9 @@ impl Default for Config {
             stop_mhz: 1800.0,
             step_mhz: Rate::default().default_step_mhz(),
             rate: Rate::default(),
+            live: false,
+            live_span_mhz: 25.0,
+            live_back: None,
             order: Order::VcoContinuous,
             dwell: 1,
             lock_reads: 2,
@@ -168,8 +176,41 @@ impl Config {
         }
     }
 
+    /// Go live (or move the live view): one step `live_span_mhz` wide centred on `centre_mhz`, at the lowest
+    /// sample rate that covers the span, so its bins are the finest. The sweep settings are kept to go back to.
+    pub fn set_live(&mut self, centre_mhz: f64) {
+        if !self.live {
+            self.live_back = Some((self.start_mhz, self.stop_mhz, self.step_mhz, self.rate));
+            self.live = true;
+        }
+        let span = self.live_span_mhz;
+        let rate = live_rate(span);
+        self.rate = rate;
+        // a step at least as wide as the span: the plan is one step
+        self.step_mhz = rate.steps().last().map_or(span, |s| s.0).max(span);
+        let (cmin, cmax) = rate.centre_range(span * 1e6);
+        let c = (centre_mhz * 1e6).clamp(cmin, cmax) / 1e6;
+        self.start_mhz = ((c - span / 2.0) * 1000.0).round() / 1000.0;
+        self.stop_mhz = ((c + span / 2.0) * 1000.0).round() / 1000.0;
+    }
+
+    /// Back from the live view to the sweep it came from.
+    pub fn leave_live(&mut self) {
+        if let Some((a, b, s, r)) = self.live_back.take() {
+            (self.start_mhz, self.stop_mhz, self.step_mhz, self.rate) = (a, b, s, r);
+        }
+        self.live = false;
+    }
+
+    pub fn live_centre_mhz(&self) -> f64 {
+        (self.start_mhz + self.stop_mhz) / 2.0
+    }
+
     /// Fit saved or profile settings to the board: its rates (the Airspys have one each) and ports.
     pub fn fit_board(&mut self) {
+        if self.live && !crate::hydra::board().has_live() {
+            self.leave_live();
+        }
         if self.rate != board_rate(self.rate) {
             self.set_rate(board_rate(self.rate));
         }
@@ -673,6 +714,10 @@ impl App {
     }
 
     fn set_range(&mut self, lo_hz: f64, hi_hz: f64) {
+        // a range is a sweep: leave the live view (back to its sweep settings), then take the range
+        if self.cfg.live {
+            self.cfg.leave_live();
+        }
         self.cfg.start_mhz = (lo_hz / 1e6 * 1000.0).round() / 1000.0;
         self.cfg.stop_mhz = (hi_hz / 1e6 * 1000.0).round() / 1000.0;
         self.apply_plan();
@@ -684,6 +729,11 @@ impl App {
             self.prev_engine = Some((EngineSnap::of(&self.cfg), self.engine_name()));
         }
         pr.apply(&mut self.cfg);
+        if self.cfg.live {
+            // keep the live view: a profile's rate and step are for sweeping
+            let c = self.cfg.live_centre_mhz();
+            self.cfg.set_live(c);
+        }
         if pr.peak_hold {
             self.engine.clear_peak();
         }
@@ -1131,7 +1181,7 @@ impl App {
             Card { label: "Sweep speed", value: format!("{rate:.0}"), unit: "steps/s", sub: if rate > 0.0 { format!("{:.2} ms per step · last 60 s", 1e3 / rate) } else { "—".into() }, flag: false, spark: true },
             Card { label: "Throughput", value: format!("{:.2}", rate as f64 * p.step_hz.min(p.window_hz as u32) as f64 / 1e9), unit: "GHz/s", sub: format!("{} MHz steps · dwell {}", fmt_trim(p.window_hz / 1e6, 2), p.dwell), flag: false, spark: false },
             Card {
-                label: "Full passes",
+                label: if self.cfg.live { "Updates" } else { "Full passes" },
                 value: if passes >= 100.0 { format!("{passes:.0}") } else { format!("{passes:.2}") },
                 unit: "/s",
                 sub: if passes > 0.0 { format!("{:.0} ms per pass · {} so far", 1e3 / passes, s.passes) } else { format!("{} so far", s.passes) },
@@ -1188,7 +1238,47 @@ impl App {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let gap = self.cfg.density.gap();
             theme::card(ui, |ui| {
-                theme::section(ui, "Range");
+                let has_live = crate::hydra::board().has_live();
+                ui.horizontal(|ui| {
+                    theme::section(ui, if self.cfg.live { "Live" } else { "Range" });
+                    if has_live {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let mut live = self.cfg.live;
+                            if theme::segmented(ui, &mut live, &[(false, "Sweep"), (true, "Live")]) && live != self.cfg.live {
+                                if live {
+                                    let c = (self.view.0 + self.view.1) / 2e6;
+                                    self.cfg.set_live(c);
+                                } else {
+                                    self.cfg.leave_live();
+                                }
+                            }
+                        });
+                    }
+                });
+                if self.cfg.live && has_live {
+                    let (fmin, fmax) = (self.cfg.rate.f_range().0 / 1e6, self.cfg.rate.f_range().1 / 1e6);
+                    let mut c = self.cfg.live_centre_mhz();
+                    let c0 = c;
+                    theme::row(ui, "Centre", |ui| {
+                        ui.add(freq_field(&mut c, fmin..=fmax)).on_hover_text("Shift+arrows: a span down or up. L: back to the sweep");
+                        ui.label(RichText::new("MHz").size(theme::SM).color(INK2));
+                    });
+                    let mut span = self.cfg.live_span_mhz;
+                    let changed = theme::row(ui, "Span", |ui| theme::segmented(ui, &mut span, LIVE_SPANS));
+                    if c != c0 || changed {
+                        self.cfg.live_span_mhz = span;
+                        self.cfg.set_live(c);
+                    }
+                    theme::caption(
+                        ui,
+                        format!(
+                            "{} · {:.2} kHz bins (FFT of one block). The board stays on this frequency; every block is an update. L or Sweep goes back to the sweep.",
+                            self.cfg.rate.label(),
+                            self.cfg.rate.adc_hz() / dsp::n_samples(self.cfg.rate) as f64 / 1e3
+                        ),
+                    );
+                    return;
+                }
                 // Typed values apply on Enter, Tab or clicking away (Esc cancels), not per keystroke.
                 let (s0, e0) = (self.cfg.start_mhz, self.cfg.stop_mhz);
                 let focus = std::mem::take(&mut self.focus_start);
@@ -1274,14 +1364,15 @@ impl App {
                 theme::more(ui, "engine-more", "Rate, order, dwell and lock check", |ui| {
                     let mut rate = self.cfg.rate;
                     let rate_hint = if crate::hydra::board() == crate::hydra::Board::Pluto {
-                        "61.44 MSPS: steps up to 50 MHz (the noise floor stays within 1 dB over 40), the fastest sweep.\n30.72 MSPS: steps up to 25 MHz, bins half as wide."
+                        "61.44 MSPS: steps up to 50 MHz (the noise floor stays within 1 dB over 40), the fastest sweep.\n30.72 MSPS: steps up to 25 MHz, bins half as wide.\n15.36, 7.68, 3.84 MSPS: narrower steps, bins down to 0.94 kHz; mostly for the live view."
                     } else {
                         "10 MSPS: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.\n12 MSPS: 24 MSPS real, tuner filter wide open, steps up to 10 MHz, about a third more GHz/s."
                     };
                     let rates = crate::hydra::board().rates();
                     if rates.len() > 1 {
                         let opts: Vec<(Rate, &str)> = rates.iter().map(|&r| (r, r.label())).collect();
-                        if theme::row_hint(ui, "Rate", rate_hint, |ui| theme::segmented(ui, &mut rate, &opts)) {
+                        let live = self.cfg.live;
+                        if theme::row_hint(ui, "Rate", rate_hint, |ui| ui.add_enabled_ui(!live, |ui| theme::segmented(ui, &mut rate, &opts)).inner) && !live {
                             self.cfg.set_rate(rate);
                         }
                     } else {
@@ -2641,6 +2732,11 @@ impl App {
 
     /// Move the swept range by its own width, stopping at the band edges.
     fn shift_range(&mut self, dir: f64) {
+        if self.cfg.live {
+            let c = self.cfg.live_centre_mhz() + dir * self.cfg.live_span_mhz;
+            self.cfg.set_live(c);
+            return;
+        }
         let (a, b) = (self.applied.start_hz, self.applied.stop_hz);
         let span = b - a;
         let (fmin, fmax) = self.cfg.rate.f_range();
@@ -2683,6 +2779,17 @@ impl App {
                 Key::Escape => self.show_keys = false,
                 // range
                 Key::G => self.focus_start = true,
+                Key::L if crate::hydra::board().has_live() => {
+                    if self.cfg.live {
+                        self.cfg.leave_live();
+                        self.toast("Sweep", false);
+                    } else {
+                        // live where the cursor is on the spectrum, else in the middle of the view
+                        let c = self.shown.hover.map_or((self.view.0 + self.view.1) / 2.0, |h| h.0) / 1e6;
+                        self.cfg.set_live(c);
+                        self.toast(format!("Live at {} MHz, {} MHz span", fmt_trim(self.cfg.live_centre_mhz(), 3), fmt_trim(self.cfg.live_span_mhz, 1)), false);
+                    }
+                }
                 Key::Backspace => self.back_range(),
                 Key::F => {
                     let (a, b) = self.cfg.rate.f_range();
@@ -2934,6 +3041,14 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
     let asked = crate::hydra::board();
     let mut src = if opts.sim { Src::Sim(Sim::start(engine.sink(), plan.clone(), cfg.rx())) } else { open_device(&opts.lib, opts.serial, &engine, &plan, cfg.rx()) };
     let mut plan = plan;
+    // a Pluto reports its tuning range when it opens: re-plan if the range moved the plan
+    if crate::hydra::board() == asked && cfg.plan() != plan {
+        plan = cfg.plan();
+        engine.set_plan(plan.clone());
+        if let Src::Device(d) = &mut src {
+            d.sweep(&plan)?;
+        }
+    }
     if crate::hydra::board() != asked {
         // the firmware said which Airspy it is: fit the settings and start the sweep
         engine.set_eq_prefix(crate::hydra::board().cache_prefix());
@@ -3270,6 +3385,14 @@ fn fit_rate_step(rate: Rate, step_mhz: f64, rates: &[Rate]) -> (Rate, f64) {
     } else {
         (fitted, fitted.default_step_mhz())
     }
+}
+
+/// Live-view spans for the Pluto, MHz.
+const LIVE_SPANS: &[(f64, &str)] = &[(50.0, "50"), (25.0, "25"), (12.0, "12"), (6.0, "6"), (3.0, "3"), (1.0, "1 MHz")];
+
+/// The lowest Pluto rate whose usable window covers `span_mhz`: the finest bins for that span.
+fn live_rate(span_mhz: f64) -> Rate {
+    [Rate::P3, Rate::P7, Rate::P15, Rate::P31, Rate::P61].into_iter().find(|r| r.max_window_hz() >= span_mhz * 1e6 - 1.0).unwrap_or(Rate::P61)
 }
 
 /// The board's rate for a requested one: the R2 runs 10 MSPS only.

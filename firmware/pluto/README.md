@@ -85,6 +85,34 @@ also installs `plutodvb2-quiet.sh`, which stops PlutoDVB2's DATV services at eve
 and broker, the DATV streamer, its LO/TX watcher scripts and its NFS server) and keeps iiod, SSH, DHCP and the
 web server. To undo it, delete its line from `/mnt/jffs2/backdoor.sh` and reboot.
 
+## Tuning range
+
+The driver tunes the RX LO over 46.88 MHz–6 GHz: the VCO's 6–12 GHz divided by 2 to 128. (It advertises
+46,875,001 Hz as its minimum but refuses it.) corvus-pluto goes further two ways:
+
+- **Past the driver's range:** it tunes the nearest edge through the driver (for the VCO settings and
+  divider), then writes the synthesizer's integer and fractional words for the target itself through the
+  driver's debugfs register access; writing integer byte 0 starts a VCO calibration, now outside 6–12 GHz.
+  At start-up it checks how far the chip locks, from 46 MHz and 6150 MHz inwards, and reports the range in
+  its greeting (`lo=46000000-6150000000`). On a Pluto+ the PLL locked 45–6170 MHz; at 46 MHz the board's
+  clock spurs (harmonics of 61.44 MHz) sit exactly where they should, at 45 MHz they don't, so 46 is the
+  floor, and 6150 leaves a margin under 6170.
+- **Past the chip's range:** a step centred further out is taken at the nearest end and shifted digitally
+  (each block multiplied by a complex exponential, its mean taken out first so the LO's leakage doesn't land
+  off centre). The step's window has to stay inside the RF bandwidth around that LO, so the cover reaches
+  half the RF bandwidth further: about 18–6178 MHz at 61.44 MSPS. Corvus Sweep takes the range from the
+  greeting.
+
+Neither is guaranteed by the chip's data sheet; expect less accuracy towards the ends.
+
+## The live view
+
+A one-step plan (Corvus Sweep's live view) streams: the board stays on the frequency (one profile switch, no
+more), keeps half its capture blocks queued back to back, and sends every block. At 15.36 MSPS and below the
+network keeps up and about 94 % of the signal is captured (each block still drops its first 256 samples);
+at 61.44 and 30.72 MSPS it's ~3,800 blocks/s, network-bound. The lower rates (CONFIG rate=15360000, 7680000,
+3840000; the driver accepts down to 2.083 MSPS) give narrower spans with finer bins.
+
 ## The driver path
 
 What runs when fast mode can't (`mode=driver`, or a board without the above):
@@ -124,7 +152,7 @@ took `skip=<2 + settle>` instead; 0.2 still accepts it, and Corvus Sweep sends b
 `mode` defaults to fast.
 
 The board sends frames of `[u32 type][u32 length][payload]` (little-endian): type 1 is one 16384-byte
-sweep block, type 2 a text line (`HELLO corvus-pluto <version> model="..." fw="..." modes=fast|driver` on
+sweep block, type 2 a text line (`HELLO corvus-pluto <version> model="..." fw="..." modes=fast|driver lo=<min>-<max>` on
 connect, then `OK ...` or `ERR ...` per command, and `NOTE ...` when fast mode stops on its own), type 3 one
 sweep block with 12-bit packed samples (12296 bytes: the 8 header words, 4088 I, Q pairs in 3 bytes each,
 I bits 0–7, then I bits 8–11 | Q bits 0–3 << 4, then Q bits 4–11, then the 8 trailer words). `OK SWEEP` says

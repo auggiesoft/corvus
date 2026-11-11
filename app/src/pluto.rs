@@ -62,12 +62,9 @@ pub fn gain_db(g: Gain) -> i32 {
     }
 }
 
-/// The analog RX bandwidth for a rate: as wide as the AD936x allows (56 MHz), 28 MHz at 30.72 MSPS.
+/// The analog RX bandwidth for a rate (Rate::pluto_rf_bw): 56 MHz at 61.44 MSPS, down to 3.5 at 3.84.
 fn rf_bandwidth(rate: Rate) -> u32 {
-    match rate {
-        Rate::P31 => 28_000_000,
-        _ => 56_000_000,
-    }
+    rate.pluto_rf_bw() as u32
 }
 
 pub struct PlutoDevice {
@@ -84,6 +81,8 @@ pub struct PlutoDevice {
     configured: Option<(Rate, i32)>,
     /// How the board sweeps ("fast", "driver"; empty before the first plan), and why not fast if it isn't.
     pub mode: Arc<parking_lot::Mutex<(String, String)>>,
+    /// Set while a new plan is on its way: blocks are dropped until the board answers it.
+    stale: Arc<AtomicBool>,
 }
 
 /// A FRAME_PACKED payload back into the block's 16-bit words (samples sign-extended from 12 bits).
@@ -122,10 +121,16 @@ fn read_frame(s: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<u32> {
     Ok(kind)
 }
 
-fn reader_loop(mut s: TcpStream, sink: Sink, replies: Sender<String>, alive: Arc<AtomicBool>, mode: Arc<parking_lot::Mutex<(String, String)>>) {
+fn reader_loop(mut s: TcpStream, sink: Sink, replies: Sender<String>, alive: Arc<AtomicBool>, mode: Arc<parking_lot::Mutex<(String, String)>>, stale: Arc<AtomicBool>) {
     let mut buf = Vec::new();
     while alive.load(Ordering::Relaxed) {
-        match read_frame(&mut s, &mut buf) {
+        let frame = read_frame(&mut s, &mut buf);
+        // blocks of the previous plan, still in flight when a new one was sent: dropped until the board's
+        // OK (frames arrive in order), or the engine would count them as gaps against the new plan
+        if matches!(frame, Ok(FRAME_BLOCK | FRAME_PACKED)) && stale.load(Ordering::Relaxed) {
+            continue;
+        }
+        match frame {
             Ok(FRAME_BLOCK) if buf.len() == BLOCK_WORDS * 2 => {
                 let words: Vec<u16> = buf.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
                 sink.push(words);
@@ -135,6 +140,9 @@ fn reader_loop(mut s: TcpStream, sink: Sink, replies: Sender<String>, alive: Arc
                 let t = String::from_utf8_lossy(&buf).into_owned();
                 if t.starts_with("ERR") || t.starts_with("NOTE") {
                     log::warn!("corvus-pluto: {t}");
+                }
+                if t.starts_with("OK SWEEP") || t.starts_with("ERR") {
+                    stale.store(false, Ordering::Relaxed);
                 }
                 if let Some(why) = t.strip_prefix("NOTE fast mode off: ") {
                     *mode.lock() = ("driver".into(), why.to_string());
@@ -176,16 +184,24 @@ impl PlutoDevice {
         let hello = hello.strip_prefix("HELLO ").ok_or_else(|| format!("{addr}: not corvus-pluto ({hello})"))?.to_string();
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let fw = hello.split("fw=\"").nth(1).and_then(|r| r.split('"').next()).unwrap_or("").to_string();
+        // corvus-pluto 0.2.1+: the LO range this chip tunes, e.g. lo=46000000-6150000000, and steps past it
+        // shifted; older boards: the driver's range only
+        match reply_value(&format!(" {hello}"), "lo").and_then(|v| v.split_once('-').map(|(a, b)| (a.parse::<f64>(), b.parse::<f64>()))) {
+            Some((Ok(a), Ok(b))) => crate::plan::set_pluto_lo(a, b, true),
+            _ => crate::plan::set_pluto_lo(crate::plan::PLUTO_DRIVER_LO.0, crate::plan::PLUTO_DRIVER_LO.1, false),
+        }
         let prog = hello.split(" model=").next().unwrap_or(&hello).to_string();
         let version = if fw.is_empty() { format!("Pluto {prog}") } else { format!("Pluto {prog} ({fw})") };
         let (tx, replies) = channel();
         let alive = Arc::new(AtomicBool::new(true));
         let mode = Arc::new(parking_lot::Mutex::new((String::new(), String::new())));
+        let stale = Arc::new(AtomicBool::new(false));
         let reader = {
             let s = stream.try_clone().map_err(|e| e.to_string())?;
             let alive = alive.clone();
             let mode = mode.clone();
-            std::thread::Builder::new().name("pluto-rx".into()).spawn(move || reader_loop(s, sink, tx, alive, mode)).map_err(|e| e.to_string())?
+            let stale = stale.clone();
+            std::thread::Builder::new().name("pluto-rx".into()).spawn(move || reader_loop(s, sink, tx, alive, mode, stale)).map_err(|e| e.to_string())?
         };
         let stop = stream.try_clone().map_err(|e| e.to_string())?;
         let stop = parking_lot::Mutex::new(stop);
@@ -193,7 +209,7 @@ impl PlutoDevice {
             let _ = stop.lock().write_all(b"STOP\n");
         }));
         log::info!("{version} at {addr}");
-        Ok(PlutoDevice { stream, version, lib_path: PathBuf::from(format!("network {addr}")), replies, alive, reader: Some(reader), plan: None, rx, configured: None, mode })
+        Ok(PlutoDevice { stream, version, lib_path: PathBuf::from(format!("network {addr}")), replies, alive, reader: Some(reader), plan: None, rx, configured: None, mode, stale })
     }
 
     /// Send one command and wait for its reply ("OK ..." or "ERR ...").
@@ -228,6 +244,7 @@ impl PlutoDevice {
     pub fn sweep(&mut self, plan: &Plan) -> Result<(), String> {
         self.configure(plan.rate)?;
         let want = if std::env::var("CORVUS_PLUTO_MODE").is_ok_and(|m| m == "driver") { "driver" } else { "fast" };
+        self.stale.store(true, Ordering::Relaxed);
         // settle= for corvus-pluto 0.2 (it adds its own flush where it needs one); skip= for 0.1, which ignores
         // settle, mode and pack. Fast mode calibrates its profiles on a new plan first (~0.7 s).
         let reply = self.cmd(

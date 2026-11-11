@@ -9,6 +9,20 @@ pub const F_MAX_HZ: f64 = 1800e6;
 /// Samples per DMA block, the unit of the firmware's block counter.
 pub const BLOCK_WORDS: usize = 8192;
 
+/// The Pluto's RX LO range in Hz, as its corvus-pluto reports it (`lo=` in its greeting): the driver's
+/// 46.88 MHz–6 GHz, or wider where the chip's synthesizer locks; and whether the board shifts steps past it
+/// (0.2.1+, the ones that report a range). Until a board says: the driver's range, which any corvus-pluto
+/// tunes (the simulator sets what a Pluto+ reported).
+static PLUTO_LO: parking_lot::Mutex<(f64, f64, bool)> = parking_lot::const_mutex((PLUTO_DRIVER_LO.0, PLUTO_DRIVER_LO.1, false));
+
+/// A board's reported range (`shifts`: it takes steps past it at the nearest end, shifted).
+pub fn set_pluto_lo(lo_hz: f64, hi_hz: f64, shifts: bool) {
+    *PLUTO_LO.lock() = (lo_hz, hi_hz, shifts);
+}
+
+/// The driver's range, for a corvus-pluto older than 0.2.1 (no `lo=`, no shifted steps).
+pub const PLUTO_DRIVER_LO: (f64, f64) = (46.88e6, 6000e6);
+
 /// The sample-rate setting the sweep runs at (RFOne: 10 or 12, Airspy R2: 10, Airspy Mini: 6). The ADC
 /// samples the tuner's IF (a quarter of the ADC rate) as real samples; the tuner IF filter is set with it.
 /// See docs/measurements.md, "12 MSPS".
@@ -32,6 +46,11 @@ pub enum Rate {
     P61,
     /// PlutoSDR family at 30.72 MSPS: half the step width, twice the frequency resolution.
     P31,
+    /// PlutoSDR family at 15.36, 7.68 and 3.84 MSPS: narrower spans with finer bins (3.75, 1.9, 0.94 kHz),
+    /// mostly for the live view (RF bandwidth 14, 7, 3.5 MHz).
+    P15,
+    P7,
+    P3,
 }
 
 impl Rate {
@@ -44,6 +63,9 @@ impl Rate {
             Rate::H20 => 20,
             Rate::P61 => 61,
             Rate::P31 => 31,
+            Rate::P15 => 15,
+            Rate::P7 => 7,
+            Rate::P3 => 3,
         }
     }
 
@@ -56,6 +78,9 @@ impl Rate {
             Rate::H20 => "20 MSPS",
             Rate::P61 => "61.44 MSPS",
             Rate::P31 => "30.72 MSPS",
+            Rate::P15 => "15.36 MSPS",
+            Rate::P7 => "7.68 MSPS",
+            Rate::P3 => "3.84 MSPS",
         }
     }
 
@@ -65,13 +90,16 @@ impl Rate {
             Rate::H20 => 20e6,
             Rate::P61 => 61.44e6,
             Rate::P31 => 30.72e6,
+            Rate::P15 => 15.36e6,
+            Rate::P7 => 7.68e6,
+            Rate::P3 => 3.84e6,
             _ => 2e6 * self.msps() as f64,
         }
     }
 
     /// Complex (IQ) samples rather than real ones.
     pub fn complex(self) -> bool {
-        matches!(self, Rate::H20 | Rate::P61 | Rate::P31)
+        matches!(self, Rate::H20 | Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3)
     }
 
     /// The HackRF's stock sweep: two slices per tune, either side of its LO.
@@ -81,7 +109,7 @@ impl Rate {
 
     /// 12-bit IQ in two words per sample (the Pluto); otherwise one word per sample.
     pub fn iq16(self) -> bool {
-        matches!(self, Rate::P61 | Rate::P31)
+        matches!(self, Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3)
     }
 
     /// Samples a block holds, tags included (a block is BLOCK_WORDS words).
@@ -98,8 +126,43 @@ impl Rate {
     pub fn f_range(self) -> (f64, f64) {
         match self {
             Rate::H20 => (1e6, 6000e6),
-            Rate::P61 | Rate::P31 => (70e6, 6000e6),
+            // past the LO range, steps are taken at its end and shifted on the board: the cover reaches half
+            // the RF bandwidth further (less accurately towards the ends)
+            Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3 => {
+                let (lo, hi, shifts) = *PLUTO_LO.lock();
+                let reach = if shifts { self.pluto_half_bw() } else { 0.0 };
+                (lo - reach, hi + reach)
+            }
             _ => (F_MIN_HZ, F_MAX_HZ),
+        }
+    }
+
+    /// Half the Pluto's RF bandwidth at this rate (56 MHz at 61.44 MSPS, 28 at 30.72, 14, 7, 3.5).
+    fn pluto_half_bw(self) -> f64 {
+        self.pluto_rf_bw() / 2.0
+    }
+
+    /// The analog RX bandwidth corvus-pluto sets for this rate: as wide as the AD936x allows at 61.44 MSPS,
+    /// otherwise a little under the sample rate.
+    pub fn pluto_rf_bw(self) -> f64 {
+        match self {
+            Rate::P31 => 28e6,
+            Rate::P15 => 14e6,
+            Rate::P7 => 7e6,
+            Rate::P3 => 3.5e6,
+            _ => 56e6,
+        }
+    }
+
+    /// Where step centres may go for steps of `step` Hz: the tuning range, or for the Pluto as far past its
+    /// LO range as keeps the whole step inside the RF bandwidth of an LO at the end.
+    pub fn centre_range(self, step: f64) -> (f64, f64) {
+        if self.iq16() {
+            let (lo, hi, shifts) = *PLUTO_LO.lock();
+            let reach = if shifts { (self.pluto_half_bw() - step / 2.0).max(0.0) } else { 0.0 };
+            (lo - reach, hi + reach)
+        } else {
+            self.f_range()
         }
     }
 
@@ -117,6 +180,9 @@ impl Rate {
             Rate::H20 => 5.0e6,
             Rate::P61 => 50.0e6,
             Rate::P31 => 25.0e6,
+            Rate::P15 => 12.0e6,
+            Rate::P7 => 6.0e6,
+            Rate::P3 => 3.0e6,
         }
     }
 
@@ -129,6 +195,9 @@ impl Rate {
             Rate::H20 => &[(5.0, "5 MHz")],
             Rate::P61 => &[(20.0, "20"), (30.0, "30"), (40.0, "40"), (50.0, "50 MHz")],
             Rate::P31 => &[(10.0, "10"), (15.0, "15"), (20.0, "20"), (25.0, "25 MHz")],
+            Rate::P15 => &[(5.0, "5"), (8.0, "8"), (10.0, "10"), (12.0, "12 MHz")],
+            Rate::P7 => &[(2.0, "2"), (4.0, "4"), (5.0, "5"), (6.0, "6 MHz")],
+            Rate::P3 => &[(1.0, "1"), (2.0, "2"), (2.5, "2.5"), (3.0, "3 MHz")],
         }
     }
 
@@ -140,6 +209,9 @@ impl Rate {
             Rate::H20 => 5.0,
             Rate::P61 => 40.0,
             Rate::P31 => 20.0,
+            Rate::P15 => 10.0,
+            Rate::P7 => 5.0,
+            Rate::P3 => 2.5,
         }
     }
 }
@@ -199,11 +271,12 @@ impl Plan {
             (n, step, start + step / 2.0)
         };
         // Keep every centre inside the tuner's range; the stitched cover may then start a little lower.
+        let (cmin, cmax) = rate.centre_range(window);
         let last = f0 + (n as f64 - 1.0) * step;
-        if last > fmax {
-            f0 -= last - fmax;
+        if last > cmax {
+            f0 -= last - cmax;
         }
-        f0 = f0.max(fmin);
+        f0 = f0.max(cmin);
         Plan {
             start_hz: start,
             stop_hz: stop,

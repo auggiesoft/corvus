@@ -53,13 +53,23 @@ link) drives a **Pluto+ or PlutoSDR** through `corvus-pluto`, a small program on
 (`../firmware/pluto/`, installed with its `install.sh`). The board retunes, captures and tags the blocks
 itself, two words per 12-bit IQ sample, and serves them over TCP; Corvus Sweep only sends the plan and
 the gain (`src/pluto.rs`). 61.44 MSPS (steps up to 50 MHz, 40 by default) or 30.72 MSPS (up to 25 MHz),
-70 MHz to 6 GHz, passes back and forth (no wrap). Every gain mode sets the AD936x's one manual gain
+plus 15.36, 7.68 and 3.84 MSPS for finer bins (3.75, 1.9, 0.94 kHz native); passes back and forth (no wrap).
+**Range:** about 18 MHz to 6.18 GHz on a Pluto+. corvus-pluto pushes the synthesizer past the driver's
+46.88 MHz–6 GHz where the chip locks (46–6150 MHz here; it reports its range, `lo=` in its greeting), and
+steps beyond that are taken at the nearest end and shifted digitally, so the cover reaches half the RF
+bandwidth further. Less accurate towards the ends (the analog filter's edge, a residual of the LO leakage).
+**Live view** (Pluto, more boards to follow): the Range card's Live switch, or **L** over the spectrum
+(centred where the cursor is). One step, Centre and Span (50, 25, 12, 6, 3, 1 MHz); the span picks the
+lowest rate that covers it, so the bins are the finest the span allows. The board stays on the frequency and
+streams: ~3,800 updates/s at 61.44 and 30.72 MSPS (network-bound), and at 15.36 MSPS and below about 94 % of
+the signal captured, nearly gapless. Shift+arrows move it a span; L or Sweep goes back to the sweep it came
+from. Every gain mode sets the AD936x's one manual gain
 (0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. The bins
 around DC are bridged from their neighbours. corvus-pluto 0.2 sweeps in **fast mode** where the board
 allows it (fastlock profiles over direct SPI; the device chip says "fast sweep", or "driver sweep" and why);
 `CORVUS_PLUTO_MODE=driver` asks for the driver path. Blocks arrive 12-bit packed and are unpacked into the
 usual layout. Over 70–6000 MHz on a Pluto+ over Ethernet: about 3,300 steps a second, 130 GHz/s, 22 passes a
-second (USB network link: ~1,900 steps/s; driver path: ~650). A new plan takes ~0.7 s while the board
+second (18–6178 MHz: ~3,100 steps/s, 20 passes a second) (USB network link: ~1,900 steps/s; driver path: ~650). A new plan takes ~0.7 s while the board
 calibrates its profiles (cached for 10 minutes). A Pluto seen on USB shows in the device picker; one given by
 address shows there too.
 

@@ -27,7 +27,7 @@ pub enum Board {
     Mini,
     /// HackRF One, with its stock firmware sweep (libhackrf): 1 MHz to 6 GHz.
     HackRF,
-    /// PlutoSDR family (ADALM-Pluto, Pluto+), over the network to corvus-pluto on the board: 70 MHz to 6 GHz.
+    /// PlutoSDR family (ADALM-Pluto, Pluto+), over the network to corvus-pluto on the board: ~18 MHz to 6.18 GHz.
     Pluto,
 }
 
@@ -69,6 +69,11 @@ impl Board {
     }
 
     /// The RFOne has ANT, CABLE1 and CABLE2; the R2 has one antenna input.
+    /// The live view (one step, the board parked on a frequency): the Pluto so far.
+    pub fn has_live(self) -> bool {
+        self == Board::Pluto
+    }
+
     pub fn has_ports(self) -> bool {
         self == Board::RFOne
     }
@@ -80,7 +85,7 @@ impl Board {
             Board::Airspy => &[Rate::M10],
             Board::Mini => &[Rate::M6],
             Board::HackRF => &[Rate::H20],
-            Board::Pluto => &[Rate::P61, Rate::P31],
+            Board::Pluto => &[Rate::P61, Rate::P31, Rate::P15, Rate::P7, Rate::P3],
         }
     }
 

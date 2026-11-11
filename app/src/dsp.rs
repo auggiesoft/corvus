@@ -324,12 +324,12 @@ mod tests {
 
     #[test]
     fn pluto_tone_lands_on_its_offset_at_the_right_level() {
-        for rate in [Rate::P61, Rate::P31] {
+        for rate in [Rate::P61, Rate::P31, Rate::P15, Rate::P7, Rate::P3] {
             for nfft in NFFTS {
                 let mut d = Dsp::new(nfft, rate);
                 let r = d.window(rate.max_window_hz());
                 let mut p = vec![0.0; r.len()];
-                for off in [7_654_321.0, -0.46 * rate.max_window_hz(), 0.31 * rate.max_window_hz()] {
+                for off in [0.1530864 * rate.max_window_hz(), -0.46 * rate.max_window_hz(), 0.31 * rate.max_window_hz()] {
                     d.power(&pluto_tone_block(off, 1024.0, rate, 40.0), r.clone(), &mut p, 0);
                     let (i, &max) = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
                     let got = d.grid_off[r.start + i];

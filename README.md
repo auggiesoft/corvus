@@ -15,7 +15,7 @@ spectrum: on the RFOne, **24–1800 MHz about five times a second (8.6 GHz/s), l
 | Airspy R2 | `firmware/airspy/`, `…-sweep5` | 10 MSPS | up to 9 MHz | 6.5 GHz/s, ~3.65 passes/s | `--board airspy` |
 | Airspy Mini | the same image as the R2 | 6 MSPS | up to 4 MHz | 2.9 GHz/s, ~1.6 passes/s | `--board mini` |
 | HackRF One | **stock** (its own sweep mode, no flashing) | 20 MSPS IQ | 5 MHz slices | 8.1 GHz/s, ~4.6 passes/s (1–6000 MHz: 1.36) | `--board hackrf` |
-| Pluto+ / PlutoSDR | its own firmware + `firmware/pluto/` (a program on the board) | 61.44 MSPS IQ (or 30.72) | up to 50 MHz | 70–6000 MHz: ~130 GHz/s, ~22 passes/s (Ethernet) | `--pluto HOST` |
+| Pluto+ / PlutoSDR | its own firmware + `firmware/pluto/` (a program on the board) | 61.44 MSPS IQ (down to 3.84) | up to 50 MHz | ~18–6178 MHz: ~125 GHz/s, ~20 passes/s (Ethernet); a live view | `--pluto HOST` |
 
 The three Corvus boards speak the same sweep protocol, and the same API is added to their host
 libraries (libhydrasdr for the RFOne, libairspy for the Airspys). The R2/Mini image detects which board
@@ -97,6 +97,8 @@ and how to recover a board if a flash goes wrong (that means opening the case).
   0.5.16.7 firmware): about 450 steps/s at 40 MHz over 70–6000 MHz, clean integrity, the
   `real_boards` test passing, `corvus-pluto` starting at boot. The board keeps working with other
   software: libiio, SDR apps and its own web pages are untouched while Corvus isn't connected.
+  Fast mode followed the same day (~3,300 steps/s), then tuning past the driver's 46.88 MHz–6 GHz (the
+  cover reaches ~18–6178 MHz) and the live view.
 
 ## Licensing
 
