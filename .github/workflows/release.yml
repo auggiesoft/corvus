@@ -12,7 +12,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # gerty (self-hosted, keeps the build images cached between releases); ubuntu-24.04 is the fallback
+    runs-on: [self-hosted, corvus-release]
     steps:
       - uses: actions/checkout@v7
         with:
