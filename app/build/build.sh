@@ -10,7 +10,11 @@ WHAT=${1:-windows}
 case "$WHAT" in
   windows)
     image=corvus-app-mingw
-    docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" -f "$B/Dockerfile.windows" "$B" >/dev/null
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      log=$(mktemp)
+      docker build --progress=plain -t "$image" -f "$B/Dockerfile.windows" "$B" > "$log" 2>&1 || { tail -40 "$log"; exit 1; }
+      rm -f "$log"
+    fi
     # the crate registry is cached under target/ (gitignored) so rebuilds don't download everything again
     mkdir -p "$APP/target/docker-cargo"
     docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/app/target/docker-cargo \

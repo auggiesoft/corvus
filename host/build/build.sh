@@ -9,7 +9,11 @@ WHAT=${1:-all}
 
 build() { # <target> <source dir> <image> <dockerfile> <configure+build commands>
   local target=$1 SRC=$2 image=$3 df=$4 cmds=$5 work=$B/work/$1 out=$B/out/$1
-  docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" -f "$B/$df" "$B" >/dev/null
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    local log; log=$(mktemp)
+    docker build --progress=plain -t "$image" -f "$B/$df" "$B" > "$log" 2>&1 || { tail -40 "$log"; exit 1; }
+    rm -f "$log"
+  fi
   case "$work" in "$B"/work/?*) rm -rf "$work" ;; *) exit 1 ;; esac
   mkdir -p "$work"
   (cd "$SRC" && tar --exclude=./.git -cf - .) | (cd "$work" && tar -xf -)

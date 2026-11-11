@@ -1,5 +1,7 @@
 # libhydrasdr (with the Corvus sweep API) Linux build, mirroring upstream CI's ubuntu-24.04 job deps.
 FROM ubuntu:24.04
-RUN apt-get update -qq \
+# If Ubuntu's own archive is unreachable (it was on 2026-11-11), retry on the kernel.org mirror of it: the same
+# packages, still checked against Ubuntu's signing keys. --error-on=any: apt-get update only warns otherwise.
+RUN (apt-get update -qq --error-on=any || { sed -i 's@http://\(archive\|security\)\.ubuntu\.com/ubuntu@http://mirrors.edge.kernel.org/ubuntu@g' /etc/apt/sources.list.d/ubuntu.sources && apt-get update -qq --error-on=any; }) \
  && apt-get install -y --no-install-recommends build-essential cmake pkg-config libusb-1.0-0-dev \
  && rm -rf /var/lib/apt/lists/*
