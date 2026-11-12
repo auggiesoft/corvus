@@ -262,8 +262,8 @@ impl Radio {
         Ok(())
     }
 
-    /// Sample rate, analog bandwidth and manual gain; DC and quadrature tracking on; the TX LO off (its
-    /// leakage lands in the RX band).
+    /// Sample rate (the FIR decimator off), analog bandwidth and manual gain; DC and quadrature tracking on; the
+    /// TX LO off (its leakage lands in the RX band), the RX LO on.
     fn configure(&mut self, rate: u32, bw: u32, gain_db: i32, input: u8) -> Result<(), String> {
         if input == 2 && !self.two_inputs() {
             return Err("this board offers RX1 only (no register access, or the AD936x is in 2R2T mode)".into());
@@ -271,9 +271,14 @@ impl Radio {
         self.select_input(1)?;
         self.want_input = input;
         self.stop_capture();
+        // another program (SoapyPlutoSDR, SDR++, GQRX) may have left the FIR decimator on, which caps the rate
+        // at 30.72 MSPS: off, so every rate here can be set
+        let _ = write_attr(&self.phy.join("in_out_voltage_filter_fir_en"), "0");
         write_attr(&self.phy.join("in_voltage_sampling_frequency"), &rate.to_string())?;
         write_attr(&self.phy.join("in_voltage_rf_bandwidth"), &bw.to_string())?;
         let _ = write_attr(&self.phy.join("out_altvoltage1_TX_LO_powerdown"), "1");
+        // and the RX LO on: SoapyPlutoSDR powers it down when it closes, leaving the receiver deaf
+        let _ = write_attr(&self.phy.join("out_altvoltage0_RX_LO_powerdown"), "0");
         for a in ["in_voltage_quadrature_tracking_en", "in_voltage_rf_dc_offset_tracking_en", "in_voltage_bb_dc_offset_tracking_en"] {
             let _ = write_attr(&self.phy.join(a), "1");
         }

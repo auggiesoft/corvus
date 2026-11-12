@@ -139,6 +139,11 @@ What runs when fast mode can't (`mode=driver`, or a board without the above):
 Both paths: manual gain, DC and quadrature tracking on, the TX LO powered down (its leakage lands in the RX
 band), RF bandwidth 56 MHz at 61.44 MSPS, 28 MHz at 30.72; 4088 IQ samples per block (66.5 µs at 61.44 MSPS).
 
+**After other programs** (0.2.4): every `CONFIG` turns the AD936x's FIR decimator off and the RX LO on.
+SoapyPlutoSDR (so SDR++, GQRX and the like through it) leaves the FIR on at low rates, which caps the rate at
+30.72 MSPS (`CONFIG rate=61440000` failed with EINVAL), and powers the RX LO down when it closes, which left
+corvus-pluto sweeping a deaf receiver (flat noise, RSSI ~104 dB) until something powered it up again.
+
 ## RX1 and RX2
 
 In 1R1T the AD936x puts one receiver on the data port; `CONFIG ... rx=2` picks RX2 (corvus-pluto 0.2.3; the
