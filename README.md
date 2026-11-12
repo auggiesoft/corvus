@@ -36,6 +36,11 @@ window, or *Share this radio* in the window); another connects by address and PI
 LAN, and drives it with the same controls, getting the waterfall history as it connects. The radio
 keeps sweeping between visits. See [app/README.md](app/README.md#remote).
 
+**Other radios through SoapySDR.** With SoapySDR installed, any IQ radio its modules open (RTL-SDR,
+LimeSDR, SDRplay, USRPs such as the B210…) shows in the radio picker and gets the same display, swept from
+the PC. Slower than a board's own sweep, but the same waterfall, looks and passband learning. See
+[app/README.md](app/README.md#soapysdr-radios).
+
 **Stock firmware works too, just slower.** On an RFOne or Airspy without the Corvus firmware, Corvus
 Sweep retunes the board from the PC step by step: about 30–60 steps a second (0.1–0.6 GHz/s), roughly
 15–20× slower than the firmware sweep, with the same display and integrity checks.

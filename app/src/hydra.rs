@@ -29,6 +29,8 @@ pub enum Board {
     HackRF,
     /// PlutoSDR family (ADALM-Pluto, Pluto+), over the network to corvus-pluto on the board: ~18 MHz to 6.18 GHz.
     Pluto,
+    /// Any IQ radio a SoapySDR module opens (RTL-SDR, LimeSDR, USRP…), swept from the PC (`soapy`).
+    Soapy,
 }
 
 impl Board {
@@ -39,6 +41,7 @@ impl Board {
             "mini" | "airspy-mini" => Some(Board::Mini),
             "hackrf" => Some(Board::HackRF),
             "pluto" | "plutoplus" | "pluto+" => Some(Board::Pluto),
+            "soapy" | "soapysdr" => Some(Board::Soapy),
             _ => None,
         }
     }
@@ -51,6 +54,7 @@ impl Board {
             Board::Mini => "Airspy Mini",
             Board::HackRF => "HackRF One",
             Board::Pluto => "Pluto",
+            Board::Soapy => crate::soapy::name(),
         }
     }
 
@@ -64,7 +68,7 @@ impl Board {
             Board::RFOne => "hydrasdr_",
             Board::Airspy | Board::Mini => "airspy_",
             Board::HackRF => "hackrf_",
-            Board::Pluto => "",
+            Board::Pluto | Board::Soapy => "",
         }
     }
 
@@ -96,6 +100,7 @@ impl Board {
             Board::Mini => &[Rate::M6],
             Board::HackRF => &[Rate::H20],
             Board::Pluto => &[Rate::P61, Rate::P31, Rate::P15, Rate::P7, Rate::P3],
+            Board::Soapy => crate::soapy::rates(),
         }
     }
 
@@ -108,7 +113,7 @@ impl Board {
             Board::RFOne => "libhydrasdr.so.1.1.4",
             Board::Airspy | Board::Mini => "libairspy.so.1.0.10",
             Board::HackRF => "libhackrf.so.0",
-            Board::Pluto => "",
+            Board::Pluto | Board::Soapy => "",
         }
     }
 
@@ -118,7 +123,7 @@ impl Board {
             Board::RFOne => os.to_string(),
             Board::Airspy | Board::Mini => format!("airspy-{os}"),
             Board::HackRF => format!("hackrf-{os}"), // not built here: the system libhackrf is used
-            Board::Pluto => "none".into(),
+            Board::Pluto | Board::Soapy => "none".into(),
         };
         format!("../host/build/out/{dir}/{}", self.lib_file())
     }
@@ -129,7 +134,7 @@ impl Board {
             Board::RFOne => "libhydrasdr.so.1",
             Board::Airspy | Board::Mini => "libairspy.so.0",
             Board::HackRF => "libhackrf.so.0",
-            Board::Pluto => "",
+            Board::Pluto | Board::Soapy => "",
         }
     }
 
@@ -141,6 +146,7 @@ impl Board {
             Board::Mini => "airspy-mini-",
             Board::HackRF => "hackrf-",
             Board::Pluto => "pluto-",
+            Board::Soapy => crate::soapy::prefix(),
         }
     }
 }
@@ -544,6 +550,7 @@ pub enum Device {
     R82x(R82xDevice),
     HackRF(crate::hackrf::HackrfDevice),
     Pluto(crate::pluto::PlutoDevice),
+    Soapy(crate::soapy::SoapyDevice),
 }
 
 impl Device {
@@ -551,6 +558,7 @@ impl Device {
         match board() {
             Board::HackRF => crate::hackrf::HackrfDevice::open(lib_path, serial, sink, rx).map(Device::HackRF),
             Board::Pluto => crate::pluto::PlutoDevice::open(sink, rx).map(Device::Pluto),
+            Board::Soapy => crate::soapy::SoapyDevice::open(serial, sink, rx).map(Device::Soapy),
             _ => R82xDevice::open(lib_path, serial, sink, rx, rate).map(Device::R82x),
         }
     }
@@ -560,13 +568,14 @@ impl Device {
             Device::R82x(d) => &d.version,
             Device::HackRF(d) => &d.version,
             Device::Pluto(d) => &d.version,
+            Device::Soapy(d) => &d.version,
         }
     }
 
     pub fn fw_revision(&self) -> i32 {
         match self {
             Device::R82x(d) => d.fw_revision,
-            Device::HackRF(_) | Device::Pluto(_) => 0,
+            Device::HackRF(_) | Device::Pluto(_) | Device::Soapy(_) => 0,
         }
     }
 
@@ -575,6 +584,7 @@ impl Device {
             Device::R82x(d) => &d.lib_path,
             Device::HackRF(d) => &d.lib_path,
             Device::Pluto(d) => &d.lib_path,
+            Device::Soapy(d) => &d.lib_path,
         }
     }
 
@@ -588,6 +598,7 @@ impl Device {
             Device::R82x(d) => d.sweep(plan),
             Device::HackRF(d) => d.sweep(plan),
             Device::Pluto(d) => d.sweep(plan),
+            Device::Soapy(d) => d.sweep(plan),
         }
     }
 
@@ -596,6 +607,7 @@ impl Device {
             Device::R82x(d) => d.set_rx(rx),
             Device::HackRF(d) => d.set_rx(rx),
             Device::Pluto(d) => d.set_rx(rx),
+            Device::Soapy(d) => d.set_rx(rx),
         }
     }
 
@@ -604,6 +616,7 @@ impl Device {
             Device::R82x(d) => d.pause(),
             Device::HackRF(d) => d.pause(),
             Device::Pluto(d) => d.pause(),
+            Device::Soapy(d) => d.pause(),
         }
     }
 
@@ -612,6 +625,7 @@ impl Device {
             Device::R82x(d) => d.resume(),
             Device::HackRF(d) => d.resume(),
             Device::Pluto(d) => d.resume(),
+            Device::Soapy(d) => d.resume(),
         }
     }
 }

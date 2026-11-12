@@ -1225,6 +1225,7 @@ fn eq_path(prefix: &str, rate: Rate, nfft: usize) -> PathBuf {
         Rate::P15 => format!("passband-eq-15msps-iq-{nfft}.f32"),
         Rate::P7 => format!("passband-eq-7msps-iq-{nfft}.f32"),
         Rate::P3 => format!("passband-eq-3msps-iq-{nfft}.f32"),
+        Rate::Iq(sr) => format!("passband-eq-iq{sr}-{nfft}.f32"),
     };
     base.join("corvus-sweep").join(format!("{prefix}{name}"))
 }
@@ -1232,7 +1233,8 @@ fn eq_path(prefix: &str, rate: Rate, nfft: usize) -> PathBuf {
 /// Every learned passband in the cache, counted as 10 passes so new data can still move it.
 fn load_eq_store(prefix: &str) -> HashMap<(Rate, usize), (Vec<f32>, u32)> {
     let mut store = HashMap::new();
-    for rate in [Rate::M10, Rate::M12, Rate::M6, Rate::H20, Rate::P61, Rate::P31, Rate::P15, Rate::P7, Rate::P3] {
+    let soapy = if prefix.starts_with("soapy-") { crate::soapy::rates() } else { &[] };
+    for rate in [Rate::M10, Rate::M12, Rate::M6, Rate::H20, Rate::P61, Rate::P31, Rate::P15, Rate::P7, Rate::P3].into_iter().chain(soapy.iter().copied()) {
         for nfft in dsp::NFFTS {
             if let Some(v) = load_eq(prefix, rate, nfft) {
                 store.insert((rate, nfft), (v, 10));

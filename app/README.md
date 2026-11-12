@@ -96,6 +96,83 @@ Other options: `--board rfone|airspy|mini|hackrf|pluto` (or `CORVUS_BOARD`), `--
 Building needs a Rust toolchain (edition 2024) and, on Linux, the usual Wayland/X11 and Vulkan or
 GL libraries that wgpu uses.
 
+### SoapySDR radios
+
+Any IQ radio a SoapySDR module can open (RTL-SDR, LimeSDR, SDRplay, BladeRF, USRPs such as the B210 through
+SoapyUHD…) can be swept too: the radio picker lists what the installed modules find (it looks in the
+background when the picker opens), or `--soapy ARGS` picks one (`--soapy driver=rtlsdr`, `--soapy
+driver=uhd,serial=…`; empty ARGS takes the first). libSoapySDR is loaded at run time, never linked: without
+it nothing changes, and Corvus Sweep needs nothing else from it.
+
+#### Getting SoapySDR
+
+You need SoapySDR 0.8 and a module for each kind of radio. Install them from your system's packages (Linux)
+or a bundle (Windows). Corvus Sweep finds them by itself; `CORVUS_SOAPY_LIB` names the library outright if it's
+somewhere unusual.
+
+**Linux.** The core and the modules for your radios:
+
+| Distribution | Core | Modules |
+|---|---|---|
+| Arch, Manjaro | `sudo pacman -S soapysdr` | `soapyrtlsdr`, `soapyairspy`, `soapyhackrf`, `soapybladerf`, `soapyuhd`, `soapyplutosdr`, `limesuite` (LimeSDR); SDRplay: `soapysdrplay3-git` (AUR) with SDRplay's API |
+| Debian, Ubuntu | `sudo apt install soapysdr-tools` | `soapysdr-module-rtlsdr`, `-airspy`, `-hackrf`, `-bladerf`, `-uhd`, `-lms7`, or `soapysdr-module-all` (no PlutoSDR module is packaged) |
+| Fedora | `sudo dnf install SoapySDR` | `soapy-rtlsdr`, `soapy-uhd`, `soapy-airspyhf`, … (`dnf search soapy`) |
+
+Then check what it sees, with the radio plugged in: `SoapySDRUtil --find`. Each radio it lists shows in the
+picker. If one is missing, it's usually USB permissions (the module's package normally brings a udev rule:
+unplug and replug, or log in again) or another program holding it. Corvus Sweep looks for
+`libSoapySDR.so.0.8` beside itself and then where the system keeps libraries.
+
+**Windows.** Two bundles carry SoapySDR 0.8 with the common modules (RTL-SDR, Airspy, HackRF, LimeSDR,
+BladeRF, USRP):
+
+- **PothosSDR** (simplest): run the installer, `PothosSDR-2021.07.25-vc16-x64.exe` from
+  [downloads.myriadrf.org/builds/PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/), and keep its
+  default folder (`C:\Program Files\PothosSDR`). Ticking "add to the system PATH" lets you run `SoapySDRUtil
+  --find` from any prompt.
+- **radioconda**: a conda-based radio distribution; its installer is at
+  [github.com/radioconda/radioconda-installer](https://github.com/radioconda/radioconda-installer). Corvus
+  Sweep finds it in `%USERPROFILE%\radioconda` (a per-user install) or `C:\ProgramData\radioconda` (all users).
+
+Corvus Sweep looks for `SoapySDR.dll` beside itself, on PATH, then in those folders. Windows also needs the
+right USB driver for each radio:
+
+- RTL-SDR dongles: WinUSB, installed with [Zadig](https://zadig.akeo.ie/) (Options → List all devices, pick
+  "Bulk-In, Interface (Interface 0)", WinUSB, Replace driver).
+- Airspy, HackRF, RFOne: no driver needed (WinUSB through Microsoft OS descriptors), though these also have
+  Corvus Sweep's own, much faster, sweep.
+- SDRplay: SDRplay's own API (v3) installer, from sdrplay.com.
+- USRP (B200/B210): Ettus's WinUSB driver (`erllc_uhd_winusb_driver.zip`, from files.ettus.com, under
+  binaries/misc), plus the FPGA images below.
+
+**USRPs (B200, B210…)** load their FPGA image from the host at every start: run `uhd_images_downloader` once
+after installing (Arch: `libuhd-utils`; Debian/Ubuntu: `uhd-host`; Windows: from the radioconda prompt, or
+Ettus's UHD installer). Then `uhd_find_devices` should list the radio.
+
+The PC sweeps it (`src/soapy.rs`): for each step it retunes through the module, drops the samples in flight
+and while the tuner settles (two of the radio's stream transfers, one for SoapyAirspy, plus 3 ms;
+`CORVUS_SOAPY_SKIP_MTU`, `CORVUS_SOAPY_SETTLE_MS`), then reads the step's blocks as complex floats, scaled so
+the radio's full scale reads 0 dBFS, in the Pluto's two-word layout. The engine then treats it as it treats
+the Pluto: two looks (on by default) hide the radio's DC spike and images, the passband learner learns its
+filter (stored per driver), the health check reads its headroom. Rates are the radio's own (the fastest few
+between 1.3 and 61.44 MSPS; an RTL-SDR's fastest is taken as 2.4); a step is three quarters of the rate.
+Gain is SoapySDR's overall gain: every gain mode sets it, 0–21 spread over the radio's range (the Receiver
+card shows the dB).
+
+Measured on the FM band (88–108 MHz), against each board's own sweep:
+
+| Through SoapySDR | Rate | Steps/s | Native (Corvus firmware) |
+|---|---|---|---|
+| Airspy Mini (SoapyAirspy) | 6 MSPS | 76 | 523 |
+| RFOne (SoapyHydraSDR) | 10 MSPS | 70 | 781 |
+| Pluto+ (SoapyPlutoSDR) | 10 MSPS | 21–39 | 3,200 (corvus-pluto) |
+
+With the transfers dropped, signals and floor match the native sweep (Mini at the same 32 dB: SNR 31 vs 30 dB
+and 32.5 vs 35.6 on two stations). Fewer, and copies of strong signals appear a step or two away (the
+samples in flight still hold the previous step). SoapyPlutoSDR buffers deeper than six transfers, so the
+Pluto keeps faint copies: use corvus-pluto, which is ~80 times faster anyway. A Soapy entry for a board
+Corvus drives natively is there for comparison.
+
 ### Remote
 
 One Corvus Sweep owns the radio and shares it; another, on any machine, shows it in the same window with the
@@ -326,6 +403,7 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 | `src/usbdev.rs` | the built-in USB driver for every board (libhydrasdr's, libairspy's and libhackrf's requests in Rust, nusb), and board discovery on any platform |
 | `src/hackrf.rs` | the HackRF's stock sweep: setup and re-tagging its blocks as 5 MHz steps (built-in driver or libhackrf) |
 | `src/pluto.rs` | the Pluto over the network: corvus-pluto's protocol (plan, gain, stop), its blocks into the engine |
+| `src/soapy.rs` | SoapySDR radios: libSoapySDR loaded at run time, the background search, the PC-driven sweep |
 | `src/net.rs` | remote operation: the server (`--serve`, Share this radio), the client, the PIN check, LAN discovery |
 | `build/` | `build.sh windows`: the Windows cross-build (MinGW in Docker) |
 | `src/plan.rs` | sample rate, range → step grid, firmware visiting order, VCO divider model, presets |

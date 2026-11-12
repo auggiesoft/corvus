@@ -56,6 +56,48 @@ pub enum Rate {
     P15,
     P7,
     P3,
+    /// Any IQ radio through SoapySDR, at this many samples a second: complex samples around the LO, in the
+    /// Pluto's two-word block layout (scaled so the radio's full scale reads 0 dBFS), swept from the PC.
+    Iq(u32),
+}
+
+/// What a SoapySDR radio tunes (Hz), as it reported when opened; until then a wide guess.
+static IQ_RANGE: parking_lot::Mutex<(f64, f64)> = parking_lot::const_mutex((1e6, 6000e6));
+
+pub fn set_iq_range(lo_hz: f64, hi_hz: f64) {
+    *IQ_RANGE.lock() = (lo_hz, hi_hz);
+}
+
+/// Share of a SoapySDR radio's sample rate a step uses (its anti-alias filter's flat part, roughly).
+const IQ_USABLE: f64 = 0.75;
+
+/// Labels and step lists for `Rate::Iq` (made once per rate and kept: the API hands out static strings).
+#[allow(clippy::type_complexity)]
+static IQ_NAMES: parking_lot::Mutex<Vec<(u32, &'static str, &'static [(f64, &'static str)])>> = parking_lot::const_mutex(Vec::new());
+
+fn iq_names(sr: u32) -> (&'static str, &'static [(f64, &'static str)]) {
+    let mut names = IQ_NAMES.lock();
+    if let Some(&(_, l, s)) = names.iter().find(|n| n.0 == sr) {
+        return (l, s);
+    }
+    let trim = |v: f64, dec: usize| {
+        let t = format!("{v:.dec$}");
+        if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t }
+    };
+    let label: &'static str = Box::leak(format!("{} MSPS", trim(sr as f64 / 1e6, 3)).into_boxed_str());
+    let w = sr as f64 * IQ_USABLE / 1e6;
+    // half, two thirds, five sixths and all of the usable width, rounded to 10 kHz
+    let mut steps: Vec<(f64, &'static str)> = Vec::new();
+    for (i, k) in [0.5, 2.0 / 3.0, 5.0 / 6.0, 1.0].into_iter().enumerate() {
+        let v = (w * k * 100.0).floor() / 100.0;
+        if v > 0.0 && steps.last().is_none_or(|l| l.0 < v) {
+            let t = trim(v, 2);
+            steps.push((v, Box::leak(if i == 3 { format!("{t} MHz") } else { t }.into_boxed_str())));
+        }
+    }
+    let steps: &'static [(f64, &'static str)] = Box::leak(steps.into_boxed_slice());
+    names.push((sr, label, steps));
+    (label, steps)
 }
 
 impl Rate {
@@ -71,6 +113,7 @@ impl Rate {
             Rate::P15 => 15,
             Rate::P7 => 7,
             Rate::P3 => 3,
+            Rate::Iq(sr) => (sr + 500_000) / 1_000_000,
         }
     }
 
@@ -86,6 +129,7 @@ impl Rate {
             Rate::P15 => "15.36 MSPS",
             Rate::P7 => "7.68 MSPS",
             Rate::P3 => "3.84 MSPS",
+            Rate::Iq(sr) => iq_names(sr).0,
         }
     }
 
@@ -98,13 +142,14 @@ impl Rate {
             Rate::P15 => 15.36e6,
             Rate::P7 => 7.68e6,
             Rate::P3 => 3.84e6,
+            Rate::Iq(sr) => sr as f64,
             _ => 2e6 * self.msps() as f64,
         }
     }
 
     /// Complex (IQ) samples rather than real ones.
     pub fn complex(self) -> bool {
-        matches!(self, Rate::H20 | Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3)
+        matches!(self, Rate::H20 | Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3 | Rate::Iq(_))
     }
 
     /// The HackRF's stock sweep: two slices per tune, either side of its LO.
@@ -112,8 +157,13 @@ impl Rate {
         self == Rate::H20
     }
 
-    /// 12-bit IQ in two words per sample (the Pluto); otherwise one word per sample.
+    /// 12-bit IQ in two words per sample (the Pluto, and SoapySDR radios); otherwise one word per sample.
     pub fn iq16(self) -> bool {
+        matches!(self, Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3 | Rate::Iq(_))
+    }
+
+    /// A Pluto rate (corvus-pluto's LO range and RF bandwidth apply).
+    pub fn pluto(self) -> bool {
         matches!(self, Rate::P61 | Rate::P31 | Rate::P15 | Rate::P7 | Rate::P3)
     }
 
@@ -138,6 +188,7 @@ impl Rate {
                 let reach = if shifts { self.pluto_half_bw() } else { 0.0 };
                 (lo - reach, hi + reach)
             }
+            Rate::Iq(_) => *IQ_RANGE.lock(),
             _ => (F_MIN_HZ, F_MAX_HZ),
         }
     }
@@ -155,6 +206,7 @@ impl Rate {
             Rate::P15 => 14e6,
             Rate::P7 => 7e6,
             Rate::P3 => 3.5e6,
+            Rate::Iq(sr) => sr as f64,
             _ => 56e6,
         }
     }
@@ -162,7 +214,7 @@ impl Rate {
     /// Where step centres may go for steps of `step` Hz: the tuning range, or for the Pluto as far past its
     /// LO range as keeps the whole step inside the RF bandwidth of an LO at the end.
     pub fn centre_range(self, step: f64) -> (f64, f64) {
-        if self.iq16() {
+        if self.pluto() {
             let (lo, hi, shifts) = *PLUTO_LO.lock();
             let reach = if shifts { (self.pluto_half_bw() - step / 2.0).max(0.0) } else { 0.0 };
             (lo - reach, hi + reach)
@@ -188,6 +240,7 @@ impl Rate {
             Rate::P15 => 12.0e6,
             Rate::P7 => 6.0e6,
             Rate::P3 => 3.0e6,
+            Rate::Iq(sr) => sr as f64 * IQ_USABLE,
         }
     }
 
@@ -203,6 +256,7 @@ impl Rate {
             Rate::P15 => &[(5.0, "5"), (8.0, "8"), (10.0, "10"), (12.0, "12 MHz")],
             Rate::P7 => &[(2.0, "2"), (4.0, "4"), (5.0, "5"), (6.0, "6 MHz")],
             Rate::P3 => &[(1.0, "1"), (2.0, "2"), (2.5, "2.5"), (3.0, "3 MHz")],
+            Rate::Iq(sr) => iq_names(sr).1,
         }
     }
 
@@ -217,6 +271,7 @@ impl Rate {
             Rate::P15 => 10.0,
             Rate::P7 => 5.0,
             Rate::P3 => 2.5,
+            Rate::Iq(sr) => iq_names(sr).1.last().map_or(sr as f64 * IQ_USABLE / 1e6, |s| s.0),
         }
     }
 }

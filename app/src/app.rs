@@ -559,6 +559,16 @@ fn dev_info(src: &Src, serial: u64) -> DevInfo {
             } else {
                 format!("{} · {} · {} · rev {}", d.version(), if serial == 0 { format!("first {board}") } else { format!("{serial:016X}") }, d.lib_path().display(), d.fw_revision())
             };
+            if let crate::hydra::Device::Soapy(s) = d {
+                return DevInfo {
+                    kind: SrcKind::Device,
+                    dot: Dot::Ok,
+                    short: format!("{} · SoapySDR sweep", s.label),
+                    details: format!("{}\nLibrary {}\nSwept from the PC: each step retunes through the radio's driver, then waits for it to settle.", d.version(), d.lib_path().display()),
+                    footer: format!("{} · {}", d.version(), d.lib_path().display()),
+                    ..Default::default()
+                };
+            }
             if let crate::hydra::Device::Pluto(p) = d {
                 let (mode, note) = p.mode.lock().clone();
                 let how = match mode.as_str() {
@@ -598,6 +608,11 @@ fn dev_info(src: &Src, serial: u64) -> DevInfo {
             }
         }
     }
+}
+
+/// SoapySDR radios as the picker lists them (none while the first search runs, or without SoapySDR).
+pub fn soapy_found() -> Vec<crate::hydra::Found> {
+    crate::soapy::cached().into_iter().map(|f| crate::hydra::Found { board: crate::hydra::Board::Soapy, serial: f.id, label: f.label }).collect()
 }
 
 /// What the picker's network part asked for.
@@ -1025,8 +1040,8 @@ impl App {
         self.replan();
         self.src = open_device(&self.lib, self.serial, &self.engine, &self.applied, self.applied_rx);
         let now = crate::hydra::board();
-        if now != board {
-            // the firmware said which Airspy it is
+        if now != board || !now.rates().contains(&self.applied.rate) {
+            // the firmware said which Airspy it is (or a SoapySDR radio, what rates it has)
             self.engine.set_eq_prefix(now.cache_prefix());
             self.cfg.fit_board();
             self.replan();
@@ -1071,7 +1086,12 @@ impl App {
                 st.serial,
                 st.dev.kind == SrcKind::Sim,
             ),
-            None => ("Radios".to_string(), found, matches!(self.src, Src::Device(_)), self.serial, matches!(self.src, Src::Sim(_))),
+            None => {
+                // and what SoapySDR's modules find (looked for in the background; they appear when it's done)
+                let mut found = found;
+                found.extend(soapy_found());
+                ("Radios".to_string(), found, matches!(self.src, Src::Device(_)), self.serial, matches!(self.src, Src::Sim(_)))
+            }
         };
         let mut pick: Option<Option<(crate::hydra::Board, u64)>> = None;
         let mut net_act: Option<NetAct> = None;
@@ -1089,6 +1109,7 @@ impl App {
                     let current = live && same_family && (f.serial == cur_serial || cur_serial == 0);
                     let label = if f.board == crate::hydra::Board::Airspy && current { cur_board.name().to_string() } else { f.label.clone() };
                     let id = match f.board.networked() {
+                        _ if f.board == crate::hydra::Board::Soapy => "SoapySDR".to_string(),
                         true if server.is_some() => "network".to_string(),
                         true => crate::pluto::addr(),
                         false => format!("{:016X}", f.serial),
@@ -2030,7 +2051,9 @@ impl App {
                 }
                 theme::more(ui, "engine-more", "Rate, order, dwell and lock check", |ui| {
                     let mut rate = self.cfg.rate;
-                    let rate_hint = if crate::hydra::board() == crate::hydra::Board::Pluto {
+                    let rate_hint = if crate::hydra::board() == crate::hydra::Board::Soapy {
+                        "The radio's own sample rates (the fastest few). A step uses three quarters of the rate, the flat middle of most radios' filters; two looks then hide the DC spike and images."
+                    } else if crate::hydra::board() == crate::hydra::Board::Pluto {
                         "61.44 MSPS: steps up to 50 MHz (the noise floor stays within 1 dB over 40), the fastest sweep.\n30.72 MSPS: steps up to 25 MHz, bins half as wide.\n15.36, 7.68, 3.84 MSPS: narrower steps, bins down to 0.94 kHz; mostly for the live view."
                     } else {
                         "10 MSPS: 20 MSPS real, IF 5 MHz, steps up to 9.3 MHz.\n12 MSPS: 24 MSPS real, tuner filter wide open, steps up to 10 MHz, about a third more GHz/s."
@@ -2136,6 +2159,9 @@ impl App {
                 }
                 if pluto {
                     theme::caption(ui, format!("{} dB of RX gain on the AD936x.", crate::pluto::gain_db(self.cfg.gain)));
+                }
+                if crate::hydra::board() == crate::hydra::Board::Soapy {
+                    theme::caption(ui, format!("{:.1} dB of gain on the radio (SoapySDR's overall gain; every mode sets it).", crate::soapy::gain_db(self.cfg.gain)));
                 }
             });
             ui.add_space(gap);
@@ -3806,8 +3832,8 @@ fn open_windowless(opts: &Options) -> (Config, Engine, Src, Plan) {
             src = Src::Offline(e);
         }
     }
-    if crate::hydra::board() != asked {
-        // the firmware said which Airspy it is: fit the settings and start the sweep
+    if crate::hydra::board() != asked || !crate::hydra::board().rates().contains(&plan.rate) {
+        // the firmware said which Airspy it is (or a SoapySDR radio, its rates): fit the settings and sweep
         engine.set_eq_prefix(crate::hydra::board().cache_prefix());
         cfg.fit_board();
         plan = cfg.plan();
@@ -3873,7 +3899,7 @@ pub fn serve(opts: Options, bind: std::net::SocketAddr, pin: Option<String>) -> 
                         engine.set_plan(applied.clone());
                         src = open_device(&lib, serial, &engine, &applied, rx);
                         let now = crate::hydra::board();
-                        if now != board {
+                        if now != board || !now.rates().contains(&applied.rate) {
                             // the firmware said which Airspy it is
                             engine.set_eq_prefix(now.cache_prefix());
                             cfg.fit_board();
@@ -4023,7 +4049,7 @@ fn open_device(lib: &std::path::Path, serial: u64, engine: &Engine, plan: &Plan,
     let asked = crate::hydra::board();
     match Device::open(lib, serial, engine.sink(), rx, plan.rate) {
         // an Airspy turned out to be the other model: the caller fits the plan and starts the sweep
-        Ok(d) if crate::hydra::board() != asked => Src::Device(d),
+        Ok(d) if crate::hydra::board() != asked || !crate::hydra::board().rates().contains(&plan.rate) => Src::Device(d),
         Ok(mut d) => match d.sweep(plan) {
             Ok(()) => {
                 log::info!("{} via {}", d.version(), d.lib_path().display());
@@ -4345,6 +4371,7 @@ fn connect_label() -> &'static str {
         crate::hydra::Board::Mini => "Connect the Airspy Mini",
         crate::hydra::Board::HackRF => "Connect the HackRF",
         crate::hydra::Board::Pluto => "Connect the Pluto",
+        crate::hydra::Board::Soapy => "Open the SoapySDR radio",
     }
 }
 

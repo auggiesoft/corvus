@@ -14,6 +14,7 @@ mod net;
 mod plan;
 mod pluto;
 mod sim;
+mod soapy;
 mod theme;
 mod usbdev;
 mod view3d;
@@ -73,13 +74,16 @@ fn install_signal_handlers() {
 const USAGE: &str = "\
 corvus-sweep [options]
 
-  --board rfone|airspy|mini|hackrf|pluto  which board (default: env CORVUS_BOARD, else the
+  --board rfone|airspy|mini|hackrf|pluto|soapy  which board (default: env CORVUS_BOARD, else the
                         first one plugged in, else rfone):
                         airspy is the Airspy R2 (10 MSPS), mini the Airspy Mini (6 MSPS),
                         hackrf a HackRF One (stock firmware sweep, 1 MHz to 6 GHz),
                         pluto a PlutoSDR or Pluto+ running corvus-pluto (~18 MHz to 6.18 GHz)
   --pluto HOST[:PORT]   the Pluto's address (implies --board pluto; default: env
                         CORVUS_PLUTO, else 192.168.2.1, its USB network link; port 30433)
+  --soapy ARGS          a radio through SoapySDR (implies --board soapy): the first one whose
+                        SoapySDR args include all of ARGS, e.g. driver=rtlsdr or
+                        driver=airspy,serial=...; an empty ARGS takes the first one found
   --3d                  start with the 3D waterfall
   --host-sweep          RFOne/Airspy: let the PC retune each step even on Corvus firmware
                         (what stock firmware gets automatically; much slower)
@@ -168,7 +172,12 @@ fn main() -> eframe::Result {
             "--3d" => opts.overrides.push(Box::new(|c| c.wf3d = true)),
             "--lib" => lib = Some(PathBuf::from(val("--lib"))),
             "--board" => {
-                board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini|hackrf|pluto"));
+                board = hydra::Board::parse(&val("--board")).unwrap_or_else(|| die("--board rfone|airspy|mini|hackrf|pluto|soapy"));
+                board_given = true;
+            }
+            "--soapy" => {
+                soapy::set_filter(&val("--soapy"));
+                board = hydra::Board::Soapy;
                 board_given = true;
             }
             "--pluto" => {

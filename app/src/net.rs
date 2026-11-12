@@ -70,7 +70,7 @@ pub struct Radio {
 
 /// The radios this machine can open, as a client's picker lists them.
 pub fn radios() -> Vec<Radio> {
-    crate::hydra::list_devices().into_iter().map(|f| Radio { board: f.board, serial: f.serial, label: f.label }).collect()
+    crate::hydra::list_devices().into_iter().chain(crate::app::soapy_found()).map(|f| Radio { board: f.board, serial: f.serial, label: f.label }).collect()
 }
 
 /// What the client's window shows: its view, in columns, and which traces.
