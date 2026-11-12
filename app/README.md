@@ -68,7 +68,13 @@ from. Every gain mode sets the AD936x's one manual gain
 (0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. **Input**
 (Receiver card, or `--port RX2`) picks RX1 or RX2 (corvus-pluto 0.2.3 on a board in 1R1T); switching restarts
 the sweep. The bins
-around DC are bridged from their neighbours. corvus-pluto 0.2 sweeps in **fast mode** where the board
+around DC are bridged from their neighbours. **Looks** (engine card, `--looks 1|2`): with two (the default)
+the steps are half as far apart, each still measuring its full width, so every frequency is seen from two
+LOs and the engine keeps the cleaner look (`Plan::overlapped`, `Worker::apply_looks`): a look on its step's
+DC, or with a signal 20 dB stronger at its mirror (where the AD936x leaves an image 33–48 dB down), gives
+way to the other; two clean looks are averaged in power. Strong signals' ghosts and the dip at each LO go,
+and the floor is steadier (its bin-to-bin spread 3.5 → 2.4 dB off-air); a burst caught by one look reads
+3 dB low. Half the speed; the live view keeps one LO. corvus-pluto 0.2 sweeps in **fast mode** where the board
 allows it (fastlock profiles over direct SPI; the device chip says "fast sweep", or "driver sweep" and why);
 `CORVUS_PLUTO_MODE=driver` asks for the driver path. Blocks arrive 12-bit packed and are unpacked into the
 usual layout. Over 70–6000 MHz on a Pluto+ over Ethernet: about 3,300 steps a second, 130 GHz/s, 22 passes a
@@ -187,6 +193,18 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
   points), peak/mean detector, traces, flatten passband, and peak labels Full / Focus / Minimal.
   Beam, switch marks, *Clear peaks* and *Relearn the passband* (a two-step confirm) are under a
   disclosure.
+  - **Smooth live trace** (on by default; `--smooth SECS`, 0 = off): the live trace holds still where
+    there is only noise and still shows a burst at once, at its level (`engine::update_bins`). Each bin
+    keeps a floor (the dB average of its readings over the *Smoothing* time, default 1 s); a reading more
+    than *Burst over* (default 10 dB) above it is shown as it is, anything else is averaged, and after a
+    burst the bin falls back within about two thirds of the smoothing time. The engine raises the
+    threshold where the floor is rougher (2.4 × its spread + 2.2 dB, so ~16 dB for one look at the finest
+    bins; +3 dB beside each LO with two looks) so noise doesn't sparkle; the caption shows the threshold
+    in use. A carrier that stays becomes part of the floor after ~10 × the smoothing time (and takes ~3 ×
+    to fade after it stops); the floors start again after a gain or input change. On the Pluto, 70–6000
+    MHz with two looks: noise's wander over time 2.3 → 0.65 dB; readings 15 dB or more over their bin's
+    usual level shown at full level 98–100 % of the time (ISM 2.4 GHz, LTE, 5 GHz); noise shown as a
+    burst ~1 in 10^6. The peak and average traces use the readings as measured. `--csv` has both.
   - **Average:** each bin's exponential average over the *Averaging* time (0.5–60 s, default 10 s;
     the caption says how many passes that is at the current speed). The time runs on the device
     clock, so it means the same on every board and profile. *Average in* dB (a video average: smooth,

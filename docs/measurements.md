@@ -265,6 +265,34 @@ serial protocol) through 42 dB of attenuators into RX2, the Pluto parked 7 MHz b
 - **Headroom:** the AD936x compresses before its samples clip. On the FM band at 71 dB the peak stayed at
   −4.7 dBFS while the last 6 dB of gain added 4 dB of RMS. With a stronger antenna feed, gain 12 (41 dB)
   clips the 90 MHz step (0.0008 % of samples) and gain 21 (71 dB) 23 of 74 steps (4.2 %).
+- **Noise figure against gain** (the same source, 42 dB of attenuators as a room-temperature 50 Ω load):
+  about 40 dB at 0 dB gain, 26 at 20, 15–20 at 30, then 11–12 from 31 dB (the floor drops 7 dB between 30
+  and 31 dB while the tone moves 1 dB) and 6–9 at 40–50. The default, Gain 10 (34 dB), is past the step;
+  Gain 9 (30 dB) is not. The tone follows the gain dB for dB to 50 dB and a −48 dBm tone clips at 55.
+
+### Two looks
+
+A strong signal's image lands at its mirror about the LO, inside the same step, and a signal on the LO is
+removed with the block mean and the DC bridge (a CW tone exactly on a step's LO read 43 dB low). With two
+looks (Corvus Sweep's default on the Pluto) every frequency is measured from two LOs 20 MHz apart, and a
+look that sits on its step's DC, or whose mirror is 20 dB stronger, gives way to the other. In a synthetic
+check (a −6 dBFS tone with a −35 dB image, and a −26 dBFS tone on one LO): the image reads −41 dBFS with one
+look and at the floor (−91) with two; the tone on the LO −87 and −29. Off-air on RX1, 70–6000 MHz at
+34 dB: 2,790 steps/s, 9.4 passes/s (one look: 18.5), no gaps; the floor's bin-to-bin spread in quiet bands
+3.5 → 2.4 dB.
+
+### Smoothing the live trace
+
+Corvus Sweep averages each bin's live reading toward a per-bin floor unless it is a burst (over the floor by
+10 dB, more where the floor is rougher). Off-air on the Pluto (RX1, two looks, 70–6000 MHz, 34 dB, 9 passes/s,
+40 snapshots 0.5 s apart): the floor's wander over time 2.3 → 0.65 dB and its bin-to-bin spread 1.8 →
+0.56 dB in quiet bands; readings 15 dB or more over their bin's median shown at their level 100 % in the
+2.4 GHz ISM band and 98 % on 700–900 MHz (10 dB over: 87–97 %, near the threshold). Noise shown as a burst:
+3 readings in ~5 million in quiet bands. Two things made it rise to ~1 in 10^4 before they were fixed: the
+bins beside each LO, where two looks leave one (their floor wanders 3.5 dB, so they get 3 dB more, and
+the LO zone is ±6 bins, as its leakage still moves 3–6 bins out), and floors that began low on the first
+blocks after a start and then took every reading for a burst (now a plain average for each bin's first
+8 readings, and again after a gain or input change).
 
 ## Restarts
 

@@ -507,6 +507,14 @@ fn synth_iq(out: &mut [u16], lo: f64, rate: Rate, t: f64, rx: &RxSettings, bands
         let a = fs * (p / 3.0).sqrt() * std::f32::consts::FRAC_1_SQRT_2;
         *c = Complex32::new(a * rng.gauss(), a * rng.gauss());
     }
+    if pluto {
+        // the AD936x's I/Q imbalance: every signal leaves an image at the mirror frequency, ~35 dB down
+        let w = Complex32::from_polar(10f32.powf(-35.0 / 20.0), 0.7);
+        let orig: Vec<Complex32> = spec.to_vec();
+        for (k, c) in spec.iter_mut().enumerate() {
+            *c += w * orig[(n - k) % n].conj();
+        }
+    }
     ifft.process_with_scratch(spec, scratch);
     if pluto {
         for (o, c) in out.as_chunks_mut::<2>().0.iter_mut().zip(spec.iter()) {

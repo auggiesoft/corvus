@@ -149,7 +149,7 @@ impl Health {
             rate,
             f0: plan.f0 as f64,
             step_hz: plan.step_hz as f64,
-            show_hz: plan.window_hz / 2.0,
+            show_hz: plan.measure_hz() / 2.0,
             steps: vec![step; plan.n()],
             fft,
             win: (0..HFFT).map(|i| (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / (HFFT - 1) as f64).cos()) as f32).collect(),

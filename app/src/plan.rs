@@ -244,6 +244,10 @@ pub struct Plan {
     pub lock_timeout: u16,
     pub order: Order,
     pub rate: Rate,
+    /// Two looks (the Pluto): each step measures twice `window_hz` around its LO, so neighbouring steps
+    /// overlap by half and every frequency is seen from two LOs. The stitched spectrum is then in segments
+    /// `window_hz` wide that end at each LO (`centre(s) - window_hz .. centre(s)`, one more than the steps).
+    pub overlap: bool,
 }
 
 impl Plan {
@@ -290,6 +294,7 @@ impl Plan {
             lock_timeout: 200,
             order,
             rate,
+            overlap: false,
         }
     }
 
@@ -315,7 +320,39 @@ impl Plan {
             lock_timeout: 0,
             order: Order::Interleaved,
             rate: Rate::H20,
+            overlap: false,
         }
+    }
+
+    /// The same sweep in two looks (see `overlap`): steps half as far apart, each measuring the width the
+    /// step had, and the LOs placed so every frequency in the range gets two looks (the first LO on the
+    /// start, the last on or past the stop): about twice the steps. Only for the Pluto's zero-IF IQ, where
+    /// it hides the image of strong signals and the blind spot at each LO; unchanged for one-step plans.
+    pub fn overlapped(self) -> Plan {
+        if !self.rate.iq16() || self.n_steps < 2 {
+            return self;
+        }
+        let step = (self.window_hz / 2.0).round();
+        let span = self.stop_hz - self.start_hz;
+        let n = (span / step - 1e-9).ceil() as usize + 1;
+        let (cmin, cmax) = self.rate.centre_range(2.0 * step);
+        let mut f0 = self.start_hz;
+        let last = f0 + (n as f64 - 1.0) * step;
+        if last > cmax {
+            f0 -= last - cmax;
+        }
+        f0 = f0.max(cmin);
+        Plan { f0: f0.round() as u64, step_hz: step as u32, n_steps: n.min(u16::MAX as usize) as u16, window_hz: step, overlap: true, ..self }
+    }
+
+    /// Width each step measures around its LO.
+    pub fn measure_hz(&self) -> f64 {
+        if self.overlap { 2.0 * self.window_hz } else { self.window_hz }
+    }
+
+    /// Slices of the stitched spectrum: one per step, or one more with two looks.
+    pub fn segments(&self) -> usize {
+        self.n() + self.overlap as usize
     }
 
     pub fn n(&self) -> usize {
@@ -336,8 +373,8 @@ impl Plan {
 
     /// Frequency range the stitched steps cover.
     pub fn cover(&self) -> (f64, f64) {
-        let lo = self.f0 as f64 - self.window_hz / 2.0;
-        (lo, lo + self.n() as f64 * self.step_hz as f64 - (self.step_hz as f64 - self.window_hz))
+        let lo = self.f0 as f64 - self.measure_hz() / 2.0;
+        (lo, lo + self.segments() as f64 * self.step_hz as f64 - (self.step_hz as f64 - self.window_hz))
     }
 
     pub fn flags(&self) -> u8 {

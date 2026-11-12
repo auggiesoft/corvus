@@ -94,10 +94,13 @@ corvus-sweep [options]
   --range START:STOP    sweep range in MHz, e.g. 88:108
   --order vco|asc       visiting order (vco needs firmware sweep4+)
   --port NAME           RF input: ANT, CABLE1, CABLE2 (RFOne) or RX1, RX2 (Pluto)
+  --looks 1|2           the Pluto: every frequency seen from one LO or two (default 2: no images, half the speed)
   --gain N              gain 0-21 in linearity mode (the Pluto: 0-71 dB, Gain 10 is 34 dB)
   --fresh               ignore saved settings
   --headless SECS       no window: sweep for SECS, print rates and seam ripple, then exit
   --csv PATH            with --headless: write the stitched spectrum as CSV
+  --csv-every SECS      with --csv: also a snapshot every SECS (PATH-1.csv, PATH-2.csv, ...)
+  --smooth SECS         live trace smoothing time (default 1; 0 = off): noise averaged, bursts pass
   --bin-khz K           bin width: 2.4, 4.9, 9.8, 19.5 or 39 kHz at 10 MSPS (x1.2 at 12)
   --msps 10|12|61|31|15|7|3  sample rate (default 12: 24 MSPS real, wider steps; the Pluto:
                         61 = 61.44 MSPS, the default, 31 = 30.72, or 15.36, 7.68, 3.84 for finer bins)
@@ -128,6 +131,7 @@ fn main() -> eframe::Result {
     let mut shot: Option<PathBuf> = None;
     let mut headless: Option<f32> = None;
     let mut csv: Option<PathBuf> = None;
+    let mut csv_every: Option<f32> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = |name: &str| args.next().unwrap_or_else(|| die(&format!("{name} needs a value")));
@@ -178,6 +182,16 @@ fn main() -> eframe::Result {
             "--fresh" => fresh = true,
             "--headless" => headless = Some(val("--headless").parse().unwrap_or_else(|_| die("bad --headless"))),
             "--csv" => csv = Some(PathBuf::from(val("--csv"))),
+            "--csv-every" => csv_every = Some(val("--csv-every").parse().ok().filter(|&s: &f32| s > 0.0).unwrap_or_else(|| die("bad --csv-every"))),
+            "--smooth" => {
+                let v: f32 = val("--smooth").parse().ok().filter(|&s: &f32| s >= 0.0).unwrap_or_else(|| die("--smooth SECS (0 = off)"));
+                opts.overrides.push(Box::new(move |c| {
+                    c.smooth = v > 0.0;
+                    if v > 0.0 {
+                        c.smooth_secs = v;
+                    }
+                }));
+            }
             "--bin-khz" => {
                 let k: f64 = val("--bin-khz").parse().unwrap_or_else(|_| die("bad --bin-khz"));
                 opts.overrides.push(Box::new(move |c| {
@@ -212,6 +226,14 @@ fn main() -> eframe::Result {
                 };
                 opts.overrides.push(Box::new(move |c| c.port = p));
             }
+            "--looks" => {
+                let two = match val("--looks").as_str() {
+                    "1" => false,
+                    "2" => true,
+                    _ => die("--looks 1|2"),
+                };
+                opts.overrides.push(Box::new(move |c| c.looks2 = two));
+            }
             "--gain" => {
                 let g: u8 = val("--gain").parse().ok().filter(|&g| g <= 21).unwrap_or_else(|| die("--gain 0-21"));
                 opts.overrides.push(Box::new(move |c| c.gain = hydra::Gain::Linearity(g)));
@@ -244,7 +266,7 @@ fn main() -> eframe::Result {
     }
     opts.screenshot = shot.map(|p| (p, after));
     if let Some(secs) = headless {
-        let r = app::headless(opts, secs, csv);
+        let r = app::headless(opts, secs, csv, csv_every);
         DONE.store(true, Ordering::Relaxed);
         if let Err(e) = r {
             eprintln!("corvus-sweep: {e}");

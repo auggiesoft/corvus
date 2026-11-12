@@ -35,6 +35,10 @@ pub struct Config {
     pub nfft: usize,
     pub detector: Detector,
     pub show_avg: bool,
+    /// Smooth the live trace's noise while bursts pass at once (`DspSettings::smooth_tau`, `burst_db`).
+    pub smooth: bool,
+    pub smooth_secs: f32,
+    pub burst_db: f32,
     /// Averaging time (s) and kind (linear power or dB).
     pub avg_secs: f32,
     pub avg_power: bool,
@@ -45,6 +49,9 @@ pub struct Config {
     pub peak_win: f32,
     pub show_peak: bool,
     pub eq_on: bool,
+    /// The Pluto: two looks at every frequency (`Plan::overlapped`): no images or LO blind spots, a steadier
+    /// floor, half the speed.
+    pub looks2: bool,
     pub beam: bool,
     pub vco_marks: bool,
     pub labels: usize,
@@ -115,6 +122,9 @@ impl Default for Config {
             nfft: 2048,
             detector: Detector::Peak,
             show_avg: false,
+            smooth: true,
+            smooth_secs: 1.0,
+            burst_db: 10.0,
             avg_secs: 10.0,
             avg_power: false,
             peak_kind: PeakKind::Hold,
@@ -123,6 +133,7 @@ impl Default for Config {
             peak_win: 10.0,
             show_peak: true,
             eq_on: true,
+            looks2: true,
             beam: true,
             vco_marks: true,
             labels: 4,
@@ -161,7 +172,9 @@ impl Config {
     }
 
     fn plan(&self) -> Plan {
-        Plan::new(self.start_mhz, self.stop_mhz, self.step_mhz, self.dwell, self.skip, self.lock_reads, self.order, self.rate)
+        let p = Plan::new(self.start_mhz, self.stop_mhz, self.step_mhz, self.dwell, self.skip, self.lock_reads, self.order, self.rate);
+        // the live view stays parked on one LO
+        if self.looks2 && !self.live { p.overlapped() } else { p }
     }
 
     /// Change the sample rate, moving the step to the new rate's default if it was on the old
@@ -252,7 +265,11 @@ impl Config {
             PeakKind::Decay => PeakMode::Decay(self.peak_fall),
             PeakKind::Percentile => PeakMode::Percentile { p: self.peak_pct as f32 / 100.0, tau: self.peak_win },
         };
-        DspSettings { nfft: self.nfft, avg_tau: if self.show_avg { self.avg_secs } else { 0.0 }, avg_power: self.avg_power, peak, eq_on: self.eq_on, wf_rate: self.wf_rate }
+        DspSettings { nfft: self.nfft, avg_tau: if self.show_avg { self.avg_secs } else { 0.0 }, avg_power: self.avg_power, peak, eq_on: self.eq_on,
+            wf_rate: self.wf_rate,
+            smooth_tau: if self.smooth { self.smooth_secs } else { 0.0 },
+            burst_db: self.burst_db,
+        }
     }
 
     /// The peak trace's name as the Traces row shows it.
@@ -500,6 +517,8 @@ pub struct App {
     stats: Stats,
     health: crate::health::Summary,
     eq_state: EqState,
+    /// Smoothing: the burst threshold in use and the floor's spread behind it (dB).
+    burst: (f32, f32),
     step_t: Vec<f32>,
     head: Option<usize>,
     labels: Vec<(f64, f32)>,
@@ -606,6 +625,7 @@ impl App {
             wf: Waterfall::new(),
             stats: Stats::default(),
             health: Default::default(),
+            burst: (f32::NAN, f32::NAN),
             eq_state: EqState::Unknown,
             step_t: Vec::new(),
             head: None,
@@ -934,6 +954,7 @@ impl App {
         self.stats = l.stats.clone();
         self.health = l.health.clone();
         self.eq_state = l.eq_state;
+        self.burst = (l.burst_db, l.noise_sd);
         self.step_t.clear();
         self.step_t.extend_from_slice(&l.step_t);
         self.head = l.head;
@@ -1493,6 +1514,13 @@ impl App {
                     }
                     theme::slider_u8(ui, "Dwell", &mut self.cfg.dwell, &Slide::int(1.0, 8.0, 1.0, "blk"));
                     if self.cfg.rate.iq16() {
+                        let live = self.cfg.live;
+                        theme::row_hint(
+                            ui,
+                            "Looks",
+                            "Two: steps half as far apart, so every frequency is seen from two LOs and the cleaner look is kept. Strong signals' mirror images and the dip at each step's centre go, and the floor is steadier. About half the speed.\nOne: each frequency once, the fastest sweep.",
+                            |ui| ui.add_enabled_ui(!live, |ui| theme::segmented(ui, &mut self.cfg.looks2, &[(true, "Two"), (false, "One")])).inner,
+                        );
                         theme::slider_u8(ui, "Settle", &mut self.cfg.skip, &Slide::int(0.0, 8.0, 0.0, "blk"));
                         theme::caption(
                             ui,
@@ -1578,6 +1606,28 @@ impl App {
                     } else {
                         format!("Averaged in {kind}.")
                     });
+                }
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.cfg.smooth, "Smooth live trace").on_hover_text(
+                        "Averages the live trace where it is only noise, so the floor holds still, and shows anything that rises clear of the floor at once, at its full level: a burst isn't smoothed away. When it ends the bin falls back within about two thirds of the smoothing time. A carrier that stays becomes part of the floor (after about ten times the smoothing time) and is smoothed like the rest. The peak and average traces use the readings as measured.",
+                    );
+                });
+                if self.cfg.smooth {
+                    theme::slider_f32(ui, "Smoothing", &mut self.cfg.smooth_secs, &Slide { min: 0.2, max: 10.0, default: 1.0, integer: false, log: true, decimals: 1, unit: "s" });
+                    theme::slider_f32(ui, "Burst over", &mut self.cfg.burst_db, &Slide { min: 3.0, max: 20.0, default: 10.0, integer: false, log: false, decimals: 0, unit: "dB" });
+                    let (thr, sd) = self.burst;
+                    let passes = self.cfg.smooth_secs / self.pass_s;
+                    let mut cap = if passes.is_finite() && passes > 0.0 { format!("Noise averaged over about {} passes. ", fmt_trim(passes as f64, if passes < 10.0 { 1 } else { 0 })) } else { String::new() };
+                    if thr.is_finite() && sd.is_finite() {
+                        cap += &format!("A reading {thr:.1} dB over its floor shows as a burst");
+                        if thr > self.cfg.burst_db + 0.05 {
+                            cap += &format!(" (raised: the floor wanders {sd:.1} dB here; two looks or wider bins steady it)");
+                        }
+                        cap += ".";
+                    } else {
+                        cap += "Lower lets weaker bursts through, and some noise.";
+                    }
+                    theme::caption(ui, cap);
                 }
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.cfg.eq_on, "Flatten passband")
@@ -3121,7 +3171,7 @@ impl eframe::App for App {
 
 /// No window: sweep for `secs`, print the rate once a second and the seam ripple at the end, and
 /// optionally write the stitched spectrum as CSV.
-pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), String> {
+pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>, csv_every: Option<f32>) -> Result<(), String> {
     let mut cfg = Config::default();
     for o in &opts.overrides {
         o(&mut cfg);
@@ -3161,8 +3211,18 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
     );
     let t0 = Instant::now();
     let mut next = 1.0;
+    let (mut snap_t, mut snap_n) = (csv_every.unwrap_or(f32::INFINITY), 0);
     while t0.elapsed().as_secs_f32() < secs && !crate::QUIT.load(std::sync::atomic::Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(50));
+        if let (Some(path), Some(every)) = (&csv, csv_every)
+            && t0.elapsed().as_secs_f32() >= snap_t
+        {
+            snap_t += every;
+            snap_n += 1;
+            let p = path.with_file_name(format!("{}-{snap_n}.csv", path.file_stem().unwrap_or_default().to_string_lossy()));
+            let out = engine.live.lock().to_csv();
+            std::fs::write(&p, out).map_err(|e| format!("{}: {e}", p.display()))?;
+        }
         if t0.elapsed().as_secs_f32() >= next {
             next += 1.0;
             let s = engine.live.lock().stats.clone();
