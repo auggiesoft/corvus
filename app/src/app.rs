@@ -498,6 +498,7 @@ pub struct App {
     view: (f64, f64),
     wf: Waterfall,
     stats: Stats,
+    health: crate::health::Summary,
     eq_state: EqState,
     step_t: Vec<f32>,
     head: Option<usize>,
@@ -604,6 +605,7 @@ impl App {
             view,
             wf: Waterfall::new(),
             stats: Stats::default(),
+            health: Default::default(),
             eq_state: EqState::Unknown,
             step_t: Vec::new(),
             head: None,
@@ -930,6 +932,7 @@ impl App {
             self.wf.push(&row, now);
         }
         self.stats = l.stats.clone();
+        self.health = l.health.clone();
         self.eq_state = l.eq_state;
         self.step_t.clear();
         self.step_t.extend_from_slice(&l.step_t);
@@ -1068,6 +1071,32 @@ impl App {
                     s.gaps + s.misfiled,
                     s.lock_timeouts,
                     s.host_drops
+                ),
+                acts: vec![],
+            });
+        }
+        let h = &self.health;
+        if h.clip_steps > 0 && self.running {
+            out.push(Cond {
+                level: Level::Caution,
+                text: format!(
+                    "The ADC is clipping on {} ({}): strong signals spread and false lines appear. Lower the gain.",
+                    crate::health::plural(h.clip_steps, "step"),
+                    crate::health::mhz_list(&h.clip_hz, h.clip_steps, 4)
+                ),
+                acts: vec![],
+            });
+        }
+        if let Some(m) = h.mirrors.first()
+            && self.running
+        {
+            let more = if h.mirrors.len() > 1 { format!(" ({} more on the Headroom card)", h.mirrors.len() - 1) } else { String::new() };
+            out.push(Cond {
+                level: Level::Info,
+                text: format!(
+                    "The line at {} MHz mirrors the one at {} MHz about the tuner's LO: an image or an I/Q spur, not a signal of its own{more}.",
+                    fmt_trim(m.hz / 1e6, 2),
+                    fmt_trim(m.of_hz / 1e6, 2)
                 ),
                 acts: vec![],
             });
@@ -1221,6 +1250,7 @@ impl App {
                 flag: recent,
                 spark: false,
             },
+            self.headroom_card(),
             Card { label: if crate::hydra::board().networked() { "Network" } else { "USB" }, value: format!("{:.1}", s.usb_mb_s), unit: "MB/s", sub: format!("{} blocks", s.blocks), flag: false, spark: false },
         ];
         let gap = 6.0;
@@ -1228,10 +1258,69 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for c in &cards {
-                let (r, _) = ui.allocate_exact_size(vec2(w, 74.0), Sense::hover());
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 74.0), Sense::hover());
                 paint_card(ui.painter(), r, c, if c.spark { Some(&self.stats.history) } else { None });
+                if c.label == HEADROOM {
+                    resp.on_hover_text(self.headroom_tip());
+                }
             }
         });
+    }
+
+    /// Sample health (health.rs): the highest sample against full scale, clipping, and the image check.
+    fn headroom_card(&self) -> Card {
+        let h = &self.health;
+        if h.steps == 0 {
+            return Card { label: HEADROOM, value: "—".into(), unit: "", sub: "no samples yet".into(), flag: false, spark: false };
+        }
+        let mut sub = if h.clip_steps > 0 { format!("{} clipping", crate::health::plural(h.clip_steps, "step")) } else { "no clipping".into() };
+        if let Some(db) = h.image_db {
+            sub += &format!(" · image {}{db:.0} dB", if h.image_floor { "≥" } else { "" });
+        }
+        Card { label: HEADROOM, value: format!("{:.1}", h.peak_dbfs.min(0.0)), unit: "dBFS", sub, flag: h.clip_steps > 0, spark: false }
+    }
+
+    fn headroom_tip(&self) -> String {
+        let h = &self.health;
+        if h.steps == 0 {
+            return "Sample health appears once steps arrive.".into();
+        }
+        let mut t = format!("Highest sample {:.1} dBFS, in the step at {} MHz.\n", h.peak_dbfs.min(0.0), fmt_trim(h.peak_hz / 1e6, 1));
+        if h.clip_steps > 0 {
+            t += &format!(
+                "Clipping on {} ({}), {:.3}% of samples: lower the gain.\n",
+                crate::health::plural(h.clip_steps, "step"),
+                crate::health::mhz_list(&h.clip_hz, h.clip_steps, 8),
+                h.clip_frac * 100.0
+            );
+        } else {
+            t += "No sample reaches full scale.\n";
+        }
+        if crate::hydra::board() == crate::hydra::Board::Pluto {
+            t += "The AD936x compresses before its samples clip: a peak within a few dB of full scale, or a gain step that adds less than it should, means the same thing.\n";
+        }
+        if h.iq {
+            t += "\nImage rejection: each strong signal against its mirror about the LO.\n";
+            match h.image_db {
+                Some(db) => {
+                    t += &format!("{}{db:.0} dB over {} strong bins", if h.image_floor { "At least " } else { "" }, h.image_signals);
+                    if let Some((w, f)) = h.image_worst {
+                        t += &format!("; least {w:.0} dB, in the step at {} MHz", fmt_trim(f / 1e6, 1));
+                    }
+                    t += ".\n";
+                }
+                None => t += "No strong signals with a quiet mirror yet.\n",
+            }
+            if h.mirrors.is_empty() {
+                t += "No mirror lines.";
+            } else {
+                t += "Mirror lines (images or I/Q spurs, not signals of their own):";
+                for m in &h.mirrors {
+                    t += &format!("\n  {} MHz, {:.1} dB under {} MHz", fmt_trim(m.hz / 1e6, 2), m.below_db, fmt_trim(m.of_hz / 1e6, 2));
+                }
+            }
+        }
+        t.trim_end().to_string()
     }
 
     fn sidebar(&mut self, ui: &mut Ui) {
@@ -3086,6 +3175,7 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>) -> Result<(), St
     }
     let l = engine.live.lock();
     println!("passes {}, steps {}, flatness correction {:?}", l.stats.passes, l.stats.steps, l.eq_state);
+    println!("{}", l.health.line());
     if let Some((raw, eq)) = l.ripple() {
         println!("per-step passband ripple: {raw:.2} dB p-p raw, {eq:.2} dB p-p after correction");
     }
@@ -3129,6 +3219,8 @@ struct Cond {
     text: String,
     acts: Vec<(Act, &'static str)>,
 }
+
+const HEADROOM: &str = "Headroom";
 
 struct Card {
     label: &'static str,

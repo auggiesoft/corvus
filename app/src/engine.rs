@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::dsp::{self, Dsp};
+use crate::health::{self, Health};
 use crate::hydra::{BLOCK_WORDS, Block, Sink, parse_block};
 use crate::plan::{Order, Plan, Rate};
 
@@ -136,6 +137,8 @@ pub struct Live {
     pub rows: VecDeque<Vec<f32>>,
     pub wf_cols: usize,
     pub stats: Stats,
+    /// Headroom, clipping and (Pluto) image rejection over the latest visit of each step.
+    pub health: health::Summary,
     clear_peak: bool,
     reset_eq: bool,
     /// Load and save the learned passband in the cache: on for the radio, off for the simulator and tests.
@@ -166,6 +169,7 @@ impl Live {
             rows: VecDeque::new(),
             wf_cols: 0,
             stats: Stats::default(),
+            health: health::Summary::default(),
             clear_peak: false,
             reset_eq: false,
             persist_eq: false,
@@ -480,6 +484,7 @@ struct Worker {
     host_drops: Arc<AtomicU64>,
     epoch: Instant,
     dsp: Dsp,
+    health: Health,
     generation: u64,
     restarts: u64,
     plan: Plan,
@@ -527,6 +532,7 @@ impl Worker {
         let eq_store = if persist_eq { load_eq_store(&eq_prefix) } else { HashMap::new() };
         Worker {
             dsp: Dsp::new(settings.nfft, plan.rate),
+            health: Health::new(&plan),
             order: OrderModel::new(&plan),
             live,
             rx,
@@ -635,6 +641,7 @@ impl Worker {
             self.acc = vec![0.0; l.m];
             self.scratch = vec![0.0; l.m];
             self.order = OrderModel::new(&self.plan);
+            self.health = Health::new(&self.plan);
             self.step_dma = vec![None; self.plan.n()];
             self.row_acc = None;
             self.rate_win.clear();
@@ -707,6 +714,7 @@ impl Worker {
             if self.acc_done {
                 continue;
             }
+            self.health.block(t.step as usize, w, self.acc_n == 0);
             // HackRF blocks carry their slice (below or above the LO) in the lock field; see hackrf.rs
             let side = if self.plan.rate.complex() { (t.lock_polls & 1) as u8 } else { 0 };
             self.dsp.power(w, self.range.clone(), &mut self.scratch, side);
@@ -958,7 +966,9 @@ impl Worker {
     }
 
     fn update_stats(&mut self, now: f32) {
+        let health = self.health.summary();
         let mut l = self.live.lock();
+        l.health = health;
         let s = &mut l.stats;
         s.host_drops = self.host_drops.load(Ordering::Relaxed);
         s.steps_per_s = match (self.rate_win.front(), self.rate_win.back()) {

@@ -8,6 +8,7 @@ mod app;
 mod dsp;
 mod engine;
 mod hackrf;
+mod health;
 mod hydra;
 mod plan;
 mod pluto;
@@ -93,6 +94,7 @@ corvus-sweep [options]
   --range START:STOP    sweep range in MHz, e.g. 88:108
   --order vco|asc       visiting order (vco needs firmware sweep4+)
   --port NAME           RF input: ANT, CABLE1, CABLE2 (RFOne) or RX1, RX2 (Pluto)
+  --gain N              gain 0-21 in linearity mode (the Pluto: 0-71 dB, Gain 10 is 34 dB)
   --fresh               ignore saved settings
   --headless SECS       no window: sweep for SECS, print rates and seam ripple, then exit
   --csv PATH            with --headless: write the stitched spectrum as CSV
@@ -209,6 +211,10 @@ fn main() -> eframe::Result {
                     _ => die("--port ANT|CABLE1|CABLE2|RX1|RX2"),
                 };
                 opts.overrides.push(Box::new(move |c| c.port = p));
+            }
+            "--gain" => {
+                let g: u8 = val("--gain").parse().ok().filter(|&g| g <= 21).unwrap_or_else(|| die("--gain 0-21"));
+                opts.overrides.push(Box::new(move |c| c.gain = hydra::Gain::Linearity(g)));
             }
             "--profile" => {
                 let v = val("--profile");

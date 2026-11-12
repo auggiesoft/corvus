@@ -18,7 +18,8 @@ cargo run --release                     # the first supported board plugged in
 cargo run --release -- --serial 0123456789ABCDEF   # a particular board
 cargo run --release -- --range 400:470 --order asc
 cargo run --release -- --msps 10                 # the older 10 MSPS setting (8 MHz steps)
-cargo run --release -- --headless 10 --csv /tmp/spectrum.csv   # no window: rates, seam ripple, CSV
+cargo run --release -- --headless 10 --csv /tmp/spectrum.csv   # no window: rates, seam ripple, health, CSV
+cargo run --release -- --gain 9 --port RX2       # gain 0-21 (linearity mode; the Pluto: 30 dB), input
 cargo run --release -- --board airspy   # an Airspy R2 (--board mini, --board hackrf)
 cargo run --release -- --pluto 192.168.1.50         # a Pluto+ or PlutoSDR running corvus-pluto
 cargo run --release -- --usb lib        # through the board's C library instead (see below)
@@ -102,11 +103,21 @@ The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the de
     and ports differ), and each board keeps its own learned passband.
 - **Status bar:** one tile ("All good", or how many problems) and the current conditions as
   sentences with a button that fixes each one: RFOne not open, a refused setting, steps lost in the
-  last 10 s, lock check off, paused, simulator, a range that can't avoid a VCO switch.
+  last 10 s, lock check off, paused, simulator, a range that can't avoid a VCO switch, ADC clipping
+  (which steps), a mirror line (below).
 - **HUD:** steps/s (device clock, with a 60 s sparkline), GHz/s, full passes/s, span, visiting
-  order, PLL lock polls, integrity (torn / gaps / timeouts / host drops) and USB MB/s. After any
+  order, PLL lock polls, integrity (torn / gaps / timeouts / host drops), headroom and USB MB/s. After any
   restart (plan, gain or port change, resume), blocks are dropped quietly until the new run's first
   block arrives, so the old plan's blocks still in flight don't count as misfiled or as gaps.
+- **Headroom** (`src/health.rs`, the HUD card; hover for the details, and `--headless` prints it):
+  the highest sample against full scale over each step's latest visit, and the steps with samples at
+  full scale, on every board. On the Pluto also the **image check**: each strong signal (30 dB over the
+  step's median bin, its mirror 20 dB quieter) against its mirror about the LO, over the step's last
+  few hundred visits. Only the part of the mirror that is coherent with the signal counts, so neither
+  other signals nor the two ADCs' own noise read as image; with too few averages to see that deep it
+  says "≥". A visible line whose mirror is coherent with it is flagged in the status bar as an image or
+  an I/Q spur, not a signal of its own. The AD936x compresses before its samples clip, so on the Pluto
+  a peak within a few dB of full scale means overload as much as a clip count does.
 - **Overview strip:** the whole swept range as a thin trace, with a box for the part the plot
   shows. Drag the box to pan (zoomed all the way out: to move the swept range), drag its edges to
   zoom, click to centre there, double-click to show the full sweep. It can be turned off under Display.

@@ -247,6 +247,25 @@ The same Pluto+ on F5OEO's Tezuka v0.3.24 (kernel 6.12, Maia SDR running alongsi
   (air band −63.0 → −62.3 dBFS, VHF −64.7 → −66.0, UHF TV −76.9 → −76.4), 2,758 steps/s; at 98 MHz GAIN
   40/20/60/40: RX2 −23.3/−42.1/−10.3/−23.4 dBFS (fast), −23.4/−43.3/−10.6/−23.3 (driver).
 
+### Image rejection and headroom (Corvus Sweep's health check)
+
+A known tone: an ADF4351 source (a WindWhisper LTDZ-type sweeper's tracking generator, set over its NWT
+serial protocol) through 42 dB of attenuators into RX2, the Pluto parked 7 MHz below it, 61.44 MSPS.
+
+- **The image is where the tone puts it, and all of it coherent:** at 1 GHz and 30 dB gain the line at
+  LO −6.78 MHz sits 40.0 dB under the tone at +6.78, with the same 40.0 dB coherent. Corvus Sweep's
+  check reads 40 dB from the sweep data alone.
+- **Image rejection at 30 dB gain against frequency:** 41 dB at 100 and 400 MHz, 40 at 1 GHz, 35 at
+  2 GHz, 33 at 3, 4 and 4.4 GHz. At 10 dB gain, 1 GHz: 48 dB. So a strong signal leaves a ghost 33–41 dB
+  under it at its mirror, inside the same 40 MHz step. Off-air on an antenna (70–6000 MHz, 30 dB): 44 dB
+  power-weighted over 387 strong bins, least 35 dB in the 850 MHz step.
+- **Further from the LO it is worse:** a line at LO −20.35 MHz had its coherent mirror 30 dB down.
+- **Not from noise:** E[I²] against E[Q²] on a quiet band reads 1.4–1.9 dB gain imbalance at 40 dB gain
+  (the two ADCs' unequal noise), which would claim ~20 dB of image rejection; the check doesn't use it.
+- **Headroom:** the AD936x compresses before its samples clip. On the FM band at 71 dB the peak stayed at
+  −4.7 dBFS while the last 6 dB of gain added 4 dB of RMS. With a stronger antenna feed, gain 12 (41 dB)
+  clips the 90 MHz step (0.0008 % of samples) and gain 21 (71 dB) 23 of 74 steps (4.2 %).
+
 ## Restarts
 
 Changing gain or port mid-sweep means SWEEP_STOP, the setting, then SWEEP_START, because the firmware
