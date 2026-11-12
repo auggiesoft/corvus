@@ -18,7 +18,7 @@ pub const TAG_WORDS: usize = 8;
 const SAMPLE_RAW: c_int = 5;
 
 /// Which board Corvus Sweep drives. Both run the same Corvus sweep protocol.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Board {
     RFOne,
     /// Airspy R2.
@@ -560,14 +560,6 @@ impl Device {
             Device::R82x(d) => &d.version,
             Device::HackRF(d) => &d.version,
             Device::Pluto(d) => &d.version,
-        }
-    }
-
-    /// How a Pluto sweeps ("fast", "driver"; None for other boards or before its first plan).
-    pub fn pluto_mode(&self) -> Option<String> {
-        match self {
-            Device::Pluto(d) => Some(d.mode.lock().0.clone()).filter(|m| !m.is_empty()),
-            _ => None,
         }
     }
 

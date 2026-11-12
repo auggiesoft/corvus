@@ -10,6 +10,7 @@ mod engine;
 mod hackrf;
 mod health;
 mod hydra;
+mod net;
 mod plan;
 mod pluto;
 mod sim;
@@ -107,6 +108,13 @@ corvus-sweep [options]
   --step MHZ            step size (default 10 at 12 MSPS, 8 at 10 MSPS, 40 at 61.44)
   --profile NAME        scan profile: fastest, quality, weak or bursts
                         (sets rate, step, dwell, lock reads, settle; later options override it)
+  --serve [ADDR][:PORT] no window: share the radio on the network until stopped (default all
+                        interfaces, port 30434), sweeping all along; another corvus-sweep connects
+                        with --connect or from its radio picker. Prints the PIN
+  --pin PIN             with --serve or --share: the PIN clients need (default: a random one);
+                        with --connect: the server's PIN
+  --share               open the window and share its radio too (the picker's Share this radio)
+  --connect HOST[:PORT] drive the radio of a corvus-sweep serving on HOST (needs --pin)
   --screenshot PATH     save a PNG of the window after --after seconds, then exit
   --after SECS          (default 4)
 ";
@@ -116,7 +124,11 @@ fn main() -> eframe::Result {
     attach_parent_console();
     install_signal_handlers();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn,eframe=warn,egui_wgpu=warn")).init();
-    let mut opts = app::Options { sim: false, lib: PathBuf::new(), serial: hydra::default_serial(), screenshot: None, overrides: Vec::new() };
+    let mut opts = app::Options { sim: false, lib: PathBuf::new(), serial: hydra::default_serial(), screenshot: None, overrides: Vec::new(), connect: None, share: None };
+    let mut serve: Option<std::net::SocketAddr> = None;
+    let mut pin: Option<String> = None;
+    let mut connect: Option<String> = None;
+    let mut share = false;
     let env_board = hydra::env_board();
     let mut board = env_board.unwrap_or(hydra::Board::RFOne);
     let mut board_given = env_board.is_some();
@@ -132,8 +144,14 @@ fn main() -> eframe::Result {
     let mut headless: Option<f32> = None;
     let mut csv: Option<PathBuf> = None;
     let mut csv_every: Option<f32> = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
+        if a == "--serve" {
+            // an optional value: ADDR, :PORT, ADDR:PORT or PORT
+            let v = args.next_if(|v| !v.starts_with("--")).unwrap_or_default();
+            serve = Some(parse_bind(&v).unwrap_or_else(|| die("--serve [ADDR][:PORT]")));
+            continue;
+        }
         let mut val = |name: &str| args.next().unwrap_or_else(|| die(&format!("{name} needs a value")));
         match a.as_str() {
             "--sim" => {
@@ -243,6 +261,9 @@ fn main() -> eframe::Result {
                 let pr = app::Profile::by_name(&v).unwrap_or_else(|| die("--profile fastest|quality|weak|bursts"));
                 opts.overrides.push(Box::new(move |c| pr.apply(c)));
             }
+            "--pin" => pin = Some(val("--pin")).filter(|p| !p.is_empty()).or_else(|| die("--pin PIN")),
+            "--connect" => connect = Some(val("--connect")),
+            "--share" => share = true,
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot"))),
             "--after" => after = val("--after").parse().unwrap_or_else(|_| die("bad --after")),
             "-h" | "--help" => {
@@ -251,6 +272,15 @@ fn main() -> eframe::Result {
             }
             _ => die(&format!("unknown option {a}")),
         }
+    }
+    if connect.is_some() && (serve.is_some() || share) {
+        die("--connect drives another machine's radio; it can't be shared from here");
+    }
+    if let Some(addr) = connect {
+        opts.connect = Some((addr, pin.clone().unwrap_or_else(|| die("--connect needs --pin"))));
+    }
+    if share {
+        opts.share = Some(pin.clone());
     }
     // no --board or CORVUS_BOARD: whichever supported board is plugged in (the one with --serial, if given)
     if !board_given && !opts.sim {
@@ -265,6 +295,15 @@ fn main() -> eframe::Result {
         opts.overrides.insert(0, Box::new(|c| *c = app::Config::default()));
     }
     opts.screenshot = shot.map(|p| (p, after));
+    if let Some(bind) = serve {
+        let r = app::serve(opts, bind, pin);
+        DONE.store(true, Ordering::Relaxed);
+        if let Err(e) = r {
+            eprintln!("corvus-sweep: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if let Some(secs) = headless {
         let r = app::headless(opts, secs, csv, csv_every);
         DONE.store(true, Ordering::Relaxed);
@@ -284,6 +323,18 @@ fn main() -> eframe::Result {
     let r = eframe::run_native("corvus-sweep", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, opts)))));
     DONE.store(true, Ordering::Relaxed);
     r
+}
+
+/// `--serve`'s address: empty (all interfaces, the default port), `ADDR`, `:PORT`, `PORT` or `ADDR:PORT`.
+fn parse_bind(v: &str) -> Option<std::net::SocketAddr> {
+    let v = v.trim();
+    let (host, port) = match v.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => ("", v.parse().ok()?),
+        None => (v, net::PORT),
+    };
+    let ip: std::net::IpAddr = if host.is_empty() { std::net::Ipv4Addr::UNSPECIFIED.into() } else { host.parse().ok()? };
+    Some(std::net::SocketAddr::new(ip, port))
 }
 
 fn die(msg: &str) -> ! {

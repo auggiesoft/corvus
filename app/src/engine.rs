@@ -85,7 +85,7 @@ pub enum Detector {
     Mean,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EqState {
     Off,
     /// No correction known for this resolution yet.
@@ -94,7 +94,7 @@ pub enum EqState {
     Learned(u32),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Stats {
     pub blocks: u64,
     pub bytes: u64,

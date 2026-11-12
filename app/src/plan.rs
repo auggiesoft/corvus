@@ -20,6 +20,11 @@ pub fn set_pluto_lo(lo_hz: f64, hi_hz: f64, shifts: bool) {
     *PLUTO_LO.lock() = (lo_hz, hi_hz, shifts);
 }
 
+/// The range in use (a client takes its server's).
+pub fn pluto_lo() -> (f64, f64, bool) {
+    *PLUTO_LO.lock()
+}
+
 /// The driver's range, for a corvus-pluto older than 0.2.1 (no `lo=`, no shifted steps).
 pub const PLUTO_DRIVER_LO: (f64, f64) = (46.88e6, 6000e6);
 
@@ -227,7 +232,7 @@ pub enum Order {
     Interleaved,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     /// Requested display range.
     pub start_hz: f64,

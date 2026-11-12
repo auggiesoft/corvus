@@ -31,6 +31,11 @@ built-in driver ported from the boards' libraries), so it's one file on Linux an
 Windows, where all four USB boards use WinUSB, which their firmware asks Windows for. The Pluto is
 reached over the network.
 
+**Remote: the same window, from anywhere.** One Corvus Sweep shares its radio (`--serve` without a
+window, or *Share this radio* in the window); another connects by address and PIN, or finds it on the
+LAN, and drives it with the same controls, getting the waterfall history as it connects. The radio
+keeps sweeping between visits. See [app/README.md](app/README.md#remote).
+
 **Stock firmware works too, just slower.** On an RFOne or Airspy without the Corvus firmware, Corvus
 Sweep retunes the board from the PC step by step: about 30–60 steps a second (0.1–0.6 GHz/s), roughly
 15–20× slower than the firmware sweep, with the same display and integrity checks.

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::dsp::{self, NFFTS};
 use crate::engine::{Detector, DspSettings, Engine, EqState, PeakMode, Stats, Trace};
 use crate::hydra::{self, Device, Gain, RxSettings};
+use crate::net::{self, DevInfo, Dot, SrcKind};
 use crate::plan::{self, Order, PRESETS, Plan, Rate};
 use crate::sim::Sim;
 use crate::theme::{self, ACCENT, AVERAGE, BG, CAUTION, CHIP, Density, EDGE, GRATICULE, HOUSE, INK, INK2, INK3, LINE, Level, PANEL, PEAK, Palette, SCALE_INK, Slide, TOUCH, TRACE, WELL};
@@ -84,6 +85,37 @@ pub struct Config {
     /// Gesture hints over the plot (each retires once its gesture has been used; see `Hint`).
     pub hints: bool,
     pub hints_learned: u8,
+    /// Sharing this radio: the PIN clients need (made up the first time it's shared).
+    pub serve_pin: String,
+    /// Servers connected to, most recent first: address and PIN.
+    pub remotes: Vec<(String, String)>,
+}
+
+/// The settings a server and its client share: the ones that change what the radio and the engine do. The
+/// rest (levels, colours, which traces are drawn) belong to each window.
+macro_rules! shared {
+    ($($f:ident: $t:ty),* $(,)?) => {
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        pub struct Shared {
+            $($f: $t),*
+        }
+        impl Shared {
+            pub fn of(c: &Config) -> Shared {
+                Shared { $($f: c.$f.clone()),* }
+            }
+            pub fn put(&self, c: &mut Config) {
+                $(c.$f = self.$f.clone();)*
+            }
+        }
+    };
+}
+
+shared! {
+    start_mhz: f64, stop_mhz: f64, step_mhz: f64, rate: Rate, live: bool, live_span_mhz: f64, live_back: Option<(f64, f64, f64, Rate)>,
+    order: Order, dwell: u8, lock_reads: u8, skip: u8, port: u8, gain: Gain, nfft: usize,
+    // show_avg sets the engine's averaging time (none while the average isn't shown)
+    show_avg: bool, smooth: bool, smooth_secs: f32, burst_db: f32, avg_secs: f32, avg_power: bool,
+    peak_kind: PeakKind, peak_fall: f32, peak_pct: u8, peak_win: f32, eq_on: bool, looks2: bool, wf_rate: f32,
 }
 
 /// What the peak trace keeps (see `engine::PeakMode`).
@@ -157,6 +189,8 @@ impl Default for Config {
             smooth3d: 1,
             hints: true,
             hints_learned: 0,
+            serve_pin: String::new(),
+            remotes: Vec::new(),
         }
     }
 }
@@ -175,6 +209,16 @@ impl Config {
         let p = Plan::new(self.start_mhz, self.stop_mhz, self.step_mhz, self.dwell, self.skip, self.lock_reads, self.order, self.rate);
         // the live view stays parked on one LO
         if self.looks2 && !self.live { p.overlapped() } else { p }
+    }
+
+    #[cfg(test)]
+    pub fn plan_for_test(&self) -> Plan {
+        self.plan()
+    }
+
+    #[cfg(test)]
+    pub fn dsp_for_test(&self) -> DspSettings {
+        self.dsp()
     }
 
     /// Change the sample rate, moving the step to the new rate's default if it was on the old
@@ -422,6 +466,10 @@ pub struct Options {
     pub serial: u64,
     pub screenshot: Option<(PathBuf, f32)>,
     pub overrides: Vec<Box<dyn Fn(&mut Config)>>,
+    /// Start connected to a server: address and PIN.
+    pub connect: Option<(String, String)>,
+    /// Start sharing this radio (with this PIN, else the saved or a new one).
+    pub share: Option<Option<String>>,
 }
 
 /// What the cached 3D heights were built from: waterfall stamp, view (×1e5), grid size, floor (×10),
@@ -432,6 +480,8 @@ enum Src {
     Device(Device),
     Sim(Sim),
     Offline(String),
+    /// Another corvus-sweep's radio, over the network.
+    Remote(Box<net::Client>),
 }
 
 impl Src {
@@ -442,7 +492,7 @@ impl Src {
                 s.sweep(p);
                 Ok(())
             }
-            Src::Offline(_) => Ok(()),
+            Src::Offline(_) | Src::Remote(_) => Ok(()),
         }
     }
     fn set_rx(&mut self, rx: RxSettings) -> Result<(), String> {
@@ -452,7 +502,7 @@ impl Src {
                 s.set_rx(rx);
                 Ok(())
             }
-            Src::Offline(_) => Ok(()),
+            Src::Offline(_) | Src::Remote(_) => Ok(()),
         }
     }
     fn pause(&mut self) {
@@ -460,6 +510,7 @@ impl Src {
             Src::Device(d) => d.pause(),
             Src::Sim(s) => s.pause(),
             Src::Offline(_) => {}
+            Src::Remote(c) => c.cmd(net::Cmd::Run(false)),
         }
     }
     fn resume(&mut self) -> Result<(), String> {
@@ -470,8 +521,90 @@ impl Src {
                 Ok(())
             }
             Src::Offline(_) => Ok(()),
+            Src::Remote(c) => {
+                c.cmd(net::Cmd::Run(true));
+                Ok(())
+            }
         }
     }
+}
+
+/// What's connected and how it sweeps, for the device chip, the status bar and the footer (and a client).
+fn dev_info(src: &Src, serial: u64) -> DevInfo {
+    let board = crate::hydra::board().name();
+    let serial_txt = if serial == 0 { "first one found".to_string() } else { format!("{serial:016X}") };
+    match src {
+        Src::Sim(_) => DevInfo {
+            kind: SrcKind::Sim,
+            dot: Dot::Info,
+            short: format!("Simulator · {board} timing"),
+            details: "A synthetic band plan swept with the firmware's timing. No radio is open.".into(),
+            footer: "Simulator".into(),
+            ..Default::default()
+        },
+        Src::Offline(e) => DevInfo {
+            kind: SrcKind::Offline,
+            err: e.clone(),
+            dot: Dot::Alarm,
+            short: format!("{board} · not open"),
+            details: if e.is_empty() { "Not connected.".into() } else { e.clone() },
+            footer: format!("{board} not open"),
+            ..Default::default()
+        },
+        // a window shows its own Remote state (see App::dev)
+        Src::Remote(c) => DevInfo { kind: SrcKind::Offline, dot: Dot::Alarm, short: format!("{} · not connected", c.addr), ..Default::default() },
+        Src::Device(d) => {
+            let footer = if crate::hydra::board().networked() {
+                format!("{} · {}", d.version(), d.lib_path().display())
+            } else {
+                format!("{} · {} · {} · rev {}", d.version(), if serial == 0 { format!("first {board}") } else { format!("{serial:016X}") }, d.lib_path().display(), d.fw_revision())
+            };
+            if let crate::hydra::Device::Pluto(p) = d {
+                let (mode, note) = p.mode.lock().clone();
+                let how = match mode.as_str() {
+                    "fast" => "fast sweep (fastlock, direct SPI)".to_string(),
+                    "driver" if !note.is_empty() => format!("driver sweep. Fast mode is off: {note}"),
+                    "driver" => "driver sweep".to_string(),
+                    _ => "corvus-pluto sweep".to_string(),
+                };
+                let short = match mode.as_str() {
+                    "fast" => "fast sweep",
+                    "driver" => "driver sweep",
+                    _ => "corvus-pluto sweep",
+                };
+                return DevInfo {
+                    kind: SrcKind::Device,
+                    dot: Dot::Ok,
+                    short: format!("{board} · {short}"),
+                    details: format!("{}\n{}\n{how}", d.version(), d.lib_path().display()),
+                    footer,
+                    pluto_fast: mode == "fast",
+                    ..Default::default()
+                };
+            }
+            let how = match d {
+                crate::hydra::Device::HackRF(_) => "stock firmware sweep".to_string(),
+                _ if d.host_driven() => "stock firmware · PC-driven sweep".to_string(),
+                _ => format!("Corvus firmware sweep{}", d.fw_revision()),
+            };
+            DevInfo {
+                kind: SrcKind::Device,
+                dot: if d.host_driven() { Dot::Caution } else { Dot::Ok },
+                short: format!("{board} · {how}"),
+                details: format!("{}\nSerial {serial_txt}\nLibrary {}", d.version(), d.lib_path().display()),
+                footer,
+                host_driven: d.host_driven(),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// What the picker's network part asked for.
+enum NetAct {
+    Connect(String, String),
+    Disconnect,
+    Share(bool),
 }
 
 /// What a primary drag on the plot does when it's let go.
@@ -582,6 +715,23 @@ pub struct App {
     /// G was pressed: put the cursor in the Start field next frame.
     focus_start: bool,
     show_keys: bool,
+    /// Sharing this radio: the server, and the last settings change it applied from a client.
+    server: Option<net::Server>,
+    served_ack: (u64, u64),
+    /// Sharing: this machine's radios, for the client's picker.
+    served_radios: Vec<net::Radio>,
+    /// Connected to a server: its latest status, the session it's for, our settings changes sent (and the
+    /// last settings sent or taken), and a CSV asked for.
+    remote_status: Option<net::Status>,
+    remote_session: u64,
+    remote_seq: u64,
+    remote_last: Option<Shared>,
+    remote_sent: Instant,
+    csv_wait: bool,
+    /// The picker's network part: servers found on the LAN (None while looking), and the address and PIN typed.
+    found: std::sync::Arc<parking_lot::Mutex<Option<Vec<net::Found>>>>,
+    conn_addr: String,
+    conn_pin: String,
 }
 
 impl App {
@@ -605,9 +755,12 @@ impl App {
             cfg.fps = 60;
         }
         let plan = cfg.plan();
-        let engine = Engine::new(plan.clone(), cfg.dsp(), !opts.sim);
+        let remote = opts.connect.is_some();
+        let engine = Engine::new(plan.clone(), cfg.dsp(), !opts.sim && !remote);
         let rx = cfg.rx();
-        let src = if opts.sim {
+        let src = if let Some((addr, pin)) = &opts.connect {
+            Src::Remote(Box::new(net::Client::start(addr, pin)))
+        } else if opts.sim {
             Src::Sim(Sim::start(engine.sink(), plan.clone(), rx))
         } else {
             open_device(&opts.lib, opts.serial, &engine, &plan, rx)
@@ -668,8 +821,29 @@ impl App {
             started: Instant::now(),
             focus_start: false,
             show_keys: false,
+            server: None,
+            served_ack: (0, 0),
+            served_radios: Vec::new(),
+            remote_status: None,
+            remote_session: 0,
+            remote_seq: 0,
+            remote_last: None,
+            remote_sent: Instant::now(),
+            csv_wait: false,
+            found: Default::default(),
+            conn_addr: String::new(),
+            conn_pin: String::new(),
             cfg,
         };
+        if let Some((addr, pin)) = &opts.connect {
+            app.remember_remote(addr, pin);
+        }
+        if let Some(pin) = opts.share {
+            if let Some(pin) = pin {
+                app.cfg.serve_pin = pin;
+            }
+            app.set_share(true);
+        }
         // the firmware said which Airspy it is (the board was switched while opening): fit and sweep
         if !crate::hydra::board().rates().contains(&app.applied.rate) {
             app.engine.set_eq_prefix(crate::hydra::board().cache_prefix());
@@ -700,7 +874,8 @@ impl App {
         let p = self.cfg.plan();
         self.cfg.start_mhz = p.start_hz / 1e6;
         self.cfg.stop_mhz = p.stop_hz / 1e6;
-        if p == self.applied {
+        // connected: the settings go to the server (push_remote) and its plan comes back (adopt)
+        if p == self.applied || matches!(self.src, Src::Remote(_)) {
             return;
         }
         let range_changed = p.start_hz != self.applied.start_hz || p.stop_hz != self.applied.stop_hz;
@@ -723,7 +898,7 @@ impl App {
 
     fn apply_rx(&mut self) {
         let rx = self.cfg.rx();
-        if rx == self.applied_rx {
+        if rx == self.applied_rx || matches!(self.src, Src::Remote(_)) {
             return;
         }
         self.engine.note_restart();
@@ -731,7 +906,7 @@ impl App {
             Ok(()) => self.error = None,
             Err(e) => self.toast(e, true),
         }
-        self.retunes.push(self.engine.now());
+        self.retunes.push(self.now());
         self.applied_rx = rx;
     }
 
@@ -757,7 +932,7 @@ impl App {
             self.cfg.set_live(c);
         }
         if pr.peak_hold {
-            self.engine.clear_peak();
+            self.clear_peak();
         }
         self.toast(format!("{} profile", pr.name), false);
     }
@@ -811,6 +986,14 @@ impl App {
     }
 
     fn retry_device(&mut self) {
+        if let Src::Remote(c) = &mut self.src {
+            // not connected: try now; connected to a radio that isn't open: the server tries
+            match c.phase() {
+                net::Phase::Up => c.cmd(net::Cmd::Retry),
+                _ => c.reconnect(),
+            }
+            return;
+        }
         self.src = Src::Offline(String::new());
         self.src = open_device(&self.lib, self.serial, &self.engine, &self.applied, self.applied_rx);
         if let Src::Device(_) = self.src {
@@ -825,6 +1008,7 @@ impl App {
     /// learned passband and the settings it allows, then start the sweep. An Airspy turns out to be an
     /// R2 or a Mini only once opened, so the settings are fitted again afterwards.
     fn switch_device(&mut self, target: Option<(crate::hydra::Board, u64)>) {
+        self.leave_remote();
         self.src = Src::Offline(String::new());
         let Some((board, serial)) = target else {
             self.cfg.fit_board();
@@ -877,36 +1061,58 @@ impl App {
     /// The device picker: boards found on USB and the simulator; the current one is lit.
     fn device_picker(&mut self, ui: &mut Ui) {
         let Some((pos, found)) = self.picker.clone() else { return };
+        // connected: the server's radios, and picking one asks the server to open it
+        let server = if let Src::Remote(_) = self.src { self.remote_status.clone() } else { None };
+        let (title, found, live, cur_serial, sim) = match &server {
+            Some(st) => (
+                format!("Radios on {}", st.name),
+                st.radios.iter().map(|r| crate::hydra::Found { board: r.board, serial: r.serial, label: r.label.clone() }).collect(),
+                st.dev.kind == SrcKind::Device,
+                st.serial,
+                st.dev.kind == SrcKind::Sim,
+            ),
+            None => ("Radios".to_string(), found, matches!(self.src, Src::Device(_)), self.serial, matches!(self.src, Src::Sim(_))),
+        };
         let mut pick: Option<Option<(crate::hydra::Board, u64)>> = None;
+        let mut net_act: Option<NetAct> = None;
         let mut close = false;
         let area = egui::Area::new(ui.id().with("devpicker")).order(egui::Order::Foreground).fixed_pos(pos).show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_min_width(330.0);
-                theme::section(ui, "Radios");
+                theme::section(ui, &title);
                 if found.is_empty() {
                     theme::caption(ui, "Nothing found on USB. Plug a board in and refresh.");
                 }
                 let cur_board = crate::hydra::board();
-                let live = matches!(self.src, Src::Device(_));
                 for f in &found {
                     let same_family = f.board == cur_board || (f.board == crate::hydra::Board::Airspy && cur_board == crate::hydra::Board::Mini);
-                    let current = live && same_family && (f.serial == self.serial || self.serial == 0);
+                    let current = live && same_family && (f.serial == cur_serial || cur_serial == 0);
                     let label = if f.board == crate::hydra::Board::Airspy && current { cur_board.name().to_string() } else { f.label.clone() };
-                    let id = if f.board.networked() { crate::pluto::addr() } else { format!("{:016X}", f.serial) };
+                    let id = match f.board.networked() {
+                        true if server.is_some() => "network".to_string(),
+                        true => crate::pluto::addr(),
+                        false => format!("{:016X}", f.serial),
+                    };
                     let text = RichText::new(format!("{label}   {id}")).font(theme::num(theme::SM));
                     if ui.add(egui::Button::selectable(current, text)).clicked() && !current {
                         pick = Some(Some((f.board, f.serial)));
                     }
                 }
                 ui.separator();
-                let sim = matches!(self.src, Src::Sim(_));
                 if ui.add(egui::Button::selectable(sim, format!("Simulator ({} timing)", cur_board.name()))).clicked() && !sim {
                     pick = Some(None);
                 }
+                ui.separator();
+                self.picker_network(ui, &mut net_act);
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Refresh").clicked() {
-                        self.picker = Some((pos, crate::hydra::list_devices()));
+                        if let Src::Remote(c) = &self.src {
+                            c.cmd(net::Cmd::Refresh);
+                        } else {
+                            self.picker = Some((pos, crate::hydra::list_devices()));
+                        }
+                        self.discover();
                     }
                     if ui.button("Close").clicked() {
                         close = true;
@@ -917,8 +1123,28 @@ impl App {
         });
         if let Some(t) = pick {
             self.picker = None;
-            self.switch_device(t);
+            match &self.src {
+                Src::Remote(c) => {
+                    c.cmd(t.map_or(net::Cmd::Sim, |(b, s)| net::Cmd::Switch(b, s)));
+                    self.toast(format!("Asking {} to open {}", self.remote_addr(), t.map_or("the simulator", |(b, _)| b.name())), false);
+                }
+                _ => self.switch_device(t),
+            }
             return;
+        }
+        match net_act {
+            Some(NetAct::Connect(addr, pin)) => {
+                self.picker = None;
+                self.connect_remote(&addr, &pin);
+                return;
+            }
+            Some(NetAct::Disconnect) => {
+                self.picker = None;
+                self.switch_device(Some((self.start_lib.0, self.serial)));
+                return;
+            }
+            Some(NetAct::Share(on)) => self.set_share(on),
+            None => {}
         }
         let outside = ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer();
         if close || outside || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -926,18 +1152,321 @@ impl App {
         }
     }
 
+    /// The picker's network part: share this radio, or drive one found on the LAN, remembered, or typed in.
+    fn picker_network(&mut self, ui: &mut Ui, act: &mut Option<NetAct>) {
+        theme::section(ui, "Network");
+        let remote = self.remote_addr();
+        if remote.is_empty() {
+            let mut on = self.server.is_some();
+            if ui
+                .checkbox(&mut on, "Share this radio")
+                .on_hover_text(format!("Let Corvus Sweep on another machine show and control this radio (port {}, all interfaces, with a PIN). This window keeps working as before.", net::PORT))
+                .changed()
+            {
+                *act = Some(NetAct::Share(on));
+            }
+            if let Some(sv) = &self.server {
+                let at = net::local_ip().map_or_else(|| "this machine".to_string(), |ip| ip.to_string());
+                let who = sv.client().map_or_else(|| "no one connected".to_string(), |c| format!("{} connected", c.ip()));
+                theme::caption(ui, format!("On {at}, port {}, PIN {} · {who}", sv.addr.port(), sv.pin));
+            }
+        } else if ui.button(format!("Disconnect from {remote}")).clicked() {
+            *act = Some(NetAct::Disconnect);
+        }
+        let pin_for = |cfg: &Config, a: &str| cfg.remotes.iter().find(|(x, _)| x == a).map(|(_, p)| p.clone());
+        match self.found.lock().clone() {
+            None => theme::caption(ui, "Looking on the LAN…"),
+            Some(v) if v.is_empty() => theme::caption(ui, "No Corvus Sweep servers found on the LAN."),
+            Some(v) => {
+                for f in v {
+                    let addr = if f.addr.port() == net::PORT { f.addr.ip().to_string() } else { f.addr.to_string() };
+                    let current = addr == remote;
+                    let text = RichText::new(format!("{}   {}   {}{}", f.name, f.board, addr, if f.busy { " · in use" } else { "" })).font(theme::num(theme::SM));
+                    if ui.add(egui::Button::selectable(current, text)).on_hover_text(format!("Corvus Sweep {}", f.version)).clicked() && !current {
+                        match pin_for(&self.cfg, &addr) {
+                            Some(pin) => *act = Some(NetAct::Connect(addr, pin)),
+                            None => self.conn_addr = addr,
+                        }
+                    }
+                }
+            }
+        }
+        for (a, pin) in self.cfg.remotes.clone() {
+            let current = a == remote;
+            if ui.add(egui::Button::selectable(current, RichText::new(format!("{a}   (saved)")).font(theme::num(theme::SM)))).clicked() && !current {
+                *act = Some(NetAct::Connect(a, pin));
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.conn_addr).hint_text("address").desired_width(170.0));
+            ui.add(egui::TextEdit::singleline(&mut self.conn_pin).hint_text("PIN").desired_width(70.0));
+            let ok = !self.conn_addr.trim().is_empty() && !self.conn_pin.trim().is_empty();
+            if ui.add_enabled(ok, egui::Button::new("Connect")).clicked() {
+                *act = Some(NetAct::Connect(self.conn_addr.trim().to_string(), self.conn_pin.trim().to_string()));
+            }
+        });
+        theme::caption(ui, "A server is Corvus Sweep sharing its radio (Share this radio, or corvus-sweep --serve). Over the internet, use a VPN such as Tailscale: the link isn't encrypted.");
+    }
+
+    /// Look for servers on the LAN in the background (the picker shows them when they answer).
+    fn discover(&self) {
+        let found = self.found.clone();
+        *found.lock() = None;
+        std::thread::spawn(move || *found.lock() = Some(net::discover(Duration::from_millis(700))));
+    }
+
     fn use_sim(&mut self) {
+        if let Src::Remote(c) = &self.src {
+            c.cmd(net::Cmd::Sim);
+            return;
+        }
         self.engine.set_persist_eq(false);
         self.src = Src::Sim(Sim::start(self.engine.sink(), self.applied.clone(), self.applied_rx));
         self.engine.note_restart();
         self.running = true;
     }
 
+    /// Engine time: this window's engine, or the server's.
+    fn now(&self) -> f32 {
+        if let Src::Remote(c) = &self.src { c.now() } else { self.engine.now() }
+    }
+
+    fn clear_peak(&mut self) {
+        if let Src::Remote(c) = &self.src { c.cmd(net::Cmd::ClearPeak) } else { self.engine.clear_peak() }
+    }
+
+    fn reset_eq(&mut self) {
+        if let Src::Remote(c) = &self.src { c.cmd(net::Cmd::ResetEq) } else { self.engine.reset_eq() }
+    }
+
+    fn remote_addr(&self) -> String {
+        if let Src::Remote(c) = &self.src { c.addr.clone() } else { String::new() }
+    }
+
+    fn remember_remote(&mut self, addr: &str, pin: &str) {
+        self.cfg.remotes.retain(|(a, _)| a != addr);
+        self.cfg.remotes.insert(0, (addr.to_string(), pin.to_string()));
+        self.cfg.remotes.truncate(8);
+    }
+
+    /// Drive another machine's radio: this one's is closed (and no longer shared). The window takes the
+    /// server's board and settings when it answers.
+    fn connect_remote(&mut self, addr: &str, pin: &str) {
+        self.set_share(false);
+        self.src = Src::Offline(String::new());
+        self.engine.set_persist_eq(false);
+        self.src = Src::Remote(Box::new(net::Client::start(addr, pin)));
+        self.remote_status = None;
+        self.remote_session = 0;
+        self.fresh_history();
+        self.remember_remote(addr, pin);
+        self.toast(format!("Connecting to {addr}"), false);
+    }
+
+    /// Back from a server to this machine (the caller opens a radio or the simulator).
+    fn leave_remote(&mut self) {
+        if let Src::Remote(_) = self.src {
+            self.src = Src::Offline(String::new());
+            self.remote_status = None;
+            self.fresh_history();
+            self.error = None;
+        }
+    }
+
+    /// Start over with an empty waterfall (a server's history is about to arrive, or ours replaces it).
+    fn fresh_history(&mut self) {
+        self.wf = Waterfall::new();
+        self.wf_mode = None;
+        self.breaks.clear();
+        self.retunes.clear();
+        self.bad_last = (0, f32::NEG_INFINITY);
+        self.stats = Stats::default();
+        self.v3_key = None;
+    }
+
+    /// Share this radio on the network (all interfaces, the default port) or stop.
+    fn set_share(&mut self, on: bool) {
+        if !on {
+            if self.server.take().is_some() {
+                self.toast("Stopped sharing", false);
+            }
+            return;
+        }
+        if self.server.is_some() || matches!(self.src, Src::Remote(_)) {
+            return;
+        }
+        if self.cfg.serve_pin.is_empty() {
+            self.cfg.serve_pin = net::random_pin();
+        }
+        let bind = std::net::SocketAddr::from(([0, 0, 0, 0], net::PORT));
+        match net::Server::start(bind, self.cfg.serve_pin.clone(), self.engine.live.clone(), self.engine.epoch) {
+            Ok(sv) => {
+                self.server = Some(sv);
+                self.served_radios = net::radios();
+                self.toast(format!("Sharing on port {}, PIN {}", net::PORT, self.cfg.serve_pin), false);
+            }
+            Err(e) => self.toast(e, true),
+        }
+    }
+
+    /// Sharing: do what the client asked, as if it had been done here.
+    fn serve_incoming(&mut self) {
+        let Some(sv) = &self.server else { return };
+        for m in sv.take() {
+            match m {
+                net::Incoming::Config { session, seq, cfg } => {
+                    cfg.put(&mut self.cfg);
+                    self.cfg.fit_board();
+                    self.served_ack = (session, seq);
+                }
+                net::Incoming::Cmd(c) => match c {
+                    net::Cmd::ClearPeak => self.clear_peak(),
+                    net::Cmd::ResetEq => self.reset_eq(),
+                    net::Cmd::Run(on) => {
+                        if on != self.running {
+                            self.toggle_run();
+                        }
+                    }
+                    net::Cmd::Retry => self.retry_device(),
+                    net::Cmd::Sim => self.switch_device(None),
+                    net::Cmd::Switch(b, s) => {
+                        self.switch_device(Some((b, s)));
+                        self.served_radios = net::radios();
+                    }
+                    net::Cmd::Refresh => self.served_radios = net::radios(),
+                },
+            }
+        }
+    }
+
+    /// Sharing: what the client should see of this window's side.
+    fn serve_publish(&self) {
+        if let Some(sv) = &self.server {
+            sv.publish(net::status(&Shared::of(&self.cfg), self.served_ack, &self.applied, self.applied_rx, self.running, self.error.clone(), self.dev(), &self.served_radios, self.serial));
+        }
+    }
+
+    /// Connected: take what the server sent since the last frame.
+    fn sync_remote(&mut self) {
+        let Src::Remote(c) = &self.src else { return };
+        let now = c.now();
+        let mut m = c.mirror.lock();
+        if m.session != self.remote_session && m.phase == net::Phase::Up {
+            // a new connection: the server's settings and history come again
+            self.remote_session = m.session;
+            self.remote_seq = 0;
+            self.remote_last = None;
+            self.remote_status = None;
+            drop(m);
+            self.fresh_history();
+            let Src::Remote(c) = &self.src else { return };
+            m = c.mirror.lock();
+        }
+        let items = std::mem::take(&mut m.items);
+        let state = m.state.clone();
+        let status = if m.status_new {
+            m.status_new = false;
+            m.status.clone()
+        } else {
+            None
+        };
+        let csv = m.csv.take();
+        drop(m);
+        let mut last_t = None;
+        for it in items {
+            match it {
+                net::Item::Layout(lay) => {
+                    self.wf.relayout(lay.cols, lay.generation, lay.cover);
+                    let mode = (lay.plan, lay.nfft);
+                    if let Some(old) = self.wf_mode.replace(mode.clone())
+                        && self.wf.filled > 0
+                        && let Some(what) = mode_change(&old, &mode, &self.cfg)
+                    {
+                        self.breaks.push((last_t.unwrap_or(now), what));
+                    }
+                }
+                net::Item::Row(r) => {
+                    self.wf.push(&net::unq8(&r.q), r.t);
+                    last_t = Some(r.t);
+                }
+            }
+        }
+        if let Some(st) = state {
+            self.stats = st.stats;
+            self.health = st.health;
+            self.eq_state = st.eq_state;
+            self.burst = st.burst;
+            self.step_t = st.step_t;
+            self.head = st.head;
+        }
+        if let Some(st) = status {
+            self.adopt(st);
+        }
+        if let Some(out) = csv
+            && std::mem::take(&mut self.csv_wait)
+        {
+            self.save_csv(out);
+        }
+    }
+
+    /// Connected: the server's settings, plan and radio. Its settings replace ours unless a change of ours is
+    /// still on its way (it's applied when the server has it, and comes back).
+    fn adopt(&mut self, st: net::Status) {
+        if st.board != crate::hydra::board() {
+            crate::hydra::set_board(st.board);
+        }
+        let (lo, hi, shifts) = st.pluto_lo;
+        plan::set_pluto_lo(lo, hi, shifts);
+        let ours_landed = self.remote_seq == 0 || (st.acked.0 == self.remote_session && st.acked.1 >= self.remote_seq);
+        if ours_landed && self.remote_last.as_ref() != Some(&st.cfg) {
+            st.cfg.put(&mut self.cfg);
+            self.remote_last = Some(st.cfg.clone());
+        }
+        if st.plan != self.applied {
+            let first = self.remote_status.is_none();
+            let p = &st.plan;
+            if p.rate != self.applied.rate {
+                self.switches = plan::divider_switches(p.rate);
+            }
+            if p.start_hz != self.applied.start_hz || p.stop_hz != self.applied.stop_hz {
+                if !first {
+                    self.prev_range = Some((self.applied.start_hz, self.applied.stop_hz));
+                }
+                self.view = (p.start_hz, p.stop_hz);
+                self.labels.clear();
+            }
+            self.applied = st.plan.clone();
+        }
+        self.applied_rx = self.cfg.rx();
+        self.running = st.running;
+        self.error = st.error.clone();
+        self.remote_status = Some(st);
+    }
+
+    /// Connected: send our settings when they change (at most ten times a second; the last one always goes).
+    fn push_remote(&mut self) {
+        let Src::Remote(c) = &self.src else { return };
+        if self.remote_status.is_none() || c.phase() != net::Phase::Up {
+            return;
+        }
+        let sh = Shared::of(&self.cfg);
+        if self.remote_last.as_ref() != Some(&sh) && self.remote_sent.elapsed() >= Duration::from_millis(100) {
+            self.remote_seq += 1;
+            c.config(self.remote_seq, sh.clone());
+            self.remote_last = Some(sh);
+            self.remote_sent = Instant::now();
+        }
+    }
+
     /// Pull what the panels need from the engine (one short lock).
     fn sync_engine(&mut self) {
+        if let Src::Remote(_) = self.src {
+            self.sync_remote();
+            return;
+        }
         let live = self.engine.live.clone();
         let mut l = live.lock();
-        let now = self.engine.now();
+        let now = self.now();
         if l.generation != self.wf.generation {
             self.wf.relayout(l.wf_cols, l.generation, l.plan.cover());
             let mode = (l.plan.clone(), l.settings.nfft);
@@ -948,8 +1477,12 @@ impl App {
                 self.breaks.push((now, what));
             }
         }
-        while let Some(row) = l.rows.pop_front() {
-            self.wf.push(&row, now);
+        let rows: Vec<Vec<f32>> = l.rows.drain(..).collect();
+        for row in &rows {
+            self.wf.push(row, now);
+        }
+        if let Some(sv) = &mut self.server {
+            sv.rows(&l, &rows, now);
         }
         self.stats = l.stats.clone();
         self.health = l.health.clone();
@@ -993,41 +1526,45 @@ impl App {
 
     /// A Pluto sweeping in corvus-pluto's fast mode.
     fn pluto_fast(&self) -> bool {
-        matches!(&self.src, Src::Device(d) if d.pluto_mode().as_deref() == Some("fast"))
+        self.dev().pluto_fast
+    }
+
+    /// The radio this window drives: its own, or a server's.
+    fn dev(&self) -> DevInfo {
+        let Src::Remote(c) = &self.src else { return dev_info(&self.src, self.serial) };
+        match (c.phase(), &self.remote_status) {
+            (net::Phase::Up, Some(s)) => {
+                let mut d = s.dev.clone();
+                d.short = format!("{} · {}", s.name, d.short);
+                d.details = format!("On {} ({}), over the network\n{}", s.name, c.addr, d.details);
+                d.footer = format!("Remote {} ({}) · {}", c.addr, s.name, d.footer);
+                d
+            }
+            (phase, _) => {
+                let (dot, what) = match &phase {
+                    net::Phase::Up | net::Phase::Connecting => (Dot::Info, "connecting".to_string()),
+                    net::Phase::Down(e) | net::Phase::Denied(e) => (Dot::Alarm, e.clone()),
+                };
+                DevInfo { kind: SrcKind::Offline, err: what.clone(), dot, short: format!("{} · {}", c.addr, if dot == Dot::Info { "connecting" } else { "not connected" }), details: what, footer: format!("Remote {}", c.addr), ..Default::default() }
+            }
+        }
+    }
+
+    /// Connected to a server, and how that's going (None: this window drives its own radio).
+    fn remote_phase(&self) -> Option<net::Phase> {
+        if let Src::Remote(c) = &self.src { Some(c.phase()) } else { None }
     }
 
     /// What's connected and how it sweeps: (dot colour, short text, details for the hover).
     fn device_status(&self) -> (Color32, String, String) {
-        let board = crate::hydra::board().name();
-        match &self.src {
-            Src::Sim(_) => (theme::INFO, format!("Simulator · {board} timing"), "A synthetic band plan swept with the firmware's timing. No radio is open.".into()),
-            Src::Offline(e) => (theme::ALARM, format!("{board} · not open"), if e.is_empty() { "Not connected.".into() } else { e.clone() }),
-            Src::Device(d) => {
-                let serial = if self.serial == 0 { "first one found".to_string() } else { format!("{:016X}", self.serial) };
-                if let crate::hydra::Device::Pluto(p) = d {
-                    let (mode, note) = p.mode.lock().clone();
-                    let how = match mode.as_str() {
-                        "fast" => "fast sweep (fastlock, direct SPI)".to_string(),
-                        "driver" if !note.is_empty() => format!("driver sweep. Fast mode is off: {note}"),
-                        "driver" => "driver sweep".to_string(),
-                        _ => "corvus-pluto sweep".to_string(),
-                    };
-                    let short = match mode.as_str() {
-                        "fast" => "fast sweep",
-                        "driver" => "driver sweep",
-                        _ => "corvus-pluto sweep",
-                    };
-                    return (theme::OK, format!("{board} · {short}"), format!("{}\n{}\n{how}", d.version(), d.lib_path().display()));
-                }
-                let how = match d {
-                    crate::hydra::Device::HackRF(_) => "stock firmware sweep".to_string(),
-                    _ if d.host_driven() => "stock firmware · PC-driven sweep".to_string(),
-                    _ => format!("Corvus firmware sweep{}", d.fw_revision()),
-                };
-                let colour = if d.host_driven() { theme::CAUTION } else { theme::OK };
-                (colour, format!("{board} · {how}"), format!("{}\nSerial {serial}\nLibrary {}", d.version(), d.lib_path().display()))
-            }
-        }
+        let d = self.dev();
+        let dot = match d.dot {
+            Dot::Ok => theme::OK,
+            Dot::Caution => theme::CAUTION,
+            Dot::Info => theme::INFO,
+            Dot::Alarm => theme::ALARM,
+        };
+        (dot, d.short, d.details)
     }
 
     fn device_chip(&mut self, ui: &mut Ui) {
@@ -1048,6 +1585,12 @@ impl App {
         resp.on_hover_text(format!("{details}\n\nClick to switch radios."));
         if clicked {
             self.picker = if self.picker.is_some() { None } else { Some((r.left_bottom() + vec2(0.0, 6.0), crate::hydra::list_devices())) };
+            if self.picker.is_some() {
+                self.discover();
+                if let Src::Remote(c) = &self.src {
+                    c.cmd(net::Cmd::Refresh);
+                }
+            }
         }
     }
 
@@ -1076,9 +1619,21 @@ impl App {
     fn conditions(&self) -> Vec<Cond> {
         let mut out = Vec::new();
         let s = &self.stats;
-        if let Src::Offline(e) = &self.src {
-            let e = if e.is_empty() { "not connected".to_string() } else { e.clone() };
-            out.push(Cond { level: Level::Alarm, text: format!("The {} isn't open: {e}.", crate::hydra::board().name()), acts: vec![(Act::Retry, "Try again"), (Act::Sim, "Run the simulator")] });
+        let dev = self.dev();
+        match self.remote_phase() {
+            Some(net::Phase::Connecting) => out.push(Cond { level: Level::Info, text: format!("Connecting to {}…", self.remote_addr()), acts: vec![(Act::Local, "Disconnect")] }),
+            Some(net::Phase::Down(e)) => out.push(Cond { level: Level::Alarm, text: format!("Can't reach {}: {e}. Trying again every 2 s.", self.remote_addr()), acts: vec![(Act::Retry, "Try now"), (Act::Local, "Disconnect")] }),
+            Some(net::Phase::Denied(e)) => out.push(Cond { level: Level::Alarm, text: format!("{} said no: {e}.", self.remote_addr()), acts: vec![(Act::Retry, "Try again"), (Act::Local, "Disconnect")] }),
+            _ if dev.kind == SrcKind::Offline => {
+                let e = if dev.err.is_empty() { "not connected".to_string() } else { dev.err.clone() };
+                out.push(Cond { level: Level::Alarm, text: format!("The {} isn't open: {e}.", crate::hydra::board().name()), acts: vec![(Act::Retry, "Try again"), (Act::Sim, "Run the simulator")] });
+            }
+            _ => {}
+        }
+        if let Some(sv) = &self.server {
+            let at = net::local_ip().map_or_else(|| format!("port {}", sv.addr.port()), |ip| format!("{ip}:{}", sv.addr.port()));
+            let who = sv.client().map_or_else(|| "no one connected".to_string(), |c| format!("{} connected", c.ip()));
+            out.push(Cond { level: Level::Info, text: format!("Sharing this radio on {at}, PIN {}: {who}.", sv.pin), acts: vec![(Act::Unshare, "Stop sharing")] });
         }
         if let Some(e) = &self.error {
             out.push(Cond { level: Level::Alarm, text: format!("The radio didn't take the last setting: {e}."), acts: vec![(Act::Dismiss, "Dismiss")] });
@@ -1138,7 +1693,7 @@ impl App {
         if !self.running {
             out.push(Cond { level: Level::Info, text: "Paused. The last sweep stays on screen.".into(), acts: vec![(Act::Resume, "Run")] });
         }
-        if let Src::Sim(_) = self.src {
+        if dev.kind == SrcKind::Sim {
             out.push(Cond { level: Level::Info, text: "Simulator: a synthetic band plan with the firmware's timing.".into(), acts: vec![(Act::Retry, connect_label())] });
         }
         let (_, slow) = self.applied.divider_transitions();
@@ -1146,7 +1701,7 @@ impl App {
             let sw: Vec<String> = self.switches.iter().filter(|&&f| f > self.applied.start_hz && f < self.applied.stop_hz).map(|f| format!("{:.1}", f / 1e6)).collect();
             out.push(Cond { level: Level::Info, text: format!("This range straddles the tuner's VCO switch at {} MHz and is too small to route around it, which costs about 10 ms per pass.", sw.join(", ")), acts: vec![] });
         }
-        if self.cfg.eq_on && self.eq_state == EqState::Unknown && self.applied.n() < 12 && !matches!(self.src, Src::Offline(_)) {
+        if self.cfg.eq_on && self.eq_state == EqState::Unknown && self.applied.n() < 12 && dev.kind != SrcKind::Offline {
             out.push(Cond { level: Level::Info, text: "Flatten passband has nothing learned at this bin width yet: it needs one sweep of 12 steps or more (Full range works).".into(), acts: vec![] });
         }
         out.sort_by_key(|c| std::cmp::Reverse(c.level));
@@ -1155,11 +1710,11 @@ impl App {
 
     /// The PC retunes each step (stock firmware, or `--host-sweep`).
     fn host_driven(&self) -> bool {
-        matches!(&self.src, Src::Device(d) if d.host_driven())
+        self.dev().host_driven
     }
 
     fn issues_recent(&self) -> bool {
-        self.bad_last.0 > 0 && self.engine.now() - self.bad_last.1 < 10.0
+        self.bad_last.0 > 0 && self.now() - self.bad_last.1 < 10.0
     }
 
     /// The status bar (rule A3): one traffic-light tile, then conditions as sentences.
@@ -1209,6 +1764,8 @@ impl App {
         match act {
             Some(Act::Retry) => self.retry_device(),
             Some(Act::Sim) => self.use_sim(),
+            Some(Act::Local) => self.switch_device(Some((self.start_lib.0, self.serial))),
+            Some(Act::Unshare) => self.set_share(false),
             Some(Act::Dismiss) => self.error = None,
             Some(Act::LockOn) => self.cfg.lock_reads = 2,
             Some(Act::Resume) => self.toggle_run(),
@@ -1678,10 +2235,10 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Clear peaks").on_hover_text("P").clicked() {
-                            self.engine.clear_peak();
+                            self.clear_peak();
                         }
                         if matches!(self.eq_state, EqState::Learning(_) | EqState::Learned(_)) && theme::confirm_button(ui, "Relearn the passband", "Click again: forget the learned shape") {
-                            self.engine.reset_eq();
+                            self.reset_eq();
                             self.toast("Relearning the passband", false);
                         }
                     });
@@ -1721,12 +2278,10 @@ impl App {
     /// The footer: where the data comes from, and what drawing costs (rule P2).
     fn footer(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            let src = match &self.src {
-                Src::Device(d) if crate::hydra::board().networked() => format!("{} · {}", d.version(), d.lib_path().display()),
-                Src::Device(d) => format!("{} · {} · {} · rev {}", d.version(), if self.serial == 0 { format!("first {}", crate::hydra::board().name()) } else { format!("{:016X}", self.serial) }, d.lib_path().display(), d.fw_revision()),
-                Src::Sim(_) => "Simulator".to_string(),
-                Src::Offline(_) => format!("{} not open", crate::hydra::board().name()),
-            };
+            let mut src = self.dev().footer;
+            if let Src::Remote(c) = &self.src {
+                src = format!("{src} · {:.0} kB/s", c.mirror.lock().rate / 1e3);
+            }
             ui.label(RichText::new(src).size(theme::XS + 1.0).color(INK2));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let fps = if self.frame_times.len() > 1 {
@@ -1799,9 +2354,9 @@ impl App {
         self.paint_range_drag(&painter, spec, ov);
         self.paint_readout(&painter, spec, wf);
         self.selection_menu(ui);
-        if let Src::Offline(err) = &self.src {
-            let err = err.clone();
-            self.offline_banner(ui, spec, &err);
+        let dev = self.dev();
+        if dev.kind == SrcKind::Offline && matches!(self.remote_phase(), None | Some(net::Phase::Up)) {
+            self.offline_banner(ui, spec, &dev.err);
         }
     }
 
@@ -2200,7 +2755,7 @@ impl App {
                 }
             }
         }
-        let now = self.engine.now();
+        let now = self.now();
         for k in 0..5 {
             let i = k * (gz - 1) / 4;
             let t = self.wf.row_time(i);
@@ -2239,7 +2794,7 @@ impl App {
             let i = (((pos.y - wf.top()) / wf.height()) * rows as f32).floor().max(0.0) as usize;
             let f = self.f_of(wf, pos.x);
             let t = self.wf.row_time(i);
-            let age = (i < self.wf.filled && t.is_finite()).then(|| self.engine.now() - t);
+            let age = (i < self.wf.filled && t.is_finite()).then(|| self.now() - t);
             (f, self.wf.value_at(i, f), age)
         } else {
             match self.shown.hover {
@@ -2481,6 +3036,10 @@ impl App {
 
     /// Reduce the stitched arrays to what is on screen (one lock).
     fn gather(&mut self, cols: usize, ov_cols: usize) {
+        if let Src::Remote(_) = self.src {
+            self.gather_remote(cols, ov_cols);
+            return;
+        }
         let live = self.engine.live.clone();
         let l = live.lock();
         let (a, b) = self.view;
@@ -2498,6 +3057,38 @@ impl App {
                 .into_iter()
                 .filter_map(|(f, _)| max_in(&l, Trace::Live, f - px * 2.0, f + px * 2.0))
                 .collect();
+        }
+    }
+
+    /// Connected: ask for the view, show the latest traces the server sent for it. Peak labels and the cursor
+    /// read the traces as sent (to a screen column, not a bin).
+    fn gather_remote(&mut self, cols: usize, ov_cols: usize) {
+        let (a, b) = self.view;
+        let req = net::ViewReq {
+            lo: a,
+            hi: b,
+            cols: cols as u32,
+            det: self.cfg.detector,
+            avg: self.cfg.show_avg,
+            peak: self.cfg.show_peak,
+            ov: self.cfg.overview.then_some((self.applied.start_hz, self.applied.stop_hz, ov_cols as u32)),
+            fps: self.cfg.fps.min(30),
+        };
+        let Src::Remote(c) = &mut self.src else { return };
+        c.view(req);
+        let m = c.mirror.lock();
+        let t = &m.traces;
+        let pair = |ys: &Vec<f32>| (t.xs.len() == ys.len()).then(|| (t.xs.clone(), ys.clone()));
+        self.shown.live = pair(&t.live).unwrap_or_default();
+        self.shown.avg = if self.cfg.show_avg { t.avg.as_ref().and_then(pair) } else { None };
+        self.shown.peak = if self.cfg.show_peak { t.peak.as_ref().and_then(pair) } else { None };
+        self.shown.overview = if self.cfg.overview { t.ov.as_ref().filter(|ys| ys.len() == t.ov_xs.len()).map(|ys| (t.ov_xs.clone(), ys.clone())) } else { None };
+        drop(m);
+        let px = (b - a) / cols as f64;
+        if self.labels_t.elapsed() > Duration::from_millis(300) {
+            self.labels_t = Instant::now();
+            let (xs, ys) = if self.cfg.show_avg { self.shown.avg.clone().unwrap_or_default() } else { self.shown.live.clone() };
+            self.labels = find_peaks(&xs, &ys, self.cfg.labels, (b - a) / 30.0).into_iter().filter_map(|(f, _)| max_in_shown(&self.shown.live, f - px * 2.0, f + px * 2.0)).collect();
         }
     }
 
@@ -2521,7 +3112,7 @@ impl App {
             p.line_segment([pos2(x, r.top()), pos2(x, r.bottom())], Stroke::new(1.0, GRATICULE.gamma_multiply(grid * if major { 1.0 } else { 0.6 })));
         }
         // sweep beam: steps brighten faintly as the firmware visits them (only when slow enough to follow)
-        let now = self.engine.now();
+        let now = self.now();
         let plan = &self.applied;
         if self.cfg.beam && self.followable && !self.step_t.is_empty() {
             let lo = plan.f0 as f64 - plan.window_hz / 2.0;
@@ -2597,8 +3188,11 @@ impl App {
         {
             let f = self.f_of(r, x);
             let px = (self.view.1 - self.view.0) / r.width() as f64;
-            let live = self.engine.live.clone();
-            let found = max_in(&live.lock(), Trace::Live, f - 2.0 * px, f + 2.0 * px);
+            let found = if let Src::Remote(_) = self.src {
+                max_in_shown(&self.shown.live, f - 2.0 * px, f + 2.0 * px)
+            } else {
+                max_in(&self.engine.live.lock(), Trace::Live, f - 2.0 * px, f + 2.0 * px)
+            };
             self.shown.hover = found;
             p.line_segment([pos2(x, r.top()), pos2(x, r.bottom())], Stroke::new(1.0, TOUCH.gamma_multiply(0.35)));
             if let Some((hf, v)) = found {
@@ -2631,7 +3225,7 @@ impl App {
         p.rect_filled(r, 4, PANEL);
         let plan = &self.applied;
         let lo = plan.f0 as f64 - plan.window_hz / 2.0;
-        let now = self.engine.now();
+        let now = self.now();
         let n = plan.n();
         let mut labels = Vec::new();
         let mut i = 0;
@@ -2712,7 +3306,7 @@ impl App {
             self.wf.paint(ctx, &p.with_clip_rect(r), sub, u0, u1, rows);
         }
         p.rect_stroke(r, 0, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
-        let now = self.engine.now();
+        let now = self.now();
         let row_y = |i: usize| r.top() + (i as f32 + 0.5) / rows as f32 * r.height();
         // retune lines: rows on either side of a receiver change aren't comparable (rule O13)
         let oldest = self.wf.row_time(self.wf.filled.min(rows).saturating_sub(1));
@@ -2817,8 +3411,19 @@ impl App {
 
 
     fn export_csv(&mut self) {
-        let path = captures_dir().join(format!("corvus-sweep-{}.csv", stamp()));
+        if let Src::Remote(c) = &self.src {
+            // the server has the full-resolution spectrum: ask for it, save it when it comes (sync_remote)
+            c.csv();
+            self.csv_wait = true;
+            self.toast("Asking the server for the spectrum", false);
+            return;
+        }
         let out = self.engine.live.lock().to_csv();
+        self.save_csv(out);
+    }
+
+    fn save_csv(&mut self, out: String) {
+        let path = captures_dir().join(format!("corvus-sweep-{}.csv", stamp()));
         let res = std::fs::create_dir_all(path.parent().unwrap()).and_then(|_| std::fs::write(&path, out));
         match res {
             Ok(()) => self.toast(format!("Saved {}", path.display()), false),
@@ -2970,7 +3575,7 @@ impl App {
                 }
                 // display
                 Key::A => self.auto_levels(),
-                Key::P => self.engine.clear_peak(),
+                Key::P => self.clear_peak(),
                 Key::H => self.cfg.show_peak = !self.cfg.show_peak,
                 Key::V => self.cfg.show_avg = !self.cfg.show_avg,
                 Key::E => {
@@ -3099,9 +3704,10 @@ impl eframe::App for App {
             self.frame_times.pop_front();
         }
         self.sync_engine();
+        self.serve_incoming();
         let bad = self.stats.torn + self.stats.gaps + self.stats.misfiled + self.stats.lock_timeouts + self.stats.host_drops;
         if bad > self.bad_last.0 {
-            self.bad_last = (bad, self.engine.now());
+            self.bad_last = (bad, self.now());
         } else if bad < self.bad_last.0 {
             self.bad_last.0 = bad;
         }
@@ -3129,10 +3735,15 @@ impl eframe::App for App {
             self.auto_pending = false;
             self.auto_levels();
         }
-        // apply changes: the sweep plan and receiver settings debounced (drag values fire every frame)
+        // apply changes: the sweep plan and receiver settings debounced (drag values fire every frame); connected,
+        // they go to the server instead
         let now = Instant::now();
+        let remote = matches!(self.src, Src::Remote(_));
+        if remote {
+            self.push_remote();
+        }
         let c = &self.cfg;
-        if c.plan() != before.plan() || c.plan() != self.applied {
+        if !remote && (c.plan() != before.plan() || c.plan() != self.applied) {
             self.plan_dirty.get_or_insert(now);
         }
         if c.rx() != before.rx() || c.rx() != self.applied_rx {
@@ -3142,7 +3753,7 @@ impl eframe::App for App {
             self.engine.set_settings(c.dsp());
             // a new bin width re-lays out the engine, so it shows as a break, not a retune
             if c.eq_on != before.eq_on {
-                self.retunes.push(self.engine.now());
+                self.retunes.push(self.now());
             }
         }
         // held while a field has the keyboard, so typing start then stop applies once
@@ -3154,6 +3765,7 @@ impl eframe::App for App {
             self.rx_dirty = None;
             self.apply_rx();
         }
+        self.serve_publish();
         let ms = frame_start.elapsed().as_secs_f32() * 1e3;
         self.frame_ms = if self.frame_ms == 0.0 { ms } else { self.frame_ms * 0.9 + ms * 0.1 };
         ui.ctx().request_repaint_after(Duration::from_secs_f32(1.0 / self.cfg.fps.max(1) as f32));
@@ -3171,7 +3783,9 @@ impl eframe::App for App {
 
 /// No window: sweep for `secs`, print the rate once a second and the seam ripple at the end, and
 /// optionally write the stitched spectrum as CSV.
-pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>, csv_every: Option<f32>) -> Result<(), String> {
+/// Settings from the defaults and the command line, an engine, and the radio (or the simulator) opened and
+/// sweeping, for the windowless modes.
+fn open_windowless(opts: &Options) -> (Config, Engine, Src, Plan) {
     let mut cfg = Config::default();
     for o in &opts.overrides {
         o(&mut cfg);
@@ -3186,8 +3800,10 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>, csv_every: Optio
     if crate::hydra::board() == asked && cfg.plan() != plan {
         plan = cfg.plan();
         engine.set_plan(plan.clone());
-        if let Src::Device(d) = &mut src {
-            d.sweep(&plan)?;
+        if let Src::Device(d) = &mut src
+            && let Err(e) = d.sweep(&plan)
+        {
+            src = Src::Offline(e);
         }
     }
     if crate::hydra::board() != asked {
@@ -3196,14 +3812,169 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>, csv_every: Optio
         cfg.fit_board();
         plan = cfg.plan();
         engine.set_plan(plan.clone());
-        if let Src::Device(d) = &mut src {
-            d.sweep(&plan)?;
+        if let Src::Device(d) = &mut src
+            && let Err(e) = d.sweep(&plan)
+        {
+            src = Src::Offline(e);
         }
     }
+    (cfg, engine, src, plan)
+}
+
+/// No window: share the radio on the network until stopped (Ctrl-C), sweeping all along. A client's changes are
+/// applied as the window would apply them; the radio keeps sweeping with the last settings when it leaves.
+pub fn serve(opts: Options, bind: std::net::SocketAddr, pin: Option<String>) -> Result<(), String> {
+    let (mut cfg, engine, mut src, mut applied) = open_windowless(&opts);
+    let pin = pin.unwrap_or_else(net::random_pin);
+    let mut server = net::Server::start(bind, pin.clone(), engine.live.clone(), engine.epoch)?;
+    let mut rx = cfg.rx();
+    let mut dsp = cfg.dsp();
+    let (mut running, mut error, mut acked) = (true, None::<String>, (0u64, 0u64));
+    let at = if bind.ip().is_unspecified() { net::local_ip().map_or("all interfaces".to_string(), |ip| format!("{ip} (all interfaces)")) } else { bind.ip().to_string() };
+    println!("{}", dev_info(&src, opts.serial).short);
+    println!("serving on {at}, port {}, PIN {pin}", bind.port());
+    let mut next_log = Instant::now();
+    let mut client = None;
+    let (start_board, mut serial, mut lib) = (crate::hydra::board(), opts.serial, opts.lib.clone());
+    let mut radios = net::radios();
+    while !crate::QUIT.load(std::sync::atomic::Ordering::Relaxed) {
+        for m in server.take() {
+            match m {
+                net::Incoming::Config { session, seq, cfg: sh } => {
+                    sh.put(&mut cfg);
+                    cfg.fit_board();
+                    acked = (session, seq);
+                }
+                net::Incoming::Cmd(c) => match c {
+                    net::Cmd::ClearPeak => engine.clear_peak(),
+                    net::Cmd::ResetEq => engine.reset_eq(),
+                    net::Cmd::Run(false) if running => {
+                        src.pause();
+                        running = false;
+                    }
+                    net::Cmd::Run(true) if !running => {
+                        engine.note_restart();
+                        match src.resume() {
+                            Ok(()) => running = true,
+                            Err(e) => error = Some(e),
+                        }
+                    }
+                    net::Cmd::Run(_) => {}
+                    net::Cmd::Refresh => radios = net::radios(),
+                    net::Cmd::Switch(board, s) => {
+                        // as the window's switch_device: the board, its passband and settings, then open and sweep
+                        drop(std::mem::replace(&mut src, Src::Offline(String::new())));
+                        crate::hydra::set_board(board);
+                        serial = s;
+                        lib = if board == start_board { opts.lib.clone() } else { crate::hydra::default_lib_path(board) };
+                        engine.set_eq_prefix(board.cache_prefix());
+                        cfg.fit_board();
+                        applied = cfg.plan();
+                        engine.set_plan(applied.clone());
+                        src = open_device(&lib, serial, &engine, &applied, rx);
+                        let now = crate::hydra::board();
+                        if now != board {
+                            // the firmware said which Airspy it is
+                            engine.set_eq_prefix(now.cache_prefix());
+                            cfg.fit_board();
+                            applied = cfg.plan();
+                            engine.set_plan(applied.clone());
+                            if let Src::Device(d) = &mut src
+                                && let Err(e) = d.sweep(&applied)
+                            {
+                                src = Src::Offline(e);
+                            }
+                        }
+                        rx = cfg.rx();
+                        dsp = cfg.dsp();
+                        engine.set_settings(dsp);
+                        error = None;
+                        if let Src::Device(_) = src {
+                            engine.set_persist_eq(true);
+                            engine.note_restart();
+                            running = true;
+                        } else {
+                            engine.set_persist_eq(false);
+                        }
+                        println!("switched to {}", dev_info(&src, serial).short);
+                        radios = net::radios();
+                    }
+                    net::Cmd::Retry => {
+                        // the old one closes first (the radio can't be opened twice)
+                        drop(std::mem::replace(&mut src, Src::Offline(String::new())));
+                        src = open_device(&lib, serial, &engine, &applied, rx);
+                        if let Src::Device(_) = src {
+                            engine.set_persist_eq(true);
+                            engine.note_restart();
+                            running = true;
+                            error = None;
+                        }
+                    }
+                    net::Cmd::Sim => {
+                        drop(std::mem::replace(&mut src, Src::Offline(String::new())));
+                        engine.set_persist_eq(false);
+                        src = Src::Sim(Sim::start(engine.sink(), applied.clone(), rx));
+                        engine.note_restart();
+                        running = true;
+                    }
+                },
+            }
+        }
+        let p = cfg.plan();
+        cfg.start_mhz = p.start_hz / 1e6;
+        cfg.stop_mhz = p.stop_hz / 1e6;
+        if p != applied {
+            engine.set_plan(p.clone());
+            error = src.sweep(&p).err();
+            running = true;
+            applied = p;
+        }
+        if cfg.rx() != rx {
+            rx = cfg.rx();
+            engine.note_restart();
+            if let Err(e) = src.set_rx(rx) {
+                error = Some(e);
+            }
+        }
+        if cfg.dsp() != dsp {
+            dsp = cfg.dsp();
+            engine.set_settings(dsp);
+        }
+        {
+            let mut l = engine.live.lock();
+            let rows: Vec<Vec<f32>> = l.rows.drain(..).collect();
+            server.rows(&l, &rows, engine.now());
+        }
+        server.publish(net::status(&Shared::of(&cfg), acked, &applied, rx, running, error.clone(), dev_info(&src, serial), &radios, serial));
+        let c = server.client();
+        if c != client || next_log.elapsed() > Duration::from_secs(60) {
+            client = c;
+            next_log = Instant::now();
+            let s = engine.live.lock().stats.clone();
+            println!(
+                "{:.3}–{:.3} MHz · {} · {:.0} steps/s · {} · {}",
+                applied.start_hz / 1e6,
+                applied.stop_hz / 1e6,
+                if running { "sweeping" } else { "paused" },
+                s.steps_per_s,
+                c.map_or_else(|| "no client".to_string(), |c| format!("client {c}")),
+                error.as_deref().unwrap_or("ok")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(server);
+    drop(src);
+    Ok(())
+}
+
+pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>, csv_every: Option<f32>) -> Result<(), String> {
+    let (cfg, engine, src, plan) = open_windowless(&opts);
     match &src {
         Src::Offline(e) => return Err(e.clone()),
         Src::Device(d) => println!("{} via {}", d.version(), d.lib_path().display()),
         Src::Sim(_) => println!("simulator"),
+        Src::Remote(c) => println!("remote {}", c.addr),
     }
     println!(
         "plan: {:.3}–{:.3} MHz, {}, {} steps × {} MHz, {:?}, dwell {}, lock reads {}, bins {:.2} kHz",
@@ -3267,6 +4038,9 @@ fn open_device(lib: &std::path::Path, serial: u64, engine: &Engine, plan: &Plan,
 #[derive(Clone, Copy)]
 enum Act {
     Retry,
+    /// Disconnect from the server and drive this machine's own radio.
+    Local,
+    Unshare,
     Sim,
     Dismiss,
     LockOn,
@@ -3502,6 +4276,14 @@ fn find_peaks(xs: &[f64], ys: &[f32], n: usize, min_sep_hz: f64) -> Vec<(f64, f3
         }
     }
     out
+}
+
+/// Strongest point of a trace as shown between f_lo and f_hi.
+fn max_in_shown(t: &(Vec<f64>, Vec<f32>), f_lo: f64, f_hi: f64) -> Option<(f64, f32)> {
+    let (xs, ys) = t;
+    let a = xs.partition_point(|&f| f < f_lo);
+    let b = xs.partition_point(|&f| f <= f_hi).max(a);
+    (a..b).map(|i| (xs[i], ys[i])).filter(|(_, v)| v.is_finite()).max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 /// Strongest full-resolution bin between f_lo and f_hi.

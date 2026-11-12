@@ -101,6 +101,10 @@ impl Waterfall {
     }
 
     fn upload(&mut self, ctx: &egui::Context) {
+        // no layout yet (a client before its server's first one): nothing to draw
+        if self.cols == 0 {
+            return;
+        }
         if !self.full_upload && self.tex.as_ref().is_some_and(|t| t.size() == [self.cols, ROWS]) {
             return;
         }

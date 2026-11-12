@@ -96,6 +96,34 @@ Other options: `--board rfone|airspy|mini|hackrf|pluto` (or `CORVUS_BOARD`), `--
 Building needs a Rust toolchain (edition 2024) and, on Linux, the usual Wayland/X11 and Vulkan or
 GL libraries that wgpu uses.
 
+### Remote
+
+One Corvus Sweep owns the radio and shares it; another, on any machine, shows it in the same window with the
+same controls.
+
+- **Share:** `corvus-sweep --serve` runs without a window (pick the board as usual: `--pluto HOST`, `--board`,
+  `--serial`, `--sim`). Or tick **Share this radio** in the radio picker (the device chip), or start with
+  `--share`: the window keeps working as before and a client can drive it too. It listens on every interface,
+  port 30434 (`--serve ADDR:PORT` to choose), with a PIN: `--pin`, else a random six-digit one, printed at
+  start (the window keeps its PIN in its settings and shows it in the status bar while sharing).
+- **Connect:** the radio picker lists servers found on the LAN, the ones used before, and takes an address
+  and PIN; or `corvus-sweep --connect HOST[:PORT] --pin PIN`. The window takes the server's board and sweep
+  settings, and its waterfall history (the last 512 rows); from then on, what either side changes, the other
+  sees. Levels, colours and which traces are drawn stay each window's own. **Disconnect** in the picker (or in
+  the status bar) goes back to this machine's radio.
+- **The server keeps sweeping** with the last settings when the client leaves, and keeps the history for the
+  next one. Pause from a client stays paused until someone presses Run. One client at a time.
+- **What travels:** the traces reduced to the client's view (its columns, at most 30 updates a second), the
+  waterfall rows (0.5 dB steps), the stats a few times a second, and the full-resolution spectrum when the
+  client exports CSV. About 250–330 kB/s for a full-width window with the overview strip and peak trace;
+  ~0.4–1 MB when connecting, for the history. The peak labels and the cursor read the traces as sent, so they're
+  precise to a screen column rather than an FFT bin. The footer shows the rate.
+- **Security:** the PIN never crosses the wire (the client answers a random challenge with HMAC-SHA256 of it),
+  and after 10 wrong PINs in 10 minutes from anywhere, logins wait. Nothing is encrypted, and someone who
+  records a login can try PINs offline: on the open internet, use a VPN such as Tailscale. A firewall on the
+  server has to let TCP 30434 in (and UDP 30434 for discovery), e.g. `ufw allow in on tailscale0 to any port
+  30434 proto tcp`.
+
 ## What's on screen
 
 The UI follows the auggiesoft UI guide's Instrument look (`DESIGN.md` has the details and exceptions).
@@ -298,6 +326,7 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 | `src/usbdev.rs` | the built-in USB driver for every board (libhydrasdr's, libairspy's and libhackrf's requests in Rust, nusb), and board discovery on any platform |
 | `src/hackrf.rs` | the HackRF's stock sweep: setup and re-tagging its blocks as 5 MHz steps (built-in driver or libhackrf) |
 | `src/pluto.rs` | the Pluto over the network: corvus-pluto's protocol (plan, gain, stop), its blocks into the engine |
+| `src/net.rs` | remote operation: the server (`--serve`, Share this radio), the client, the PIN check, LAN discovery |
 | `build/` | `build.sh windows`: the Windows cross-build (MinGW in Docker) |
 | `src/plan.rs` | sample rate, range → step grid, firmware visiting order, VCO divider model, presets |
 | `src/dsp.rs` | raw block → dBFS power on the RF offset grid (rustfft, Hann, Welch) |

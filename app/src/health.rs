@@ -40,7 +40,7 @@ const SEGS: usize = 4;
 const MAX_MIRRORS: usize = 8;
 
 /// A line that mirrors a stronger one about its step's LO.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Mirror {
     pub hz: f64,
     pub of_hz: f64,
@@ -48,7 +48,7 @@ pub struct Mirror {
     pub below_db: f32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Summary {
     /// Steps measured (each one's latest visit).
     pub steps: usize,
