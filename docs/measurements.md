@@ -243,6 +243,9 @@ The same Pluto+ on F5OEO's Tezuka v0.3.24 (kernel 6.12, Maia SDR running alongsi
   RX2 (700–900 MHz peak −37.6 → −72.3 dBFS, 2.4 GHz −36.1 → −79.9), FM leaking across (−42.4 → −47.2).
   Parked at 98 MHz, GAIN 20/60/40 dB: RX1 −44.0/−10.0/−23.3 dBFS, RX2 −45.6/−21.0/−34.7 in fast mode and
   the same in driver mode; back on RX1 with RX2's gain mode restored after every session.
+  **With the antenna moved to RX2** the inputs swap: band medians within 1.5 dB of RX1's with the antenna
+  (air band −63.0 → −62.3 dBFS, VHF −64.7 → −66.0, UHF TV −76.9 → −76.4), 2,758 steps/s; at 98 MHz GAIN
+  40/20/60/40: RX2 −23.3/−42.1/−10.3/−23.4 dBFS (fast), −23.4/−43.3/−10.6/−23.3 (driver).
 
 ## Restarts
 

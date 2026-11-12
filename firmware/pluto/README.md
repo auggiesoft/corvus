@@ -155,10 +155,10 @@ gain mode restored) before they resume: on STOP, CONFIG, an error or a disconnec
 driver's gain controls, never see RX2 selected. (Driving RX2's gain through the driver in 1R1T was the step
 before a board reset in testing; the switch itself, done this way, ran clean.)
 
-Measured on a Pluto+ with an antenna on RX1 and nothing on RX2, 70–3000 MHz: the same noise floor on both
-in every gain-table band (−88 dBFS median at 40 dB), real signals 15–45 dB down on RX2 (strong FM leaks
-across); fast mode at the same speed (~2,720 steps/s); GAIN mid-stream moves RX2 as it moves RX1, in fast
-and driver mode alike.
+Measured on a Pluto+, 70–3000 MHz at 40 dB, with the antenna on RX1 and then moved to RX2: the two inputs
+swap, band for band within about 1.5 dB, with the same noise floor (−88 dBFS median) and the same speed
+(~2,750 steps/s); the unconnected input sees signals 15–45 dB down (strong FM leaks across). GAIN mid-stream
+moves RX2 as it moves RX1, in fast and driver mode alike.
 
 At 61.44 MSPS the noise floor rises towards the band edges (the AD936x's noise-shaped ADC): within 1 dB
 over ±20 MHz, +3.5 dB at ±25 MHz. Hence the 40 MHz default step (50 is offered); Corvus Sweep's learned

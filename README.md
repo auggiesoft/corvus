@@ -100,7 +100,7 @@ and how to recover a board if a flash goes wrong (that means opening the case).
   Fast mode followed the same day (~3,300 steps/s), then tuning past the driver's 46.88 MHz–6 GHz (the
   cover reaches ~18–6178 MHz) and the live view. The same board on F5OEO's Tezuka v0.3.24 firmware: fast mode
   at ~2,700 steps/s, with Tezuka's radio pollers paused while Corvus sweeps. RX2 can be selected (switched,
-  gain-controlled and back to RX1 cleanly); checked so far without an antenna on it.
+  gain-controlled and back to RX1 cleanly), checked with an antenna on each input in turn.
 
 ## Licensing
 
