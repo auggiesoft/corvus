@@ -63,16 +63,36 @@ static uint32_t freq_hz;
 static uint32_t cnt_ref;   /* DMA blocks completed when the last retune locked (or its writes finished) */
 static uint32_t last_cnt;
 static uint16_t lock_info; /* polls used by the last retune, bit 15 = timed out */
+static uint8_t tune_failed; /* the current step is outside the R82x PLL range: nothing is sent for it */
+static volatile uint8_t have_restore; /* restore_hz holds the tuner frequency from before the sweep */
+static uint32_t restore_hz;
+
+/* Put the tuner back where it was before the sweep. Runs in the USB IRQ or with USB0 masked, so it
+ * can't interleave with the main loop's tuner I2C (retune() masks USB0 around each transaction). */
+static void restore_tuner(void)
+{
+	if (have_restore)
+	{
+		have_restore = 0;
+		r820t_set_freq(&airspy_conf->r820t_conf_rw, restore_hz);
+	}
+}
 
 void sweep_start(void) /* USB IRQ */
 {
 	start_req = 1;
 }
 
-void sweep_stop(void) /* USB IRQ or main loop */
+void sweep_halt(void) /* USB IRQ */
 {
 	start_req = 0;
 	active = 0;
+}
+
+void sweep_stop(void) /* USB IRQ */
+{
+	sweep_halt();
+	restore_tuner();
 }
 
 int sweep_is_active(void)
@@ -93,11 +113,10 @@ static uint8_t vco_divider(uint32_t rf)
 
 	for (d = 0; d <= 5; d++)
 	{
-		uint32_t vco = lo << (d + 1);
-		if (vco >= 1770000000u && vco <= 3900000000u)
+		if (lo <= (3900000000u >> (d + 1)) && (lo << (d + 1)) >= 1770000000u)
 			break;
 	}
-	return d;
+	return d; /* 6 = out of range */
 }
 
 /* Split the grid into runs of equal VCO divider (SWEEP_FLAG_VCO_ORDER), else leave n_runs = 0. */
@@ -146,7 +165,7 @@ static uint16_t pos_to_step(uint16_t p)
 }
 
 /* Next step. A pass ends after every step was visited once; in VCO order the next pass runs the
- * other way and starts by re-measuring the end step (no retune needed, so it is cheap). */
+ * other way and starts by re-measuring the end step (sweep_poll skips the retune for it). */
 static void advance(void)
 {
 	if (n_runs == 0)
@@ -176,16 +195,50 @@ static void advance(void)
 	step = pos_to_step(pos);
 }
 
+/* 1 if every step frequency fits in 32 bits (no wrap to a frequency that was never asked for). */
+static int plan_fits(void)
+{
+	uint32_t n = (uint32_t)sweep_params.n_steps - 1u;
+	uint32_t hi = (sweep_params.f_step_hz >> 16) * n; /* n < 2^16, so neither product wraps */
+	uint32_t lo = (sweep_params.f_step_hz & 0xffffu) * n;
+	uint32_t span;
+
+	if (hi >> 16)
+		return 0;
+	span = hi << 16;
+	if (span + lo < span)
+		return 0;
+	span += lo;
+	return sweep_params.f_start_hz + span >= sweep_params.f_start_hz;
+}
+
 static void apply_start(void) /* main loop */
 {
 	nvic_disable_irq(NVIC_USB0_IRQ);
-	if (start_req)
+	if (!start_req)
 	{
-		sweep_params = sweep_params_rx;
-		start_req = 0;
-		active = 1;
+		nvic_enable_irq(NVIC_USB0_IRQ); /* stopped again before we got here */
+		return;
 	}
+	sweep_params = sweep_params_rx;
+	start_req = 0;
+	if (!have_restore)
+	{
+		/* First start since the last stop; a restart keeps the frequency from before the first one. */
+		restore_hz = airspy_conf->r820t_conf_rw.freq;
+		have_restore = 1;
+	}
+	if (!plan_fits())
+	{
+		active = 0;
+		restore_tuner();
+		nvic_enable_irq(NVIC_USB0_IRQ);
+		return;
+	}
+	active = 1;
 	nvic_enable_irq(NVIC_USB0_IRQ);
+	if (sweep_params.lock_timeout > SWEEP_LOCK_TIMEOUT_MAX)
+		sweep_params.lock_timeout = SWEEP_LOCK_TIMEOUT_MAX;
 	plan_order();
 	pos = 0;
 	dir = 1;
@@ -208,10 +261,27 @@ static void retune(void)
 	uint16_t polls = 0;
 	uint8_t run = 0;
 	uint8_t v;
+	int rc;
 
 	nvic_disable_irq(NVIC_USB0_IRQ);
-	r820t_set_freq(&airspy_conf->r820t_conf_rw, freq_hz);
+	if (!active)
+	{
+		/* Stopped (and the tuner restored) since sweep_poll looked: don't move it again. */
+		nvic_enable_irq(NVIC_USB0_IRQ);
+		return;
+	}
+	rc = r820t_set_freq(&airspy_conf->r820t_conf_rw, freq_hz);
 	nvic_enable_irq(NVIC_USB0_IRQ);
+
+	tune_failed = (rc < 0);
+	if (tune_failed)
+	{
+		lock_info = 0;
+		cnt_ref = *dma_block_count;
+		block = 0;
+		retune_pending = 0;
+		return;
+	}
 
 	/*
 	 * Wait for PLL lock (as librtlsdr's r82xx_set_pll checks). Lock time grows with the VCO
@@ -221,6 +291,8 @@ static void retune(void)
 	 */
 	while (run < sweep_params.lock_reads)
 	{
+		if (!active || start_req)
+			break; /* stopped or restarted: don't hold the main loop for the rest of the wait */
 		if (polls >= sweep_params.lock_timeout)
 		{
 			polls |= 0x8000;
@@ -261,7 +333,10 @@ void sweep_poll(void)
 
 	if (*usb_bulk_buffer_length != SWEEP_BLOCK_BYTES)
 	{
+		nvic_disable_irq(NVIC_USB0_IRQ);
 		active = 0; /* packing on: not supported */
+		restore_tuner();
+		nvic_enable_irq(NVIC_USB0_IRQ);
 		return;
 	}
 
@@ -272,6 +347,14 @@ void sweep_poll(void)
 
 	if (retune_pending)
 	{
+		retune();
+		return;
+	}
+
+	if (tune_failed)
+	{
+		/* The tuner can't reach this step, so its data would be mislabelled: send nothing, move on. */
+		advance();
 		retune();
 		return;
 	}
@@ -293,6 +376,13 @@ void sweep_poll(void)
 	if (++block >= sweep_params.dwell_blocks)
 	{
 		advance();
-		retune();
+		if (step_freq(step) == freq_hz)
+		{
+			/* Same frequency (VCO-order turnaround, or a one-step plan): no retune, and the next block
+			 * follows on without a gap, so let it through the post-retune skip below. */
+			block = 0;
+			cnt_ref = cnt - 1u - sweep_params.skip_blocks;
+		} else
+			retune();
 	}
 }

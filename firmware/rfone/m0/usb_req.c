@@ -922,7 +922,7 @@ const usb_transfer_stage_t stage)
 	{
 		if (endpoint->setup.length != sizeof(sweep_params_t))
 			return USB_REQUEST_STATUS_STALL;
-		sweep_stop();
+		sweep_halt(); /* a restart keeps the original pre-sweep frequency for the final stop */
 		usb_transfer_schedule_block(endpoint->out, &sweep_params_rx, sizeof(sweep_params_t));
 		return USB_REQUEST_STATUS_OK;
 	} else if (stage == USB_TRANSFER_STAGE_DATA)

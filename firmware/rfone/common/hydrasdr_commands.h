@@ -73,7 +73,7 @@ typedef enum
 
 /* Sweep mode (custom extension, see m0/sweep.h). Kept clear of the 29..33 range the host
  * library already uses for newer upstream commands. */
-#define HYDRASDR_SWEEP_START (0x70) /* OUT data stage: sweep_params_t (12 bytes) */
+#define HYDRASDR_SWEEP_START (0x70) /* OUT data stage: sweep_params_t (16 bytes) */
 #define HYDRASDR_SWEEP_STOP  (0x71)
 
 typedef enum

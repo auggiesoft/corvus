@@ -230,9 +230,15 @@ extern ADDAPI int ADDCALL airspy_spiflash_erase_sector(struct airspy_device* dev
  * setting: airspy_set_samplerate(0) or 10000000; ADC 20 MHz real, IF 5 MHz),
  * packing off, gains as wanted, airspy_start_rx(), then airspy_sweep_start().
  * Parse every AIRSPY_SWEEP_BLOCK_SAMPLES-sample block in the callback with
- * airspy_sweep_parse_block() and drop anything not AIRSPY_SWEEP_BLOCK_VALID.
+ * airspy_sweep_parse_block() and drop anything not AIRSPY_SWEEP_BLOCK_VALID,
+ * and VALID blocks with lock_timed_out set (the tuner may not be on freq_hz).
  * While sweeping the firmware STALLs tuner, gain and sample-rate requests;
  * airspy_sweep_stop() (or airspy_stop_rx()) ends the sweep.
+ *
+ * Steps the R820T PLL can't reach (LO = RF + IF outside ~27.7-1950 MHz, IF
+ * 1.25-6 MHz depending on board and rate): sweep6+ sends no blocks for them;
+ * older sweep firmware sent blocks tagged with the requested frequency but
+ * captured elsewhere. airspy_sweep_start() refuses plans no rate can reach.
  *
  * The RAW spectrum is real-valued with the IF at a quarter of the ADC rate
  * and inverted: RF = freq_hz - (f - IF).
@@ -255,7 +261,7 @@ typedef struct {
 	uint8_t  dwell_blocks; /* blocks sent per step (>= 1) */
 	uint8_t  lock_reads;   /* consecutive PLL-locked reads required (2; 0 = no lock check) */
 	uint8_t  flags;        /* AIRSPY_SWEEP_FLAG_* (0 = plain ascending order) */
-	uint16_t lock_timeout; /* maximum lock polls, ~0.1 ms each (200) */
+	uint16_t lock_timeout; /* maximum lock polls, ~0.1 ms each (200); 1..0x7FFF when lock_reads > 0 */
 } airspy_sweep_params_t;
 
 enum airspy_sweep_block_status {
@@ -284,7 +290,8 @@ extern ADDAPI int ADDCALL airspy_sweep_fw_revision(struct airspy_device* device)
  * RAW/unpacked, AIRSPY_ERROR_STREAMING_STOPPED when not streaming, AIRSPY_ERROR_UNSUPPORTED without sweep
  * firmware or when flags need a newer one */
 extern ADDAPI int ADDCALL airspy_sweep_start(struct airspy_device* device, const airspy_sweep_params_t* params);
-/* Stop the sweep; streaming continues in normal mode */
+/* Stop the sweep; streaming continues in normal mode. On sweep6+ the tuner goes back to the frequency it had
+ * before the sweep; older sweep firmware leaves it on the last step, so call airspy_set_freq() after stopping. */
 extern ADDAPI int ADDCALL airspy_sweep_stop(struct airspy_device* device);
 /* Validate an AIRSPY_SWEEP_BLOCK_SAMPLES-sample RAW block and read its tags (info may be NULL) */
 extern ADDAPI int ADDCALL airspy_sweep_parse_block(const uint16_t* block, airspy_sweep_block_info_t* info);

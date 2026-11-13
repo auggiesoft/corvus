@@ -88,7 +88,7 @@ dev = V()
 assert lib.airspy_open_sn(C.byref(dev), SERIAL) == 0, "open failed"
 try:
     check("sweep_supported", lib.airspy_sweep_supported(dev), TRUE)
-    check("sweep_fw_revision", lib.airspy_sweep_fw_revision(dev), 5)
+    check("sweep_fw_revision (5 or later)", lib.airspy_sweep_fw_revision(dev), lambda r: r >= 5)
     full = Params(28_000_000, 8_000_000, 222, 0, 1, 2, 1, 200)
     narrow = Params(400_000_000, 8_000_000, 10, 0, 2, 2, 0, 200)
     lib.airspy_set_sample_type(dev, RAW)

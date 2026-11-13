@@ -14,6 +14,11 @@
  *   trailer (last 16 bytes):  u16 0x5AA5, u16 lock, u16 step, u16 block, u32 dma_block_count, u32 freq_hz
  *     lock = PLL lock-bit polls this step needed (bit 15 set: timed out without lock)
  *
+ * sweep6: a step the R82x PLL can't reach (RF below ~22.7 MHz or above ~1945 MHz) is never tagged: the
+ * sweep moves on without sending blocks for it. A plan whose step frequencies overflow 32 bits doesn't
+ * start. lock_timeout is clamped to SWEEP_LOCK_TIMEOUT_MAX. SWEEP_STOP (and SET_PACKING or a receiver
+ * mode change ending a sweep) puts the tuner back on the frequency it had before the sweep started.
+ *
  * A block whose header and trailer disagree (or lack the magic) was overwritten by the
  * ADC DMA before USB finished reading it, and must be discarded by the host.
  * Unpacked 16-bit mode only (packing off).
@@ -33,7 +38,7 @@ typedef struct
 	uint8_t dwell_blocks;  /* blocks sent per step (>= 1) */
 	uint8_t lock_reads;    /* consecutive R82x PLL-locked reads (reg 2 bit 6) required before capture; 0 = don't poll */
 	uint8_t flags;         /* SWEEP_FLAG_* (sweep4+; ignored by sweep2/3) */
-	uint16_t lock_timeout; /* max lock polls (~0.1 ms each) before capturing anyway */
+	uint16_t lock_timeout; /* max lock polls (~0.1 ms each) before capturing anyway; clamped to SWEEP_LOCK_TIMEOUT_MAX */
 } sweep_params_t;          /* 16 bytes, sent as the OUT data stage of HYDRASDR_SWEEP_START */
 
 /*
@@ -43,10 +48,13 @@ typedef struct
  */
 #define SWEEP_FLAG_VCO_ORDER (0x01)
 
+#define SWEEP_LOCK_TIMEOUT_MAX (0x7FFF) /* bit 15 of the trailer's lock field is the timed-out flag */
+
 extern sweep_params_t sweep_params_rx; /* OUT data stage target; applied by the main loop */
 
 void sweep_start(void);
-void sweep_stop(void);
+void sweep_stop(void);     /* end the sweep and restore the pre-sweep tuner frequency (USB IRQ) */
+void sweep_halt(void);     /* end the sweep without restoring (a new SWEEP_START is arriving) */
 int sweep_is_active(void);
 void sweep_poll(void);     /* call from the M0 main loop on every wake-up */
 

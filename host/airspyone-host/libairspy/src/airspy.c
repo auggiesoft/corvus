@@ -2029,7 +2029,16 @@ int airspy_list_devices(uint64_t *serials, int count)
 			return AIRSPY_ERROR_INVALID_PARAM;
 		}
 		last_hz = (uint64_t)params->f_start_hz + (uint64_t)(params->n_steps - 1) * params->f_step_hz;
-		if (last_hz > 0xFFFFFFFFull)
+		/* The R820T PLL reaches LO 27.66-1950 MHz, LO = RF + IF, and the IF is 1.25-6 MHz depending on board
+		 * and rate. Refuse plans no rate can reach; sweep6 firmware skips the remaining unreachable steps,
+		 * older sweep firmware tagged them with a frequency the tuner wasn't on. */
+		if (params->f_start_hz < 21656250u || last_hz > 1948750000ull)
+		{
+			return AIRSPY_ERROR_INVALID_PARAM;
+		}
+		/* Bit 15 of the trailer's lock field is the timed-out flag; a 0 timeout with lock reads would mark
+		 * every block timed out. */
+		if (params->lock_timeout > 0x7FFF || (params->lock_reads > 0 && params->lock_timeout == 0))
 		{
 			return AIRSPY_ERROR_INVALID_PARAM;
 		}

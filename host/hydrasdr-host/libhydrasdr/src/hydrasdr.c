@@ -33,6 +33,9 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 
 static void sweep_clear_stale(struct hydrasdr_device* dev);
 
+#define SWEEP_RF_MIN_HZ (22656250ull)   /* LO 27.66 MHz - 5 MHz IF */
+#define SWEEP_RF_MAX_HZ (1944000000ull) /* LO 1950 MHz - 6 MHz IF */
+
 /*
  * ============================================================================
  * DEVICE REGISTRY - Add new HydraSDR variants here
@@ -954,7 +957,15 @@ ADDAPI int ADDCALL hydrasdr_sweep_start(struct hydrasdr_device* device, const hy
 		return HYDRASDR_ERROR_INVALID_PARAM;
 	}
 	last_hz = (uint64_t)params->f_start_hz + (uint64_t)(params->n_steps - 1) * params->f_step_hz;
-	if (last_hz > 0xFFFFFFFFull) {
+	/* The R82x PLL (VCO 1.77-3.9 GHz, divider 2..64) reaches LO 27.66-1950 MHz; LO = RF + IF, with
+	 * IF 5 MHz (10 MSPS) or 6 MHz (12 MSPS). Outside that, firmware before sweep6 tagged blocks
+	 * with a frequency the tuner wasn't on. */
+	if (params->f_start_hz < SWEEP_RF_MIN_HZ || last_hz > SWEEP_RF_MAX_HZ) {
+		return HYDRASDR_ERROR_INVALID_PARAM;
+	}
+	/* Bit 15 of the trailer's lock field is the timed-out flag; a 0 timeout with lock reads
+	 * would mark every block timed out. */
+	if (params->lock_timeout > 0x7FFF || (params->lock_reads > 0 && params->lock_timeout == 0)) {
 		return HYDRASDR_ERROR_INVALID_PARAM;
 	}
 	/* Tags only survive the RAW pass-through, and the firmware only sweeps unpacked 16 KB blocks. */

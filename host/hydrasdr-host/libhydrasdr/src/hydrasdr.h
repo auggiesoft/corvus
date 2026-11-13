@@ -2460,9 +2460,18 @@ extern ADDAPI int ADDCALL hydrasdr_reset(struct hydrasdr_device* device);
  * stays the RF centre at either rate. Parse every
  * HYDRASDR_SWEEP_BLOCK_SAMPLES-sample block in the callback with
  * hydrasdr_sweep_parse_block() and drop anything not
- * HYDRASDR_SWEEP_BLOCK_VALID. While sweeping the firmware STALLs tuner,
- * gain, sample-rate, packing and RF-port requests; hydrasdr_sweep_stop()
- * (or hydrasdr_stop_rx()) ends the sweep.
+ * HYDRASDR_SWEEP_BLOCK_VALID, and VALID blocks with lock_timed_out set (the
+ * tuner may not have reached freq_hz). While sweeping the firmware STALLs
+ * tuner, gain, sample-rate and RF-port requests. hydrasdr_sweep_stop() (or
+ * hydrasdr_stop_rx()) ends the sweep; a packing change also ends it on sweep5+
+ * (sweep2-4 STALL it), but hydrasdr_set_packing() refuses while streaming anyway.
+ * An UNTAGGED block in the middle of a sweep means its header was overwritten
+ * (an overrun), not normal-mode data.
+ *
+ * Steps the R82x PLL can't reach (RF below ~22.7 MHz or above ~1944 MHz):
+ * sweep6+ sends no blocks for them; older sweep firmware sent blocks tagged
+ * with the requested frequency but captured elsewhere. hydrasdr_sweep_start()
+ * refuses plans that start or end outside that range.
  *
  * The RAW spectrum is real-valued with the IF at a quarter of the ADC rate
  * and inverted: RF = freq_hz - (f_if - IF), where IF is HYDRASDR_SWEEP_IF_HZ
@@ -2482,10 +2491,10 @@ extern ADDAPI int ADDCALL hydrasdr_reset(struct hydrasdr_device* device);
 /**
  * Visit the steps in VCO-continuous order (firmware sweep4+): steps are grouped by R82x VCO divider,
  * alternate groups are swept downwards and every pass reverses the whole order. Divider switches
- * then cost ~0.5 ms instead of ~10 ms and there is no wrap (~16 % faster over 24-1800 MHz).
+ * then cost ~0.5 ms instead of ~10 ms and there is no wrap (~17-19 % faster over 24-1800 MHz).
  * Blocks still carry the grid step index and frequency, but steps no longer arrive in ascending
  * order; a pass is complete when the sweep counter changes. Each pass starts by re-measuring the
- * step the previous pass ended on.
+ * step the previous pass ended on (without a retune on sweep6+).
  */
 #define HYDRASDR_SWEEP_FLAG_VCO_ORDER (0x01)
 
@@ -2498,7 +2507,7 @@ typedef struct {
 	uint8_t  dwell_blocks; /**< blocks sent per step (>= 1) */
 	uint8_t  lock_reads;   /**< consecutive PLL-locked reads required (2; 0 = no lock check) */
 	uint8_t  flags;        /**< HYDRASDR_SWEEP_FLAG_* (0 = plain ascending order) */
-	uint16_t lock_timeout; /**< maximum lock polls, ~0.1 ms each (200) */
+	uint16_t lock_timeout; /**< maximum lock polls, ~0.1 ms each (200); 1..0x7FFF when lock_reads > 0 */
 } hydrasdr_sweep_params_t;
 
 /** Result of hydrasdr_sweep_parse_block(). */
@@ -2543,6 +2552,9 @@ extern ADDAPI int ADDCALL hydrasdr_sweep_start(struct hydrasdr_device* device, c
 
 /**
  * @brief Stop the firmware sweep; streaming continues in normal mode
+ *
+ * On sweep6+ the tuner goes back to the frequency it had before the sweep started. Older sweep
+ * firmware leaves it on the last sweep step, so call hydrasdr_set_freq() after stopping.
  */
 extern ADDAPI int ADDCALL hydrasdr_sweep_stop(struct hydrasdr_device* device);
 

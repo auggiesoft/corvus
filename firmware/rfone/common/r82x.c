@@ -523,8 +523,12 @@ int r82x_set_pll(r82x_priv_t *priv, uint32_t freq)
 	div_found = 0;
 	for (div_num = 0; div_num <= 5; div_num++)
 	{
+		/* Compare before shifting: freq << (div_num + 1) wraps in 32 bits above ~1.95 GHz and could
+		 * land in range, tuning a wrong frequency (Corvus sweep6) */
+		if (freq > (vco_max >> (div_num + 1)))
+			continue;
 		vco = freq << (div_num + 1);
-		if (vco >= vco_min && vco <= vco_max)
+		if (vco >= vco_min)
 		{
 			div_found = 1;
 			break;
