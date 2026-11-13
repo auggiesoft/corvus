@@ -15,6 +15,7 @@ mod plan;
 mod pluto;
 mod sim;
 mod pcsweep;
+mod rtl;
 mod soapy;
 mod theme;
 mod usbdev;
@@ -120,6 +121,9 @@ corvus-sweep [options]
                         with --connect: the server's PIN
   --share               open the window and share its radio too (the picker's Share this radio)
   --connect HOST[:PORT] drive the radio of a corvus-sweep serving on HOST (needs --pin)
+  --get-rtl             download RTL-SDR support (corvus-rtl's librtlsdr; on Windows also install
+                        the WinUSB driver, after a Windows admin prompt), then exit. The window
+                        offers the same when an RTL-SDR dongle is chosen
   --screenshot PATH     save a PNG of the window after --after seconds, then exit
   --after SECS          (default 4)
 ";
@@ -274,6 +278,17 @@ fn main() -> eframe::Result {
             "--pin" => pin = Some(val("--pin")).filter(|p| !p.is_empty()).or_else(|| die("--pin PIN")),
             "--connect" => connect = Some(val("--connect")),
             "--share" => share = true,
+            "--get-rtl" => {
+                let r = rtl::get_now();
+                match r {
+                    Ok(m) => println!("{m}"),
+                    Err(e) => {
+                        eprintln!("corvus-sweep: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             "--screenshot" => shot = Some(PathBuf::from(val("--screenshot"))),
             "--after" => after = val("--after").parse().unwrap_or_else(|_| die("bad --after")),
             "-h" | "--help" => {

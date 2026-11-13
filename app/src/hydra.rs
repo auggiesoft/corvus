@@ -31,6 +31,8 @@ pub enum Board {
     Pluto,
     /// Any IQ radio a SoapySDR module opens (RTL-SDR, LimeSDR, USRP…), swept from the PC (`soapy`).
     Soapy,
+    /// An RTL2832U dongle through corvus-rtl's librtlsdr (downloaded on first use), swept from the PC (`rtl`).
+    Rtl,
 }
 
 impl Board {
@@ -42,6 +44,7 @@ impl Board {
             "hackrf" => Some(Board::HackRF),
             "pluto" | "plutoplus" | "pluto+" => Some(Board::Pluto),
             "soapy" | "soapysdr" => Some(Board::Soapy),
+            "rtl" | "rtlsdr" | "rtl-sdr" => Some(Board::Rtl),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ impl Board {
             Board::HackRF => "HackRF One",
             Board::Pluto => "Pluto",
             Board::Soapy => crate::soapy::name(),
+            Board::Rtl => crate::rtl::name(),
         }
     }
 
@@ -68,7 +72,7 @@ impl Board {
             Board::RFOne => "hydrasdr_",
             Board::Airspy | Board::Mini => "airspy_",
             Board::HackRF => "hackrf_",
-            Board::Pluto | Board::Soapy => "",
+            Board::Pluto | Board::Soapy | Board::Rtl => "",
         }
     }
 
@@ -101,6 +105,7 @@ impl Board {
             Board::HackRF => &[Rate::H20],
             Board::Pluto => &[Rate::P61, Rate::P31, Rate::P15, Rate::P7, Rate::P3],
             Board::Soapy => crate::soapy::rates(),
+            Board::Rtl => crate::rtl::RATES,
         }
     }
 
@@ -113,7 +118,7 @@ impl Board {
             Board::RFOne => "libhydrasdr.so.1.1.4",
             Board::Airspy | Board::Mini => "libairspy.so.1.0.10",
             Board::HackRF => "libhackrf.so.0",
-            Board::Pluto | Board::Soapy => "",
+            Board::Pluto | Board::Soapy | Board::Rtl => "",
         }
     }
 
@@ -123,7 +128,7 @@ impl Board {
             Board::RFOne => os.to_string(),
             Board::Airspy | Board::Mini => format!("airspy-{os}"),
             Board::HackRF => format!("hackrf-{os}"), // not built here: the system libhackrf is used
-            Board::Pluto | Board::Soapy => "none".into(),
+            Board::Pluto | Board::Soapy | Board::Rtl => "none".into(),
         };
         format!("../host/build/out/{dir}/{}", self.lib_file())
     }
@@ -134,7 +139,7 @@ impl Board {
             Board::RFOne => "libhydrasdr.so.1",
             Board::Airspy | Board::Mini => "libairspy.so.0",
             Board::HackRF => "libhackrf.so.0",
-            Board::Pluto | Board::Soapy => "",
+            Board::Pluto | Board::Soapy | Board::Rtl => "",
         }
     }
 
@@ -147,6 +152,7 @@ impl Board {
             Board::HackRF => "hackrf-",
             Board::Pluto => "pluto-",
             Board::Soapy => crate::soapy::prefix(),
+            Board::Rtl => "rtl-",
         }
     }
 }
@@ -551,6 +557,7 @@ pub enum Device {
     HackRF(crate::hackrf::HackrfDevice),
     Pluto(crate::pluto::PlutoDevice),
     Soapy(crate::soapy::SoapyDevice),
+    Rtl(crate::rtl::RtlDevice),
 }
 
 impl Device {
@@ -559,6 +566,7 @@ impl Device {
             Board::HackRF => crate::hackrf::HackrfDevice::open(lib_path, serial, sink, rx).map(Device::HackRF),
             Board::Pluto => crate::pluto::PlutoDevice::open(sink, rx).map(Device::Pluto),
             Board::Soapy => crate::soapy::SoapyDevice::open(serial, sink, rx).map(Device::Soapy),
+            Board::Rtl => crate::rtl::RtlDevice::open(serial, sink, rx).map(Device::Rtl),
             _ => R82xDevice::open(lib_path, serial, sink, rx, rate).map(Device::R82x),
         }
     }
@@ -569,13 +577,23 @@ impl Device {
             Device::HackRF(d) => &d.version,
             Device::Pluto(d) => &d.version,
             Device::Soapy(d) => &d.version,
+            Device::Rtl(d) => &d.version,
         }
     }
 
     pub fn fw_revision(&self) -> i32 {
         match self {
             Device::R82x(d) => d.fw_revision,
-            Device::HackRF(_) | Device::Pluto(_) | Device::Soapy(_) => 0,
+            Device::HackRF(_) | Device::Pluto(_) | Device::Soapy(_) | Device::Rtl(_) => 0,
+        }
+    }
+
+    /// The key of the radio actually opened, where it can differ from the one asked for (an RTL-SDR dongle
+    /// opened as "the first one", or one of several sharing a serial).
+    pub fn opened_serial(&self) -> Option<u64> {
+        match self {
+            Device::Rtl(d) => Some(d.key),
+            _ => None,
         }
     }
 
@@ -585,6 +603,7 @@ impl Device {
             Device::HackRF(d) => &d.lib_path,
             Device::Pluto(d) => &d.lib_path,
             Device::Soapy(d) => &d.lib_path,
+            Device::Rtl(d) => &d.lib_path,
         }
     }
 
@@ -599,6 +618,7 @@ impl Device {
             Device::HackRF(d) => d.sweep(plan),
             Device::Pluto(d) => d.sweep(plan),
             Device::Soapy(d) => d.sweep(plan),
+            Device::Rtl(d) => d.sweep(plan),
         }
     }
 
@@ -608,6 +628,7 @@ impl Device {
             Device::HackRF(d) => d.set_rx(rx),
             Device::Pluto(d) => d.set_rx(rx),
             Device::Soapy(d) => d.set_rx(rx),
+            Device::Rtl(d) => d.set_rx(rx),
         }
     }
 
@@ -617,6 +638,7 @@ impl Device {
             Device::HackRF(d) => d.pause(),
             Device::Pluto(d) => d.pause(),
             Device::Soapy(d) => d.pause(),
+            Device::Rtl(d) => d.pause(),
         }
     }
 
@@ -626,6 +648,7 @@ impl Device {
             Device::HackRF(d) => d.resume(),
             Device::Pluto(d) => d.resume(),
             Device::Soapy(d) => d.resume(),
+            Device::Rtl(d) => d.resume(),
         }
     }
 }

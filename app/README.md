@@ -100,6 +100,44 @@ Other options: `--board rfone|airspy|mini|hackrf|pluto` (or `CORVUS_BOARD`), `--
 Building needs a Rust toolchain (edition 2024) and, on Linux, the usual Wayland/X11 and Vulkan or
 GL libraries that wgpu uses.
 
+### RTL-SDR dongles
+
+RTL2832U dongles (RTL-SDR Blog V3/V4, NooElec NESDR, FlightAware Pro Stick, and the other 40-odd that
+librtlsdr knows) show in the radio picker when plugged in. What they need comes from a separate project,
+[corvus-rtl](https://github.com/auggiesoft/corvus-rtl), and Corvus Sweep downloads it the first time a dongle is
+chosen, so the program itself stays one file:
+
+- **librtlsdr** (the RTL-SDR Blog's fork, with libusb built in on Windows), under 0.3 MB. The window offers
+  *Download RTL-SDR support*; `--get-rtl` does it without a window. It's kept in the user's app data folder
+  (`%LOCALAPPDATA%\corvus-sweep\rtl\` or `~/.local/share/corvus-sweep/rtl/`) and used only if its SHA-256
+  matches the one built into this Corvus Sweep. On Linux a system librtlsdr (the `rtl-sdr` package) is used
+  when there's no download; `CORVUS_RTL_LIB` names one outright.
+- **Windows only, the USB driver.** Windows has no driver that lets a program read these dongles. *Install the
+  USB driver* downloads corvus-rtl's installer (also pinned) and runs it after a Windows admin prompt: it gives
+  the dongles Windows' own WinUSB driver, as Zadig does, signing the driver package with a certificate it makes
+  for the purpose and then deletes the key of (corvus-rtl's README has the details and how to undo it).
+  `--get-rtl` runs it too.
+- **Linux:** permission to open the dongle needs a udev rule (the `rtl-sdr` package's, or corvus-rtl's
+  `rtl-sdr/rtl-sdr.rules`); the DVB-T kernel driver is detached when the dongle opens.
+
+The sweep is the PC's (`src/rtl.rs`): per step it retunes, empties the dongle's buffer, drops 2 ms (at least
+4096 samples) while the tuner settles, and reads the step's blocks synchronously, so nothing from before the
+retune gets through. Each read asks for exactly what the step still needs. Rates 2.4, 2.048 and 1.024 MSPS (a
+step is three quarters of the rate, so 1.8 MHz at 2.4, 0.9 MHz with two looks); the tuning range follows the
+tuner (R820T/R828D 24–1766 MHz, E4000 52–2200, …), and steps outside it are skipped; gain is the tuner's own
+steps, 0–21 spread over them; the bias tee stays off. The 8-bit samples are scaled so both rails read full
+scale, so the status bar reports clipping as it does for the boards.
+
+Measured on two generic R820T dongles (RTL2838UHIDIR) under Linux: about 270 steps a second at 2.4 MSPS with
+no extra settling blocks (0.24 GHz/s with two looks; 24–1766 MHz in about 7 s), fewer with the profiles that
+drop settling blocks (*Quality*: ~100). On the FM band the stations land on their channels, matching the
+RFOne's sweep of the same band. The Windows side (the DLL and the driver installer) builds but hasn't been
+run on a Windows machine yet: if it misbehaves there, please open an issue.
+
+Dongles that share a serial (many leave the factory as `00000001`) are listed as #1, #2… and each opens its
+own dongle, though which physical one is #1 can change when they're replugged. To tell them apart for good,
+give each its own serial with librtlsdr's `rtl_eeprom -s` (that writes the dongle's EEPROM).
+
 ### SoapySDR radios
 
 Any IQ radio a SoapySDR module can open (RTL-SDR, LimeSDR, SDRplay, BladeRF, USRPs such as the B210 through
@@ -408,6 +446,7 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 | `src/usbdev.rs` | the built-in USB driver for every board (libhydrasdr's, libairspy's and libhackrf's requests in Rust, nusb), and board discovery on any platform |
 | `src/hackrf.rs` | the HackRF's stock sweep: setup and re-tagging its blocks as 5 MHz steps (built-in driver or libhackrf) |
 | `src/pluto.rs` | the Pluto over the network: corvus-pluto's protocol (plan, gain, stop), its blocks into the engine |
+| `src/rtl.rs` | RTL2832U dongles: corvus-rtl downloaded and checked, the Windows driver install, the PC-driven sweep |
 | `src/pcsweep.rs` | what the PC-driven IQ sweeps share: the visiting order and tagged blocks |
 | `src/soapy.rs` | SoapySDR radios: libSoapySDR loaded at run time, the background search, the PC-driven sweep |
 | `src/net.rs` | remote operation: the server (`--serve`, Share this radio), the client, the PIN check, LAN discovery |

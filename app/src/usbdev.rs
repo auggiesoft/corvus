@@ -624,11 +624,24 @@ pub fn list() -> Vec<crate::hydra::Found> {
                 (HACKRF_VID, pid) if HACKRF_PIDS.contains(&pid) => Some(Found { board: Board::HackRF, serial, label: "HackRF One".into() }),
                 // a Pluto on USB (its network link); Corvus reaches it over the network, not this device
                 (PLUTO_VID, PLUTO_PID) => Some(Found { board: Board::Pluto, serial, label: "Pluto".into() }),
-                _ => None,
+                // an RTL2832U dongle: listed even before its library is downloaded (opening it offers that)
+                (vid, pid) => crate::rtl::id_name(vid, pid).map(|n| Found { board: Board::Rtl, serial, label: format!("RTL-SDR ({n})") }),
             }
         })
         .collect();
     out.sort_by_key(|f| (f.board as u8, f.serial));
+    // RTL-SDR dongles sharing a serial: number them, each with its own key (rtl::dup_key)
+    let mut i = 0;
+    while i < out.len() {
+        let same = out[i..].iter().take_while(|f| f.board == Board::Rtl && f.board == out[i].board && f.serial == out[i].serial).count();
+        if same > 1 {
+            for (k, f) in out[i..i + same].iter_mut().enumerate() {
+                f.serial = crate::rtl::dup_key(f.serial, k);
+                f.label = format!("{} #{}", f.label, k + 1);
+            }
+        }
+        i += same.max(1);
+    }
     out
 }
 

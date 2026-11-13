@@ -588,6 +588,17 @@ fn dev_info(src: &Src, serial: u64) -> DevInfo {
             } else {
                 format!("{} · {} · {} · rev {}", d.version(), if serial == 0 { format!("first {board}") } else { format!("{serial:016X}") }, d.lib_path().display(), d.fw_revision())
             };
+            if let crate::hydra::Device::Rtl(r) = d {
+                return DevInfo {
+                    kind: SrcKind::Device,
+                    dot: Dot::Ok,
+                    short: format!("{} · PC sweep", r.label),
+                    details: format!("{}\nLibrary {}\nSwept from the PC: each step retunes the dongle, empties its buffer and waits for the tuner to settle.", d.version(), d.lib_path().display()),
+                    // the version and the library's full path run into the load meter: the details have them
+                    footer: format!("{} · serial {} · {}", r.label, r.sn, d.lib_path().file_name().map_or_else(|| d.lib_path().display().to_string(), |f| f.to_string_lossy().into_owned())),
+                    ..Default::default()
+                };
+            }
             if let crate::hydra::Device::Soapy(s) = d {
                 return DevInfo {
                     kind: SrcKind::Device,
@@ -1122,7 +1133,8 @@ impl App {
                 // and what SoapySDR's modules find (looked for in the background; they appear when it's done)
                 let mut found = found;
                 found.extend(soapy_found());
-                ("Radios".to_string(), found, matches!(self.src, Src::Device(_)), self.serial, matches!(self.src, Src::Sim(_)))
+                let cur = if let Src::Device(d) = &self.src { d.opened_serial().unwrap_or(self.serial) } else { self.serial };
+                ("Radios".to_string(), found, matches!(self.src, Src::Device(_)), cur, matches!(self.src, Src::Sim(_)))
             }
         };
         let mut pick: Option<Option<(crate::hydra::Board, u64)>> = None;
@@ -1142,6 +1154,7 @@ impl App {
                     let label = if f.board == crate::hydra::Board::Airspy && current { cur_board.name().to_string() } else { f.label.clone() };
                     let id = match f.board.networked() {
                         _ if f.board == crate::hydra::Board::Soapy => "SoapySDR".to_string(),
+                        _ if f.board == crate::hydra::Board::Rtl => format!("SN {:08X}", f.serial & 0x00FF_FFFF_FFFF_FFFF),
                         true if server.is_some() => "network".to_string(),
                         true => crate::pluto::addr(),
                         false => format!("{:016X}", f.serial),
@@ -1677,11 +1690,24 @@ impl App {
             Some(net::Phase::Connecting) => out.push(Cond { level: Level::Info, text: format!("Connecting to {}…", self.remote_addr()), acts: vec![(Act::Local, "Disconnect")] }),
             Some(net::Phase::Down(e)) => out.push(Cond { level: Level::Alarm, text: format!("Can't reach {}: {e}. Trying again every 2 s.", self.remote_addr()), acts: vec![(Act::Retry, "Try now"), (Act::Local, "Disconnect")] }),
             Some(net::Phase::Denied(e)) => out.push(Cond { level: Level::Alarm, text: format!("{} said no: {e}.", self.remote_addr()), acts: vec![(Act::Retry, "Try again"), (Act::Local, "Disconnect")] }),
+            _ if dev.kind == SrcKind::Offline && dev.err == crate::rtl::NEEDS_LIB => out.push(Cond {
+                level: Level::Caution,
+                text: "This RTL-SDR needs corvus-rtl's librtlsdr, a one-time download of about 0.3 MB from GitHub (checked against a hash built into Corvus Sweep).".into(),
+                acts: vec![(Act::RtlGet, "Download RTL-SDR support"), (Act::Sim, "Run the simulator")],
+            }),
+            _ if dev.kind == SrcKind::Offline && dev.err == crate::rtl::NEEDS_DRIVER => out.push(Cond {
+                level: Level::Caution,
+                text: "Windows has no driver that lets programs read this RTL-SDR. Corvus can install Windows' own WinUSB driver for it (a small download from corvus-rtl, then a Windows admin prompt), as Zadig would.".into(),
+                acts: vec![(Act::RtlDriver, "Install the USB driver"), (Act::Retry, "Try again")],
+            }),
             _ if dev.kind == SrcKind::Offline => {
                 let e = if dev.err.is_empty() { "not connected".to_string() } else { dev.err.clone() };
                 out.push(Cond { level: Level::Alarm, text: format!("The {} isn't open: {e}.", crate::hydra::board().name()), acts: vec![(Act::Retry, "Try again"), (Act::Sim, "Run the simulator")] });
             }
             _ => {}
+        }
+        if let crate::rtl::Job::Running(what) = crate::rtl::job() {
+            out.push(Cond { level: Level::Info, text: format!("{what}…"), acts: vec![] });
         }
         if let Some(sv) = &self.server {
             let at = net::local_ip().map_or_else(|| format!("port {}", sv.addr.port()), |ip| format!("{ip}:{}", sv.addr.port()));
@@ -1824,6 +1850,8 @@ impl App {
             Some(Act::Sim) => self.use_sim(),
             Some(Act::Local) => self.switch_device(Some((self.start_lib.0, self.serial))),
             Some(Act::Unshare) => self.set_share(false),
+            Some(Act::RtlGet) => crate::rtl::start_download(),
+            Some(Act::RtlDriver) => crate::rtl::start_driver_install(),
             Some(Act::Dismiss) => self.error = None,
             Some(Act::FwHide) => self.fw_hidden = self.dev().details,
             Some(Act::LockOn) => self.cfg.lock_reads = 2,
@@ -2089,7 +2117,9 @@ impl App {
                 }
                 theme::more(ui, "engine-more", "Rate, order, dwell and lock check", |ui| {
                     let mut rate = self.cfg.rate;
-                    let rate_hint = if crate::hydra::board() == crate::hydra::Board::Soapy {
+                    let rate_hint = if crate::hydra::board() == crate::hydra::Board::Rtl {
+                        "2.4 MSPS: the fastest an RTL2832U delivers without dropping samples; steps of 1.8 MHz. 2.048 and 1.024 MSPS: finer bins."
+                    } else if crate::hydra::board() == crate::hydra::Board::Soapy {
                         "The radio's own sample rates (the fastest few). A step uses three quarters of the rate, the flat middle of most radios' filters; two looks then hide the DC spike and images."
                     } else if crate::hydra::board() == crate::hydra::Board::Pluto {
                         "61.44 MSPS: steps up to 50 MHz (the noise floor stays within 1 dB over 40), the fastest sweep.\n30.72 MSPS: steps up to 25 MHz, bins half as wide.\n15.36, 7.68, 3.84 MSPS: narrower steps, bins down to 0.94 kHz; mostly for the live view."
@@ -2200,6 +2230,9 @@ impl App {
                 }
                 if crate::hydra::board() == crate::hydra::Board::Soapy {
                     theme::caption(ui, format!("{:.1} dB of gain on the radio (SoapySDR's overall gain; every mode sets it).", crate::soapy::gain_db(self.cfg.gain)));
+                }
+                if crate::hydra::board() == crate::hydra::Board::Rtl {
+                    theme::caption(ui, format!("{:.1} dB of tuner gain (the dongle's own steps; every mode sets it).", crate::rtl::gain_db(self.cfg.gain)));
                 }
             });
             ui.add_space(gap);
@@ -3462,6 +3495,13 @@ impl App {
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                let busy = matches!(crate::rtl::job(), crate::rtl::Job::Running(_));
+                if err == crate::rtl::NEEDS_LIB && ui.add_enabled(!busy, egui::Button::new("Download RTL-SDR support")).clicked() {
+                    crate::rtl::start_download();
+                }
+                if err == crate::rtl::NEEDS_DRIVER && ui.add_enabled(!busy, egui::Button::new("Install the USB driver")).clicked() {
+                    crate::rtl::start_driver_install();
+                }
                 if ui.button("Try again").clicked() {
                     self.retry_device();
                 }
@@ -3769,6 +3809,15 @@ impl eframe::App for App {
         }
         self.sync_engine();
         self.serve_incoming();
+        // RTL-SDR support downloaded or its driver installed: open the dongle again
+        match crate::rtl::take_finished() {
+            Some(Ok(msg)) => {
+                self.toast(msg, false);
+                self.retry_device();
+            }
+            Some(Err(e)) => self.toast(e, true),
+            None => {}
+        }
         let bad = self.stats.torn + self.stats.gaps + self.stats.misfiled + self.stats.lock_timeouts + self.stats.host_drops;
         if bad > self.bad_last.0 {
             self.bad_last = (bad, self.now());
@@ -4114,6 +4163,9 @@ enum Act {
     /// Disconnect from the server and drive this machine's own radio.
     Local,
     Unshare,
+    /// Download corvus-rtl's librtlsdr; install the WinUSB driver for the dongle (Windows).
+    RtlGet,
+    RtlDriver,
     Sim,
     Dismiss,
     /// Hide the outdated-firmware notice for this board until the next start.
@@ -4421,6 +4473,7 @@ fn connect_label() -> &'static str {
         crate::hydra::Board::HackRF => "Connect the HackRF",
         crate::hydra::Board::Pluto => "Connect the Pluto",
         crate::hydra::Board::Soapy => "Open the SoapySDR radio",
+        crate::hydra::Board::Rtl => "Open the RTL-SDR",
     }
 }
 

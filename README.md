@@ -36,6 +36,11 @@ window, or *Share this radio* in the window); another connects by address and PI
 LAN, and drives it with the same controls, getting the waterfall history as it connects. The radio
 keeps sweeping between visits. See [app/README.md](app/README.md#remote).
 
+**RTL-SDR dongles,** on Windows without Zadig. Plugged in, they show in the radio picker. The first time one is
+used, Corvus Sweep downloads librtlsdr (and on Windows a WinUSB driver installer) from the separate
+[corvus-rtl](https://github.com/auggiesoft/corvus-rtl) project, checked against hashes built into it. See
+[app/README.md](app/README.md#rtl-sdr-dongles).
+
 **Other radios through SoapySDR.** With SoapySDR installed, any IQ radio its modules open (RTL-SDR,
 LimeSDR, SDRplay, USRPs such as the B210…) shows in the radio picker and gets the same display, swept from
 the PC. Slower than a board's own sweep, but the same waterfall, looks and passband learning. See
