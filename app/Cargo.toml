@@ -1,6 +1,6 @@
 [package]
 name = "corvus-sweep"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Live, seamlessly stitched wideband spectrum for an RFOne running the Corvus sweep firmware"
 license = "MIT"
