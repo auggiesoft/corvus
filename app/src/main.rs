@@ -14,6 +14,7 @@ mod net;
 mod plan;
 mod pluto;
 mod sim;
+mod pcsweep;
 mod soapy;
 mod theme;
 mod usbdev;

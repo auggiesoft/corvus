@@ -17,28 +17,22 @@ use std::time::Duration;
 
 use libloading::Library;
 
-use crate::hydra::{BLOCK_WORDS, Gain, RxSettings, Sink, TAG_WORDS, Tag, tag_block};
-use crate::plan::{Order, Plan, Rate};
+use crate::hydra::{Gain, RxSettings, Sink};
+use crate::pcsweep::{BLOCK_IQ, Pass, push_block};
+use crate::plan::{Plan, Rate};
 
 const RX: c_int = 1;
 const SOAPY_SDR_TIMEOUT: c_int = -1;
 const SOAPY_SDR_OVERFLOW: c_int = -4;
-/// IQ samples in a block (the Pluto layout: two words each between the tags).
-const BLOCK_IQ: usize = (BLOCK_WORDS - 2 * TAG_WORDS) / 2;
-/// Full scale in the block's words, as the Pluto's 12-bit samples.
-const FULL_SCALE: f32 = 2048.0;
 /// Settling after a retune before samples count (ms; `CORVUS_SOAPY_SETTLE_MS` overrides).
 const SETTLE_MS: f64 = 3.0;
 /// Whole stream transfers (the radio's MTU) dropped after a retune, on top of the settling: what was in
-/// flight when it retuned, which otherwise shows as copies of signals one or two steps away. Measured
-/// (FM band, against each board's native sweep): SoapyAirspy needs one, SoapyHydraSDR two; two for the rest
-/// until measured. SoapyPlutoSDR buffers deeper than six (use the Pluto's own sweep, corvus-pluto).
-/// `CORVUS_SOAPY_SKIP_MTU` overrides.
-fn skip_mtu(driver: &str) -> f64 {
-    match driver {
-        "airspy" => 1.0,
-        _ => 2.0,
-    }
+/// flight when it retuned, which otherwise shows as copies of strong signals one step away. Two, as Corvus's
+/// own PC-driven sweep drops: one is enough only when the retune lands early in a transfer (SoapyAirspy with
+/// one: copies 11–18 dB up in some runs, none in others). SoapyPlutoSDR buffers deeper than six (use the
+/// Pluto's own sweep, corvus-pluto). `CORVUS_SOAPY_SKIP_MTU` overrides.
+fn skip_mtu(_driver: &str) -> f64 {
+    2.0
 }
 
 #[repr(C)]
@@ -487,10 +481,7 @@ struct Sweeper {
     rate: Option<u32>,
     plan: Option<Plan>,
     paused: bool,
-    /// Where in the pass: its index, and whether it runs backwards (every other pass, for back-and-forth order).
-    pos: usize,
-    back: bool,
-    sweep: u32,
+    pass: Pass,
     tuned: Option<u64>,
     /// Samples read since opening (the block counter the tags carry).
     samples: u64,
@@ -513,9 +504,7 @@ impl Sweeper {
             rate: None,
             plan: None,
             paused: false,
-            pos: 0,
-            back: false,
-            sweep: 0,
+            pass: Pass::default(),
             tuned: None,
             samples: 0,
             buf: vec![0.0; 2 * BLOCK_IQ],
@@ -577,9 +566,7 @@ impl Sweeper {
 
     /// A new pass from the first step (what the engine expects after a change).
     fn restart(&mut self) {
-        self.pos = 0;
-        self.back = false;
-        self.sweep = self.sweep.wrapping_add(1);
+        self.pass.restart();
         self.tuned = None;
     }
 
@@ -669,7 +656,7 @@ impl Sweeper {
         }
         let seq = plan.sequence();
         let n = seq.len();
-        let k = seq[if self.back { n - 1 - self.pos } else { self.pos }];
+        let k = self.pass.step(&seq);
         let f = plan.centre(k as usize).round() as u64;
         let sr = self.rate.unwrap_or(1) as f64;
         if self.tuned != Some(f) {
@@ -697,24 +684,10 @@ impl Sweeper {
                 }
                 continue;
             }
-            let mut w = vec![0u16; BLOCK_WORDS];
-            for (o, v) in w[TAG_WORDS..BLOCK_WORDS - TAG_WORDS].iter_mut().zip(&self.buf) {
-                *o = (v * FULL_SCALE).round().clamp(-32768.0, 32767.0) as i16 as u16;
-            }
-            let dma = (self.samples / BLOCK_IQ as u64) as u32;
-            tag_block(&mut w, &Tag { step: k, block: b, sweep: self.sweep, freq_hz: f as u32, dma_count: dma, lock_polls: 0, lock_timed_out: false });
-            self.sink.push(w);
+            push_block(&self.sink, &self.buf, k, b, self.pass.sweep, f, (self.samples / BLOCK_IQ as u64) as u32);
             b += 1;
         }
-        // the next step; at the end of a pass, the next one (back and forth: it starts where this one ended)
-        self.pos += 1;
-        if self.pos >= n {
-            self.pos = 0;
-            self.sweep = self.sweep.wrapping_add(1);
-            if plan.order == Order::VcoContinuous && n > 1 {
-                self.back = !self.back;
-            }
-        }
+        self.pass.advance(&plan, n);
         Ok(())
     }
 }

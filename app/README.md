@@ -154,7 +154,7 @@ after installing (Arch: `libuhd-utils`; Debian/Ubuntu: `uhd-host`; Windows: from
 Ettus's UHD installer). Then `uhd_find_devices` should list the radio.
 
 The PC sweeps it (`src/soapy.rs`): for each step it retunes through the module, drops the samples in flight
-and while the tuner settles (two of the radio's stream transfers, one for SoapyAirspy, plus 3 ms;
+and while the tuner settles (two of the radio's stream transfers, plus 3 ms;
 `CORVUS_SOAPY_SKIP_MTU`, `CORVUS_SOAPY_SETTLE_MS`), then reads the step's blocks as complex floats, scaled so
 the radio's full scale reads 0 dBFS, in the Pluto's two-word layout. The engine then treats it as it treats
 the Pluto: two looks (on by default) hide the radio's DC spike and images, the passband learner learns its
@@ -167,13 +167,14 @@ Measured on the FM band (88–108 MHz), against each board's own sweep:
 
 | Through SoapySDR | Rate | Steps/s | Native (Corvus firmware) |
 |---|---|---|---|
-| Airspy Mini (SoapyAirspy) | 6 MSPS | 76 | 523 |
+| Airspy Mini (SoapyAirspy) | 6 MSPS | 44 | 523 |
 | RFOne (SoapyHydraSDR) | 10 MSPS | 70 | 781 |
 | Pluto+ (SoapyPlutoSDR) | 10 MSPS | 21–39 | 3,200 (corvus-pluto) |
 
-With the transfers dropped, signals and floor match the native sweep (Mini at the same 32 dB: SNR 31 vs 30 dB
-and 32.5 vs 35.6 on two stations). Fewer, and copies of strong signals appear a step or two away (the
-samples in flight still hold the previous step). SoapyPlutoSDR buffers deeper than six transfers, so the
+With the transfers dropped, signals and floor match the native sweep (Mini at the same 32 dB: SNR 29–35 vs
+30 dB and 34–44 vs 36 on two stations). Fewer, and copies of strong signals appear a step away (the samples
+in flight still hold the previous step): with one, the Mini showed them 9–18 dB up in some runs and not in
+others, depending on where in a transfer each retune lands. SoapyPlutoSDR buffers deeper than six transfers, so the
 Pluto keeps faint copies: use corvus-pluto, which is ~80 times faster anyway. A Soapy entry for a board
 Corvus drives natively is there for comparison.
 
@@ -407,6 +408,7 @@ at 60 fps by default; Settings caps it at 30, 20 or 15 to save power.
 | `src/usbdev.rs` | the built-in USB driver for every board (libhydrasdr's, libairspy's and libhackrf's requests in Rust, nusb), and board discovery on any platform |
 | `src/hackrf.rs` | the HackRF's stock sweep: setup and re-tagging its blocks as 5 MHz steps (built-in driver or libhackrf) |
 | `src/pluto.rs` | the Pluto over the network: corvus-pluto's protocol (plan, gain, stop), its blocks into the engine |
+| `src/pcsweep.rs` | what the PC-driven IQ sweeps share: the visiting order and tagged blocks |
 | `src/soapy.rs` | SoapySDR radios: libSoapySDR loaded at run time, the background search, the PC-driven sweep |
 | `src/net.rs` | remote operation: the server (`--serve`, Share this radio), the client, the PIN check, LAN discovery |
 | `build/` | `build.sh windows`: the Windows cross-build (MinGW in Docker) |
