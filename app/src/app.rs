@@ -529,6 +529,35 @@ impl Src {
     }
 }
 
+/// The newest Corvus sweep firmware for the RFOne and the Airspy R2/Mini (`firmware/README.md`, "Versions").
+const LATEST_SWEEP_FW: i32 = 7;
+/// How the device chip names a firmware sweep, followed by the revision: "Corvus firmware sweep7".
+const CORVUS_FW: &str = "Corvus firmware sweep";
+
+/// The revision of the board's Corvus firmware when it's older than `LATEST_SWEEP_FW`. Read from the chip
+/// text, so it works the same for a radio on another machine (`--connect`).
+fn outdated_fw(dev: &DevInfo) -> Option<i32> {
+    if dev.kind != SrcKind::Device {
+        return None;
+    }
+    let i = dev.short.find(CORVUS_FW)?;
+    let rev: i32 = dev.short[i + CORVUS_FW.len()..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()?;
+    (rev < LATEST_SWEEP_FW).then_some(rev)
+}
+
+/// What updating the board's firmware fixes, worst first, or `None` when it's current.
+fn fw_notice(dev: &DevInfo) -> Option<String> {
+    let rev = outdated_fw(dev)?;
+    // (fixed in, what goes wrong before it), one entry per release with a fix worth updating for
+    const FIXES: [(i32, &str); 2] = [
+        (7, "restarting a sweep (every settings change does) can hang the board until it's unplugged"),
+        (6, "steps outside the tuner's range (below ~23 MHz, above ~1.94 GHz) are labelled with frequencies the tuner wasn't on"),
+    ];
+    let fixes: Vec<&str> = FIXES.iter().filter(|&&(v, _)| rev < v).map(|&(_, f)| f).collect();
+    let why = if fixes.is_empty() { String::new() } else { format!(" On sweep{rev}, {}.", fixes.join(", and ")) };
+    Some(format!("The board runs Corvus firmware sweep{rev}; sweep{LATEST_SWEEP_FW} is current.{why} To update, see firmware/README.md in Corvus."))
+}
+
 /// What's connected and how it sweeps, for the device chip, the status bar and the footer (and a client).
 fn dev_info(src: &Src, serial: u64) -> DevInfo {
     let board = crate::hydra::board().name();
@@ -595,7 +624,7 @@ fn dev_info(src: &Src, serial: u64) -> DevInfo {
             let how = match d {
                 crate::hydra::Device::HackRF(_) => "stock firmware sweep".to_string(),
                 _ if d.host_driven() => "stock firmware · PC-driven sweep".to_string(),
-                _ => format!("Corvus firmware sweep{}", d.fw_revision()),
+                _ => format!("{CORVUS_FW}{}", d.fw_revision()),
             };
             DevInfo {
                 kind: SrcKind::Device,
@@ -691,6 +720,8 @@ pub struct App {
     toast: Option<(String, Instant)>,
     /// The last command the radio refused; a status-bar condition until it clears.
     error: Option<String>,
+    /// The device details when the outdated-firmware notice was dismissed: hidden for that board this session.
+    fw_hidden: String,
     /// The range before the last range change, for "↶ back".
     prev_range: Option<(f64, f64)>,
     /// Sweep settings before the last profile was applied, named for the restore button.
@@ -810,6 +841,7 @@ impl App {
             shown: Shown::default(),
             toast: None,
             error: None,
+            fw_hidden: String::new(),
             prev_range: None,
             prev_engine: None,
             retunes: Vec::new(),
@@ -1708,6 +1740,11 @@ impl App {
                 acts: vec![],
             });
         }
+        if let Some(n) = fw_notice(&dev)
+            && dev.details != self.fw_hidden
+        {
+            out.push(Cond { level: Level::Caution, text: n, acts: vec![(Act::FwHide, "Dismiss")] });
+        }
         if self.applied.lock_reads == 0 && !self.applied.rate.complex() && !self.host_driven() {
             out.push(Cond { level: Level::Caution, text: "The PLL lock check is off: about 1 in 5 steps come out wrong, by up to 22 dB.".into(), acts: vec![(Act::LockOn, "Turn it on")] });
         }
@@ -1788,6 +1825,7 @@ impl App {
             Some(Act::Local) => self.switch_device(Some((self.start_lib.0, self.serial))),
             Some(Act::Unshare) => self.set_share(false),
             Some(Act::Dismiss) => self.error = None,
+            Some(Act::FwHide) => self.fw_hidden = self.dev().details,
             Some(Act::LockOn) => self.cfg.lock_reads = 2,
             Some(Act::Resume) => self.toggle_run(),
             None => {}
@@ -3857,7 +3895,11 @@ pub fn serve(opts: Options, bind: std::net::SocketAddr, pin: Option<String>) -> 
     let mut dsp = cfg.dsp();
     let (mut running, mut error, mut acked) = (true, None::<String>, (0u64, 0u64));
     let at = if bind.ip().is_unspecified() { net::local_ip().map_or("all interfaces".to_string(), |ip| format!("{ip} (all interfaces)")) } else { bind.ip().to_string() };
-    println!("{}", dev_info(&src, opts.serial).short);
+    let info = dev_info(&src, opts.serial);
+    println!("{}", info.short);
+    if let Some(n) = fw_notice(&info) {
+        eprintln!("corvus-sweep: {n}");
+    }
     println!("serving on {at}, port {}, PIN {pin}", bind.port());
     let mut next_log = Instant::now();
     let mut client = None;
@@ -3998,7 +4040,12 @@ pub fn headless(opts: Options, secs: f32, csv: Option<PathBuf>, csv_every: Optio
     let (cfg, engine, src, plan) = open_windowless(&opts);
     match &src {
         Src::Offline(e) => return Err(e.clone()),
-        Src::Device(d) => println!("{} via {}", d.version(), d.lib_path().display()),
+        Src::Device(d) => {
+            println!("{} via {}", d.version(), d.lib_path().display());
+            if let Some(n) = fw_notice(&dev_info(&src, opts.serial)) {
+                eprintln!("corvus-sweep: {n}");
+            }
+        }
         Src::Sim(_) => println!("simulator"),
         Src::Remote(c) => println!("remote {}", c.addr),
     }
@@ -4069,6 +4116,8 @@ enum Act {
     Unshare,
     Sim,
     Dismiss,
+    /// Hide the outdated-firmware notice for this board until the next start.
+    FwHide,
     LockOn,
     Resume,
 }
@@ -4435,6 +4484,19 @@ fn _assert_send() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outdated_corvus_firmware_is_flagged() {
+        let dev = |short: &str| DevInfo { kind: SrcKind::Device, short: short.into(), ..Default::default() };
+        assert_eq!(outdated_fw(&dev("Airspy R2 · Corvus firmware sweep6")), Some(6));
+        assert_eq!(outdated_fw(&dev("lab-pc · RFOne · Corvus firmware sweep5")), Some(5)); // over the network
+        assert_eq!(outdated_fw(&dev(&format!("RFOne · Corvus firmware sweep{LATEST_SWEEP_FW}"))), None);
+        assert_eq!(outdated_fw(&dev("RFOne · stock firmware · PC-driven sweep")), None);
+        assert_eq!(outdated_fw(&dev("Pluto · corvus-pluto sweep")), None);
+        assert_eq!(outdated_fw(&DevInfo { kind: SrcKind::Sim, ..dev("Corvus firmware sweep1") }), None);
+        assert!(fw_notice(&dev("Airspy Mini · Corvus firmware sweep5")).unwrap().contains("labelled"));
+        assert!(!fw_notice(&dev("Airspy R2 · Corvus firmware sweep6")).unwrap().contains("labelled"));
+    }
 
     #[test]
     fn typed_ends_that_cross_keep_the_span() {

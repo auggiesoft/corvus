@@ -87,6 +87,10 @@ app retunes with `set_freq`, skips two USB transfers for settling, and tags the 
 the same order and format as the firmware. It runs at 30–60 steps a second, which the status bar
 explains. `--host-sweep` forces it on Corvus firmware too, for comparison.
 
+**Older Corvus firmware** (a sweep revision below the newest in `../firmware/README.md`) is flagged in the
+status bar, with what the update fixes (sweep7: a hang on quick sweep restarts) and a Dismiss button that
+hides it for that board until the next start. `--headless` and `--serve` print the same note.
+
 Other options: `--board rfone|airspy|mini|hackrf|pluto` (or `CORVUS_BOARD`), `--pluto HOST` (or `CORVUS_PLUTO`), `--host-sweep`, `--lib PATH` (or `CORVUS_LIB`), `--serial HEX` (or `CORVUS_SERIAL`),
 `--msps 10|12|61|31`, `--step MHZ`, `--bin-khz K`, `--profile NAME`, `--fresh` (ignore saved settings);
 `--help` lists them all. Settings persist between runs via eframe storage

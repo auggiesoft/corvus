@@ -6,8 +6,8 @@ to. That's what lets Corvus Sweep stitch a 24–1800 MHz spectrum about five tim
 
 | Board | Source | Status |
 |---|---|---|
-| HydraSDR RFOne | `rfone/`: the RFOne firmware v1.0.2, plus sweep mode | `v1.0.2-sweep5`, in daily use on one board |
-| Airspy R2 and Airspy Mini | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode. One image for both: it detects the board at boot | `v1.0.0-rc10-6-8-gcf1a374-sweep5`, tested on one R2 and one Mini (below) |
+| HydraSDR RFOne | `rfone/`: the RFOne firmware v1.0.2, plus sweep mode | `v1.0.2-sweep7`, in daily use on one board |
+| Airspy R2 and Airspy Mini | `airspy/`: upstream airspyone_firmware master (`cf1a374`, rc10-6 plus R820T2 tuning speedups), plus sweep mode. One image for both: it detects the board at boot | `v1.0.0-rc10-6-8-gcf1a374-sweep7`, tested on one R2; sweep5 also on one Mini (below) |
 
 `rfone/` is an import of the upstream RFOne firmware (GPL-2.0-or-later, see `rfone/LICENSE`) with
 the sweep mode on top. The new sweep files (`rfone/m0/sweep.c`, `rfone/m0/sweep.h`) are MIT; the
@@ -33,7 +33,11 @@ recognises sweep firmware by that suffix, so it must stay.
 | sweep2 | PLL lock polling before capture; burst PLL register write |
 | sweep3 | a start is applied by the main loop, not inside the USB interrupt; the pass counter no longer resets on a restart |
 | sweep4 | opt-in VCO-continuous visiting order (flag 0x01), +18.6 % over the full range |
-| **sweep5** | SET_PACKING during a sweep ends it instead of being refused, so a host that died mid-sweep can't lock out the next open |
+| sweep5 | SET_PACKING during a sweep ends it instead of being refused, so a host that died mid-sweep can't lock out the next open |
+| sweep6 | steps the PLL can't reach (RF below ~22.7 MHz or above ~1945 MHz) send no blocks instead of blocks tagged with a frequency the tuner wasn't on; SWEEP_STOP puts the tuner back on its pre-sweep frequency; lock_timeout clamped to 0x7FFF; no retune when the frequency doesn't change |
+| **sweep7** | USB control-endpoint fix (`common/usb.c`): a SWEEP_START arriving right behind another request could be acked twice and wedge the control endpoint, hanging the board until it was unplugged. Seen on an Airspy R2 under back-to-back restarts; both boards share the code. 10,000 back-to-back restarts on each without a hang |
+
+Corvus Sweep warns in its status bar when a board runs an older sweep revision than the newest above.
 
 The measurements behind each change are in `../docs/measurements.md`.
 
@@ -99,8 +103,10 @@ code. The output is `firmware/build/out/rfone/corvus-fw-<version>-rfone.bin`, wi
 `.map` and SHA256SUMS.
 
 The build is reproducible. The same toolchain builds upstream's v1.0.2 tag byte-identical to the
-official release image, and this tree builds `corvus-fw-v1.0.2-sweep5-rfone.bin` with sha256
-`10c3508dfe045587c09f1050a40718726e43d2e2dbc9479bf6f8272ba91ff824` (22860 bytes).
+official release image, and this tree builds `corvus-fw-v1.0.2-sweep7-rfone.bin` with sha256
+`7fcfb30e4329266e27a16f970c78f7e52e883925950d2bdeae66ed9164f23e5c` (23196 bytes) and
+`corvus-fw-v1.0.0-rc10-6-8-gcf1a374-sweep7-airspy.bin` with sha256
+`a0fc87203c815b3f8dd122f9bcb4068e2beb6a4fe81fb55c6048b2da7989b354` (23080 bytes).
 
 ## Flashing
 
@@ -114,8 +120,8 @@ RFOne:
    `hydrasdr_spiflash -s <serial> -r backup.bin -l 1048576`
 2. Note the frequency calibration: `hydrasdr_calibrate -s <serial> -r`
 3. Flash and reset:
-   `hydrasdr_spiflash -s <serial> -w corvus-fw-v1.0.2-sweep5-rfone.bin`, then `hydrasdr_reset -s <serial>`
-4. Check that `hydrasdr_info -s <serial>` reports `v1.0.2-sweep5`, and that the calibration still
+   `hydrasdr_spiflash -s <serial> -w corvus-fw-v1.0.2-sweep7-rfone.bin`, then `hydrasdr_reset -s <serial>`
+4. Check that `hydrasdr_info -s <serial>` reports `v1.0.2-sweep7`, and that the calibration still
    reads the same. A firmware write should leave the calibration record (at 0x20000) alone. If it's
    gone, restore it with `hydrasdr_calibrate -s <serial> -w <ppb>`.
 

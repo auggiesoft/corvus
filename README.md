@@ -11,8 +11,8 @@ spectrum: on the RFOne, **24–1800 MHz about five times a second (8.6 GHz/s), l
 
 | Board | Firmware | Rate | Steps | 24–1800 MHz | Corvus Sweep |
 |---|---|---|---|---|---|
-| HydraSDR RFOne | `firmware/rfone/`, `v1.0.2-sweep5` | 12 MSPS (or 10) | up to 10 MHz | 8.6 GHz/s, ~5 passes/s | `--board rfone` (default) |
-| Airspy R2 | `firmware/airspy/`, `…-sweep5` | 10 MSPS | up to 9 MHz | 6.5 GHz/s, ~3.65 passes/s | `--board airspy` |
+| HydraSDR RFOne | `firmware/rfone/`, `v1.0.2-sweep7` | 12 MSPS (or 10) | up to 10 MHz | 8.6 GHz/s, ~5 passes/s | `--board rfone` (default) |
+| Airspy R2 | `firmware/airspy/`, `…-sweep7` | 10 MSPS | up to 9 MHz | 6.5 GHz/s, ~3.65 passes/s | `--board airspy` |
 | Airspy Mini | the same image as the R2 | 6 MSPS | up to 4 MHz | 2.9 GHz/s, ~1.6 passes/s | `--board mini` |
 | HackRF One | **stock** (its own sweep mode, no flashing) | 20 MSPS IQ | 5 MHz slices | 8.1 GHz/s, ~4.6 passes/s (1–6000 MHz: 1.36) | `--board hackrf` |
 | Pluto+ / PlutoSDR | its own firmware + `firmware/pluto/` (a program on the board) | 61.44 MSPS IQ (down to 3.84) | up to 50 MHz | ~18–6178 MHz: ~125 GHz/s, ~20 passes/s (Ethernet); a live view | `--pluto HOST` |
@@ -90,7 +90,7 @@ and how to recover a board if a flash goes wrong (that means opening the case).
 
 ## Status
 
-- The RFOne firmware (`v1.0.2-sweep5`), the library and Corvus Sweep are used daily on one RFOne
+- The RFOne firmware (`v1.0.2-sweep7`), the library and Corvus Sweep are used daily on one RFOne
   under Linux. Every firmware version has passed the same regression checks: normal streaming is
   unchanged, and the factory calibration survives flashing.
 - Corvus Sweep for Windows (`corvus-sweep-<version>-windows-x64.zip` on the Releases page, or
