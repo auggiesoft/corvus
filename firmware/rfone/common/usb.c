@@ -593,6 +593,15 @@ static void usb_check_for_setup_events(void)
           // a cleaner way to get the SETUP data.
           copy_setup(&endpoint->in->setup, usb_queue_head(endpoint->address)->setup);
           usb_clear_endpoint_setup_status(endptsetupstat_bit);
+          /* A new SETUP ends the control transfer before it. Anything still queued on this endpoint belongs
+           * to that transfer (UM10503: flush before priming for a new setup), and so does a completion not
+           * yet handled, which would otherwise run as a stage of this new request: e.g. the OUT status of an
+           * IN request taken as the DATA stage of the OUT request after it, which then acks twice and leaves
+           * a zero-length IN that never completes at the head of the queue, so nothing is retired again and
+           * the next ack spins forever in this ISR once the pool is empty. */
+          usb_endpoint_flush(endpoint->in);
+          usb_endpoint_flush(endpoint);
+          usb_clear_endpoint_complete(USB0_ENDPTCOMPLETE_ERCE(1 << i) | USB0_ENDPTCOMPLETE_ETCE(1 << i));
           endpoint->setup_complete(endpoint);
         } else {
           usb_clear_endpoint_setup_status(endptsetupstat_bit);
@@ -651,8 +660,10 @@ void usb0_isr(void)
     // - Short packet detected.
     // - SETUP packet received.
 
-    usb_check_for_setup_events();
+    /* Completions first: they finish stages of the transfer that was running, which a SETUP handled
+     * first would replace (see usb_check_for_setup_events). */
     usb_check_for_transfer_events();
+    usb_check_for_setup_events();
 
     // TODO: Reset ignored ENDPTSETUPSTAT and ENDPTCOMPLETE flags?
   }
