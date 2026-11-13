@@ -309,13 +309,12 @@ impl Live {
             let a = lo + n * c / cols;
             let b = (lo + n * (c + 1) / cols).max(a + 1);
             xs.push(0.5 * (self.freq(a) + self.freq(b - 1)));
-            ys.push(self.reduce(t, a, b, det));
+            ys.push(self.reduce(self.array(t), a, b, det));
         }
         (xs, ys)
     }
 
-    fn reduce(&self, t: Trace, a: usize, b: usize, det: Detector) -> f32 {
-        let arr = self.array(t);
+    fn reduce(&self, arr: &[f32], a: usize, b: usize, det: Detector) -> f32 {
         let m = self.m;
         let mut acc = match det {
             Detector::Peak => f32::NEG_INFINITY,
@@ -399,10 +398,12 @@ impl Live {
         Some((pp(&|j| shape[j]), pp(&|j| shape[j] - self.eq[j])))
     }
 
+    /// A waterfall row: the readings as measured, never the smoothed live trace, so a burst keeps its level
+    /// and length and the noise its texture.
     fn waterfall_row(&self) -> Vec<f32> {
-        let (lo, hi) = (0, self.cur.len());
+        let (lo, hi) = (0, self.raw.len());
         let cols = self.wf_cols;
-        (0..cols).map(|c| self.reduce(Trace::Live, lo + (hi - lo) * c / cols, (lo + (hi - lo) * (c + 1) / cols).max(lo + 1), Detector::Peak)).collect()
+        (0..cols).map(|c| self.reduce(&self.raw, lo + (hi - lo) * c / cols, (lo + (hi - lo) * (c + 1) / cols).max(lo + 1), Detector::Peak)).collect()
     }
 }
 
@@ -1444,6 +1445,25 @@ mod tests {
         // the tone on the LO (-26 dBFS): lost with one look, seen by the next step with two
         assert!(near(&l1, 960e6) < -50.0, "one look loses the tone on the LO ({})", near(&l1, 960e6));
         assert!(near(&l2, 960e6) > -32.0, "two looks see it ({})", near(&l2, 960e6));
+    }
+
+    /// The waterfall shows the readings as measured: smoothing changes the live trace only.
+    #[test]
+    fn waterfall_rows_are_not_smoothed() {
+        let plan = Plan::new(400.0, 410.0, 8.0, 1, 0, 2, Order::Ascending, Rate::M10);
+        let s = DspSettings { nfft: 2048, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 20.0, smooth_tau: 1.0, burst_db: 8.0 };
+        let mut l = Live::new(plan, s);
+        l.wf_cols = l.cur.len();
+        let len = l.cur.len();
+        for pass in 0..40 {
+            let vals: Vec<f32> = (0..len).map(|j| -90.0 + ((j * 7 + pass * 13) % 11) as f32 * 0.5).collect();
+            update_bins(&mut l, s, 0, &vals, &[], if pass == 0 { None } else { Some(0.1) });
+        }
+        assert!(l.cur.iter().zip(&l.raw).any(|(c, r)| (c - r).abs() > 0.5), "the live trace is smoothed");
+        let row = l.waterfall_row();
+        for (j, (w, r)) in row.iter().zip(&l.raw).enumerate() {
+            assert_eq!(*w, r - l.eq[j % l.m], "column {j}");
+        }
     }
 
     /// Smoothing: the noise's wander over time drops by more than half, a 15 dB burst on one pass (20 dB
