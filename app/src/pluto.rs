@@ -247,9 +247,14 @@ impl PlutoDevice {
     }
 
     pub fn sweep(&mut self, plan: &Plan) -> Result<(), String> {
-        self.configure(plan.rate)?;
-        let want = if std::env::var("CORVUS_PLUTO_MODE").is_ok_and(|m| m == "driver") { "driver" } else { "fast" };
+        // from here until the board answers the new plan, what arrives is the old one's: a new rate's CONFIG
+        // comes first, and blocks the board sends meanwhile counted one gap per span change in the live view
         self.stale.store(true, Ordering::Relaxed);
+        if let Err(e) = self.configure(plan.rate) {
+            self.stale.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
+        let want = if std::env::var("CORVUS_PLUTO_MODE").is_ok_and(|m| m == "driver") { "driver" } else { "fast" };
         // settle= for corvus-pluto 0.2 (it adds its own flush where it needs one); skip= for 0.1, which ignores
         // settle, mode and pack. Fast mode calibrates its profiles on a new plan first (~0.7 s).
         let reply = self.cmd(

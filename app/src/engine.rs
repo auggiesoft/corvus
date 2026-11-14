@@ -142,6 +142,8 @@ const RELEASE_DB: f32 = 0.5;
 
 pub struct Live {
     pub generation: u64,
+    /// The engine queue's buffer count when the current plan was set: the buffers before it are the old plan's.
+    pub plan_after: u64,
     pub restarts: u64,
     pub plan: Plan,
     pub settings: DspSettings,
@@ -189,6 +191,7 @@ impl Live {
     fn new(plan: Plan, settings: DspSettings) -> Live {
         let mut l = Live {
             generation: 0,
+            plan_after: 0,
             restarts: 0,
             plan,
             settings,
@@ -497,6 +500,7 @@ pub struct Engine {
     pub live: Arc<Mutex<Live>>,
     tx: SyncSender<Vec<u16>>,
     pub host_drops: Arc<AtomicU64>,
+    queued: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     pub epoch: Instant,
@@ -512,14 +516,15 @@ impl Engine {
         let (tx, rx) = sync_channel(512);
         let stop = Arc::new(AtomicBool::new(false));
         let host_drops = Arc::new(AtomicU64::new(0));
+        let queued = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
         let mut w = Worker::new(live.clone(), rx, stop.clone(), host_drops.clone(), epoch);
         let thread = std::thread::Builder::new().name("corvus-dsp".into()).spawn(move || w.run()).expect("spawn worker");
-        Engine { live, tx, host_drops, stop, thread: Some(thread), epoch }
+        Engine { live, tx, host_drops, queued, stop, thread: Some(thread), epoch }
     }
 
     pub fn sink(&self) -> Sink {
-        Sink { tx: self.tx.clone(), host_drops: self.host_drops.clone(), host: None }
+        Sink { tx: self.tx.clone(), host_drops: self.host_drops.clone(), queued: self.queued.clone(), host: None }
     }
 
     pub fn now(&self) -> f32 {
@@ -539,6 +544,15 @@ impl Engine {
         if relayout {
             l.relayout();
         }
+    }
+
+    /// The radio has taken the plan last set: whatever is queued now came before it, from the old plan or from
+    /// the moment between the two. Dropped, and the step sequence starts again after it. In a live view the old
+    /// plan's blocks look just like the new one's (one step, the same frequency), so the sequence can't sort
+    /// them out itself.
+    pub fn plan_started(&self) {
+        let q = self.queued.load(Ordering::Relaxed);
+        self.live.lock().plan_after = q;
     }
 
     /// The sweep was restarted (gain/port change, resume): the step sequence starts over.
@@ -655,6 +669,9 @@ struct Worker {
     /// dropped without counting as misfiled or as a gap. Gives up after 256 blocks.
     settling: bool,
     settle_dropped: u32,
+    /// Buffers taken from the queue so far, and the count the current plan started at (see Live::plan_after).
+    taken: u64,
+    plan_after: u64,
     acc_lock: u16,
     acc_dma: u32,
     /// Each step's block counter at its previous visit, for the time between visits (device clock).
@@ -711,6 +728,8 @@ impl Worker {
             acc_done: false,
             settling: true,
             settle_dropped: 0,
+            taken: 0,
+            plan_after: 0,
             acc_lock: 0,
             acc_dma: 0,
             step_dma: Vec::new(),
@@ -807,6 +826,10 @@ impl Worker {
         if (l.settings.smooth_tau > 0.0) != (self.settings.smooth_tau > 0.0) {
             l.reset_floors();
         }
+        if l.plan_after != self.plan_after {
+            self.plan_after = l.plan_after;
+            self.reset_sequence(true);
+        }
         let eq_toggled = l.settings.eq_on != self.settings.eq_on;
         self.settings = l.settings;
         if l.generation != self.generation {
@@ -851,6 +874,12 @@ impl Worker {
 
     fn process(&mut self, bufs: &[Vec<u16>]) {
         self.sync();
+        // buffers queued before the current plan was set hold the old plan's blocks: in a live view they look
+        // just like the new plan's (one step, the same frequency), so the step sequence can't tell them apart
+        let first = self.taken;
+        self.taken += bufs.len() as u64;
+        let old = (self.plan_after.saturating_sub(first) as usize).min(bufs.len());
+        let bufs = &bufs[old..];
         let words: usize = bufs.iter().map(Vec::len).sum();
         let nb = words / BLOCK_WORDS;
         let (mut torn, mut untagged, mut misfiled, mut timeouts, mut valid) = (0, 0, 0, 0, 0);
@@ -1336,6 +1365,46 @@ mod tests {
         }
         let l = eng.live.lock();
         assert!(l.stats.steps > 500, "the sweep kept running ({} steps)", l.stats.steps);
+        assert_eq!((l.stats.gaps, l.stats.misfiled, l.stats.torn), (0, 0, 0));
+    }
+
+    /// A live view changing span: the old and new plans' blocks look alike (one step, the same frequency), the
+    /// board numbers the new run's passes on from the old one's, and some of the old plan's blocks are still
+    /// queued when the new one starts. Dropped once the radio has the new plan, they count no gap.
+    #[test]
+    fn live_span_changes_count_no_gaps() {
+        let live = |r: Rate| {
+            let span = r.max_window_hz() / 1e6 - 0.1;
+            Plan::new(96.5 - span / 2.0, 96.5 + span / 2.0, r.max_window_hz() / 1e6, 1, 0, 2, Order::VcoContinuous, r)
+        };
+        let (a, b) = (live(Rate::P31), live(Rate::P61));
+        assert_eq!((a.n(), b.n(), a.centre(0)), (1, 1, b.centre(0)));
+        let eng = Engine::new(a.clone(), DspSettings { nfft: 2048, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 20.0, smooth_tau: 0.0, burst_db: 8.0 }, false);
+        let sink = eng.sink();
+        let block = |sweep: u32, dma: u32| {
+            let mut w = vec![0u16; BLOCK_WORDS];
+            for (n, x) in w.iter_mut().enumerate() {
+                *x = (300.0 * (n as f64 * 1.3).sin()) as i16 as u16;
+            }
+            tag_block(&mut w, &Tag { step: 0, block: 0, sweep, freq_hz: a.centre(0) as u32, dma_count: dma, lock_polls: 0, lock_timed_out: false });
+            w
+        };
+        for s in 100..120 {
+            sink.push(block(s, s - 100));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        eng.set_plan(b.clone());
+        // the old plan's last blocks, then the board's answer, then the new run four passes on
+        for s in 120..123 {
+            sink.push(block(s, s - 100));
+        }
+        eng.plan_started();
+        for s in 127..160 {
+            sink.push(block(s, s - 127));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let l = eng.live.lock();
+        assert!(l.stats.steps > 20, "the new run was taken ({} steps)", l.stats.steps);
         assert_eq!((l.stats.gaps, l.stats.misfiled, l.stats.torn), (0, 0, 0));
     }
 

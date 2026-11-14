@@ -413,6 +413,9 @@ impl Api {
 pub struct Sink {
     pub tx: SyncSender<Vec<u16>>,
     pub host_drops: Arc<AtomicU64>,
+    /// Buffers queued so far (counted after they're in the queue), so the engine can tell which queued
+    /// buffers came before a new plan.
+    pub queued: Arc<AtomicU64>,
     pub host: Option<Arc<HostShared>>,
 }
 
@@ -420,6 +423,8 @@ impl Sink {
     pub fn push(&self, buf: Vec<u16>) {
         if self.tx.try_send(buf).is_err() {
             self.host_drops.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.queued.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1167,7 +1172,7 @@ mod tests {
             for round in 0..2 {
                 set_board(board);
                 let (tx, rx) = std::sync::mpsc::sync_channel(4096);
-                let sink = Sink { tx, host_drops: Arc::new(AtomicU64::new(0)), host: None };
+                let sink = Sink { tx, host_drops: Arc::new(AtomicU64::new(0)), queued: Arc::new(AtomicU64::new(0)), host: None };
                 let rx_set = RxSettings { port: 0, gain: Gain::Linearity(10) };
                 let mut d = Device::open(Path::new(NATIVE_LIB), serial, sink, rx_set, rates[0]).unwrap_or_else(|e| panic!("{b}: {e}"));
                 let r = rates[0];
@@ -1216,6 +1221,43 @@ mod tests {
                 drop(d);
             }
         }
+    }
+
+    /// The Pluto's live view, switched between spans the way the window does it (engine first, then the
+    /// board): a new sample rate must not count a gap. `CORVUS_TEST_PLUTO=10.2.2.35 cargo test --release
+    /// pluto_live_span_changes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn pluto_live_span_changes_count_no_gaps() {
+        use crate::engine::{DspSettings, Engine, PeakMode};
+        use crate::plan::Order;
+        let addr = std::env::var("CORVUS_TEST_PLUTO").expect("set CORVUS_TEST_PLUTO");
+        crate::pluto::set_addr(&addr);
+        set_board(Board::Pluto);
+        let live = |r: Rate| {
+            let span = r.max_window_hz() / 1e6 - 0.1;
+            Plan::new(96.5 - span / 2.0, 96.5 + span / 2.0, r.max_window_hz() / 1e6, 1, 0, 2, Order::VcoContinuous, r)
+        };
+        let s = DspSettings { nfft: 2048, avg_tau: 0.0, avg_power: false, peak: PeakMode::Hold, eq_on: false, wf_rate: 20.0, smooth_tau: 0.0, burst_db: 8.0 };
+        let first = live(Rate::P31);
+        let engine = Engine::new(first.clone(), s, false);
+        let rx_set = RxSettings { port: 0, gain: Gain::Linearity(10) };
+        let mut d = Device::open(Path::new(NATIVE_LIB), 0, engine.sink(), rx_set, Rate::P31).unwrap_or_else(|e| panic!("pluto: {e}"));
+        d.sweep(&first).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        for r in [Rate::P61, Rate::P15, Rate::P7, Rate::P3, Rate::P31, Rate::P3, Rate::P61] {
+            let p = live(r);
+            assert_eq!(p.n(), 1);
+            engine.set_plan(p.clone());
+            d.sweep(&p).unwrap();
+            engine.plan_started();
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let st = engine.live.lock().stats.clone();
+            eprintln!("live at {}: {} valid blocks, gaps {} misfiled {} torn {} drops {}", r.label(), st.valid, st.gaps, st.misfiled, st.torn, st.host_drops);
+        }
+        let st = engine.live.lock().stats.clone();
+        drop(d);
+        assert_eq!((st.gaps, st.misfiled, st.torn), (0, 0, 0), "a span change counted lost steps");
     }
 
     #[test]

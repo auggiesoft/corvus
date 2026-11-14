@@ -925,6 +925,7 @@ impl App {
             {
                 app.src = Src::Offline(e);
             }
+            app.engine.plan_started();
         }
         app
     }
@@ -958,6 +959,7 @@ impl App {
             Ok(()) => self.error = None,
             Err(e) => self.toast(e, true),
         }
+        self.engine.plan_started();
         self.running = true;
         if range_changed {
             self.prev_range = Some((self.applied.start_hz, self.applied.stop_hz));
@@ -1106,6 +1108,7 @@ impl App {
             {
                 self.src = Src::Offline(e);
             }
+            self.engine.plan_started();
         }
         if let Src::Device(_) = self.src {
             self.engine.set_persist_eq(true);
@@ -3944,6 +3947,7 @@ fn open_windowless(opts: &Options) -> (Config, Engine, Src, Plan) {
         {
             src = Src::Offline(e);
         }
+        engine.plan_started();
     }
     if crate::hydra::board() != asked || !crate::hydra::board().rates().contains(&plan.rate) {
         // the firmware said which Airspy it is (or a SoapySDR radio, its rates): fit the settings and sweep
@@ -3956,6 +3960,7 @@ fn open_windowless(opts: &Options) -> (Config, Engine, Src, Plan) {
         {
             src = Src::Offline(e);
         }
+        engine.plan_started();
     }
     (cfg, engine, src, plan)
 }
@@ -4027,6 +4032,7 @@ pub fn serve(opts: Options, bind: std::net::SocketAddr, pin: Option<String>) -> 
                             {
                                 src = Src::Offline(e);
                             }
+                            engine.plan_started();
                         }
                         rx = cfg.rx();
                         dsp = cfg.dsp();
@@ -4069,6 +4075,7 @@ pub fn serve(opts: Options, bind: std::net::SocketAddr, pin: Option<String>) -> 
         if p != applied {
             engine.set_plan(p.clone());
             error = src.sweep(&p).err();
+            engine.plan_started();
             running = true;
             applied = p;
         }
