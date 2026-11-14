@@ -41,6 +41,9 @@ used, Corvus Sweep downloads librtlsdr (and on Windows a WinUSB driver installer
 [corvus-rtl](https://github.com/auggiesoft/corvus-rtl) project, checked against hashes built into it. See
 [app/README.md](app/README.md#rtl-sdr-dongles).
 
+**Live view** on every board but the HackRF: stop sweeping and watch one span continuously. The RFOne and the
+Airspys stream normally while live, so every sample counts; see [app/README.md](app/README.md#live-view).
+
 **Other radios through SoapySDR.** With SoapySDR installed, any IQ radio its modules open (RTL-SDR,
 LimeSDR, SDRplay, USRPs such as the B210…) shows in the radio picker and gets the same display, swept from
 the PC. Slower than a board's own sweep, but the same waterfall, looks and passband learning. See

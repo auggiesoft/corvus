@@ -59,12 +59,8 @@ plus 15.36, 7.68 and 3.84 MSPS for finer bins (3.75, 1.9, 0.94 kHz native); pass
 46.88 MHz–6 GHz where the chip locks (46–6150 MHz here; it reports its range, `lo=` in its greeting), and
 steps beyond that are taken at the nearest end and shifted digitally, so the cover reaches half the RF
 bandwidth further. Less accurate towards the ends (the analog filter's edge, a residual of the LO leakage).
-**Live view** (Pluto, more boards to follow): the Range card's Live switch, or **L** over the spectrum
-(centred where the cursor is). One step, Centre and Span (50, 25, 12, 6, 3, 1 MHz); the span picks the
-lowest rate that covers it, so the bins are the finest the span allows. The board stays on the frequency and
-streams: ~3,800 updates/s at 61.44 and 30.72 MSPS (network-bound), and at 15.36 MSPS and below about 94 % of
-the signal captured, nearly gapless. Shift+arrows move it a span; L or Sweep goes back to the sweep it came
-from. Every gain mode sets the AD936x's one manual gain
+**Live view** ([Live view](#live-view)): ~3,800 updates/s at 61.44 and 30.72 MSPS (network-bound), and at
+15.36 MSPS and below about 94 % of the signal captured, nearly gapless. Every gain mode sets the AD936x's one manual gain
 (0–71 dB; Gain 10 is 34 dB, shown under the slider), and it changes mid-sweep without stopping. **Input**
 (Receiver card, or `--port RX2`) picks RX1 or RX2 (corvus-pluto 0.2.3 on a board in 1R1T); switching restarts
 the sweep. The bins
@@ -99,6 +95,25 @@ Other options: `--board rfone|airspy|mini|hackrf|pluto` (or `CORVUS_BOARD`), `--
 
 Building needs a Rust toolchain (edition 2024) and, on Linux, the usual Wayland/X11 and Vulkan or
 GL libraries that wgpu uses.
+
+### Live view
+
+Every board but the HackRF can stop sweeping and stay on one frequency: the Range card's **Live** switch, or
+**L** over the spectrum (centred where the cursor is). Centre and Span set it; Shift+arrows move it a span,
+and L or Sweep goes back to the sweep it came from. The span picks the board's narrowest rate that covers it,
+so the bins are the finest the span allows, and every block is an update.
+
+| Board | Spans (MHz) | While live |
+|---|---|---|
+| Pluto | 50, 25, 12, 6, 3, 1 | corvus-pluto stays on the LO: ~3,800 updates/s at 61.44 and 30.72 MSPS (network-bound), about 94 % of the signal at 15.36 MSPS and below |
+| RFOne | 10, 6, 3, 1 | the firmware sweep stops and the board streams normally, on any firmware: every sample, an update per 8,192 |
+| Airspy R2 / Mini | 9, 6, 3, 1 / 4, 2, 1 | the same: an R2 at 10 MSPS gives 2,441 updates/s, 40 MB/s, nothing dropped |
+| RTL-SDR | 1.8, 1.5, 0.7 | the dongle stays tuned and is read continuously: every sample, ~590 updates/s at 2.4 MSPS |
+| SoapySDR radio | its rates' usable widths | the same: SoapyAirspy at 10 MSPS gives 2,441 updates/s |
+
+The flatness correction is learnt only while sweeping. A live view uses the one learnt at the same rate and
+bin size if it covers the span (a span wider than the sweep's steps goes uncorrected). The IQ radios' DC bins
+are bridged from their neighbours, as on the Pluto.
 
 ### RTL-SDR dongles
 

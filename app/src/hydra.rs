@@ -78,8 +78,10 @@ impl Board {
 
     /// The RFOne has ANT, CABLE1 and CABLE2; the R2 has one antenna input.
     /// The live view (one step, the board parked on a frequency): the Pluto so far.
+    /// The live view (one step, the board parked on it): every board but the HackRF, whose stock firmware
+    /// only sweeps. The RFOne and the Airspys stream normally while live (`R82xDevice::sweep`).
     pub fn has_live(self) -> bool {
-        self == Board::Pluto
+        self != Board::HackRF
     }
 
     pub fn has_ports(self) -> bool {
@@ -431,8 +433,8 @@ unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
         let n = t.sample_count.max(0) as usize;
         let samples = std::slice::from_raw_parts(t.samples as *const u16, n);
         match &sink.host {
-            Some(h) => h.on_transfer(samples, sink),
-            None => sink.push(samples.to_vec()),
+            Some(h) if !h.passthrough.load(Ordering::Relaxed) => h.on_transfer(samples, sink),
+            _ => sink.push(samples.to_vec()),
         }
     }
     0
@@ -445,10 +447,15 @@ unsafe extern "C" fn rx_callback(t: *mut Transfer) -> c_int {
 /// firmware would and passes them on; everything else is dropped. Same tags and visiting order as the
 /// firmware, so the engine can't tell the difference, only that it's slower (a step costs ~2-3 transfers
 /// of 131072 samples, 6.5 ms each at 20 MSPS real).
+///
+/// The live view uses it too, on any firmware: the board streams normally on one frequency and every block
+/// of every transfer is tagged (`HostState::stream`), each `dwell` of them a pass. While the firmware sweeps,
+/// `passthrough` hands its own tagged blocks on untouched.
 pub struct HostShared {
     state: parking_lot::Mutex<HostState>,
     cv: parking_lot::Condvar,
     transfers: AtomicU64,
+    passthrough: AtomicBool,
 }
 
 #[derive(Default)]
@@ -460,14 +467,25 @@ struct HostState {
     sweep: u32,
     block: u16,
     left: u16,
+    /// Live: tag every block from `accept_from` on, `dwell` to a pass, until disarmed.
+    stream: bool,
+    dwell: u16,
 }
 
 /// Whole transfers skipped after a retune before blocks are taken (see `HostShared`).
 const HOST_SETTLE_TRANSFERS: u64 = 2;
 
 impl HostShared {
-    fn new() -> HostShared {
-        HostShared { state: parking_lot::Mutex::new(HostState::default()), cv: parking_lot::Condvar::new(), transfers: AtomicU64::new(0) }
+    fn new(passthrough: bool) -> HostShared {
+        HostShared { state: parking_lot::Mutex::new(HostState::default()), cv: parking_lot::Condvar::new(), transfers: AtomicU64::new(0), passthrough: AtomicBool::new(passthrough) }
+    }
+
+    /// Stop taking blocks (a sweep step or the live stream).
+    fn disarm(&self) {
+        let mut st = self.state.lock();
+        st.armed = false;
+        st.stream = false;
+        self.cv.notify_all();
     }
 
     fn on_transfer(&self, samples: &[u16], sink: &Sink) {
@@ -478,7 +496,7 @@ impl HostShared {
         }
         let per = (samples.len() / BLOCK_WORDS) as u64;
         for (i, chunk) in samples.chunks_exact(BLOCK_WORDS).enumerate() {
-            if st.left == 0 {
+            if !st.stream && st.left == 0 {
                 break;
             }
             let mut w = chunk.to_vec();
@@ -486,9 +504,16 @@ impl HostShared {
             tag_block(&mut w, &Tag { step: st.step, block: st.block, sweep: st.sweep, freq_hz: st.freq_hz, dma_count: dma, lock_polls: 0, lock_timed_out: false });
             sink.push(w);
             st.block += 1;
-            st.left -= 1;
+            if st.stream {
+                if st.block >= st.dwell {
+                    st.block = 0;
+                    st.sweep = st.sweep.wrapping_add(1);
+                }
+            } else {
+                st.left -= 1;
+            }
         }
-        if st.left == 0 {
+        if !st.stream && st.left == 0 {
             st.armed = false;
             self.cv.notify_all();
         }
@@ -678,6 +703,8 @@ pub struct R82xDevice {
     streaming: bool,
     /// PC-driven sweep (no sweep firmware, or forced).
     host_mode: bool,
+    /// The live view: streaming normally on one frequency, every block tagged by `host`.
+    live: bool,
     set_freq: Option<FreqFn>,
     host: Option<Arc<HostShared>>,
     sweeper: Option<HostSweeper>,
@@ -746,7 +773,8 @@ impl R82xDevice {
         };
         set_board(board);
         let host_mode = fw_revision == 0 || FORCE_HOST.load(Ordering::Relaxed);
-        let host = if host_mode { Some(Arc::new(HostShared::new())) } else { None };
+        // always there: the live view streams through it on sweep firmware too
+        let host = Some(Arc::new(HostShared::new(!host_mode)));
         sink.host = host.clone();
         let io = match opened {
             Opened::Lib(api, dev) => Io::Lib { api, dev, sink: Box::into_raw(Box::new(sink)) },
@@ -763,6 +791,7 @@ impl R82xDevice {
             rate,
             streaming: false,
             host_mode,
+            live: false,
             set_freq,
             host,
             sweeper: None,
@@ -867,8 +896,8 @@ impl R82xDevice {
                 Io::Native { usb, sink } => {
                     let sink = sink.clone();
                     usb.start_rx(move |words| match &sink.host {
-                        Some(h) => h.on_transfer(&words, &sink),
-                        None => sink.push(words),
+                        Some(h) if !h.passthrough.load(Ordering::Relaxed) => h.on_transfer(&words, &sink),
+                        _ => sink.push(words),
                     })?
                 }
             }
@@ -894,12 +923,33 @@ impl R82xDevice {
         if let Some(s) = self.sweeper.take() {
             s.stop.store(true, Ordering::Relaxed);
             if let Some(h) = &self.host {
-                let mut st = h.state.lock();
-                st.armed = false;
-                h.cv.notify_all();
+                h.disarm();
             }
             let _ = s.thread.join();
         }
+    }
+
+    /// The live view: tune to the plan's one step and tag every block that follows (after the settling
+    /// transfers), `dwell` blocks to a pass. The board streams normally, so nothing is lost between blocks.
+    fn start_live(&mut self, plan: &Plan) -> Result<(), String> {
+        let (Some(set_freq), Some(host)) = (self.set_freq.clone(), self.host.clone()) else {
+            return Err("the library has no set_freq".into());
+        };
+        host.passthrough.store(false, Ordering::Relaxed);
+        set_freq(plan.f0);
+        let mut st = host.state.lock();
+        *st = HostState {
+            armed: true,
+            accept_from: host.transfers.load(Ordering::Acquire) + HOST_SETTLE_TRANSFERS,
+            step: 0,
+            freq_hz: plan.f0 as u32,
+            sweep: self.host_sweep_no.fetch_add(1, Ordering::Relaxed) as u32 + 1,
+            block: 0,
+            left: 0,
+            stream: true,
+            dwell: plan.dwell.max(1) as u16,
+        };
+        Ok(())
     }
 
     fn start_sweeper(&mut self, plan: &Plan) {
@@ -914,19 +964,35 @@ impl R82xDevice {
     }
 
     /// Start streaming if needed and (re)start the sweep with this plan. A running firmware sweep is
-    /// replaced without a stop.
+    /// replaced without a stop. A one-step plan (the live view) streams normally instead: the firmware sweep
+    /// is stopped and the PC tags every block.
     pub fn sweep(&mut self, plan: &Plan) -> Result<(), String> {
         self.stop_sweeper();
+        if let Some(h) = &self.host {
+            h.disarm();
+        }
         if plan.rate != self.rate {
             // the rate request is refused mid-sweep: stop everything, change it, start again
             self.pause();
             self.rate = plan.rate;
             self.apply_rate()?;
         }
+        let live = plan.n() == 1;
+        if live && !self.host_mode && !self.live && self.streaming {
+            // tuner requests are refused while the firmware sweeps
+            self.sweep_stop();
+        }
+        self.live = false;
         self.start_stream()?;
-        if self.host_mode {
+        if live {
+            self.start_live(plan)?;
+            self.live = true;
+        } else if self.host_mode {
             self.start_sweeper(plan);
         } else {
+            if let Some(h) = &self.host {
+                h.passthrough.store(true, Ordering::Relaxed);
+            }
             let p = SweepParams::from(plan);
             match &self.io {
                 Io::Lib { api, dev, .. } => {
@@ -946,8 +1012,11 @@ impl R82xDevice {
         self.rx = rx;
         let sweeping = self.streaming && self.plan.is_some();
         if sweeping {
-            if self.host_mode {
+            if self.host_mode || self.live {
                 self.stop_sweeper();
+                if let Some(h) = &self.host {
+                    h.disarm();
+                }
             } else {
                 self.sweep_stop();
             }
@@ -963,8 +1032,11 @@ impl R82xDevice {
     /// Stop the sweep and the stream (otherwise normal mode keeps streaming 40–48 MB/s of raw samples).
     pub fn pause(&mut self) {
         self.stop_sweeper();
+        if let Some(h) = &self.host {
+            h.disarm();
+        }
         if self.streaming {
-            if !self.host_mode {
+            if !self.host_mode && !self.live {
                 self.sweep_stop();
             }
             match &mut self.io {
@@ -1014,6 +1086,7 @@ fn host_sweep(set_freq: FreqFn, plan: Plan, host: Arc<HostShared>, stop: Arc<Ato
                     sweep,
                     block: 0,
                     left: plan.dwell as u16,
+                    ..Default::default()
                 };
                 while st.armed && !stop.load(Ordering::Relaxed) {
                     host.cv.wait_for(&mut st, std::time::Duration::from_millis(50));
@@ -1076,14 +1149,21 @@ mod tests {
             };
             let rates = board.rates();
             let plan = |r: Rate, lo: f64, hi: f64| Plan::new(lo, hi, if r == Rate::H20 { 5.0 } else { r.max_window_hz() / 1e6 - 1.0 }, 1, 0, 2, Order::VcoContinuous, r);
-            let blocks = |rx: &std::sync::mpsc::Receiver<Vec<u16>>, ms: u64| {
+            // tagged blocks that came in `ms`, and the steps they were for
+            let tagged = |rx: &std::sync::mpsc::Receiver<Vec<u16>>, ms: u64| {
                 std::thread::sleep(std::time::Duration::from_millis(ms));
-                let mut n = 0;
+                let (mut n, mut steps) = (0, std::collections::BTreeSet::new());
                 while let Ok(buf) = rx.try_recv() {
-                    n += buf.chunks_exact(BLOCK_WORDS).filter(|b| matches!(parse_block(b), Block::Valid(_))).count();
+                    for b in buf.chunks_exact(BLOCK_WORDS) {
+                        if let Block::Valid(t) = parse_block(b) {
+                            n += 1;
+                            steps.insert(t.step);
+                        }
+                    }
                 }
-                n
+                (n, steps.len())
             };
+            let blocks = |rx: &std::sync::mpsc::Receiver<Vec<u16>>, ms: u64| tagged(rx, ms).0;
             for round in 0..2 {
                 set_board(board);
                 let (tx, rx) = std::sync::mpsc::sync_channel(4096);
@@ -1104,8 +1184,35 @@ mod tests {
                 d.sweep(&plan(r2, 400.0, 1000.0)).unwrap();
                 let p2 = blocks(&rx, 900);
                 eprintln!("{b} round {round} ({}): blocks {a} sweeping, {g} after a gain change, {paused} paused, {res} resumed, {p2} after a new plan at {}", d.version(), r2.label());
-                assert!(a > 50 && g > 50 && res > 50 && p2 > 50, "{b}: blocks stopped coming");
+                // an RTL-SDR's sweep runs ~17 steps a second (librtlsdr takes ~50 ms to retune)
+                let min = if board == Board::Rtl { 5 } else { 50 };
+                assert!(a > min && g > min && res > min && p2 > min, "{b}: blocks stopped coming");
                 assert!(paused < 20, "{b}: still streaming while paused ({paused})");
+                if board.has_live() {
+                    // the live view (one step; the RFOne and Airspys stream normally) and back to the sweep
+                    let w = r2.max_window_hz() / 1e6;
+                    let live = Plan::new(100.0, 100.0 + (w - 0.1).max(0.3), w, 1, 0, 2, Order::VcoContinuous, r2);
+                    assert_eq!(live.n(), 1);
+                    d.sweep(&live).unwrap();
+                    // blocks of the step the sweep was on can still be in flight
+                    let _ = blocks(&rx, 200);
+                    let (l1, s1) = tagged(&rx, 900);
+                    d.set_rx(RxSettings { port: 0, gain: Gain::Linearity(10) }).unwrap();
+                    let (l2, s2) = tagged(&rx, 700);
+                    d.pause();
+                    let _ = blocks(&rx, 200);
+                    let lp = blocks(&rx, 300);
+                    d.resume().unwrap();
+                    let (l3, s3) = tagged(&rx, 700);
+                    d.sweep(&plan(r2, 400.0, 1000.0)).unwrap();
+                    let _ = blocks(&rx, 200);
+                    let (back, sb) = tagged(&rx, 900);
+                    eprintln!("{b} round {round} live: {l1} blocks, {l2} after a gain change, {lp} paused, {l3} resumed (steps {s1}/{s2}/{s3}); back to the sweep: {back} blocks over {sb} steps");
+                    assert!(l1 > 50 && l2 > 50 && l3 > 50 && back > min, "{b}: live blocks stopped coming");
+                    assert!(s1 == 1 && s2 == 1 && s3 == 1, "{b}: live blocks for more than one step");
+                    assert!(sb > 1, "{b}: the sweep didn't come back from the live view");
+                    assert!(lp < 20, "{b}: still streaming while paused live ({lp})");
+                }
                 drop(d);
             }
         }

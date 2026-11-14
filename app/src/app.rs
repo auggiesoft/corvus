@@ -240,7 +240,10 @@ impl Config {
             self.live_back = Some((self.start_mhz, self.stop_mhz, self.step_mhz, self.rate));
             self.live = true;
         }
-        let span = self.live_span_mhz;
+        // one of this board's spans: the widest no wider than the one asked for (a Pluto's 50 MHz on an RFOne: 10)
+        let spans = live_spans();
+        let span = spans.iter().map(|s| s.0).find(|&s| s <= self.live_span_mhz + 1e-9).unwrap_or_else(|| spans.last().map_or(1.0, |s| s.0));
+        self.live_span_mhz = span;
         let rate = live_rate(span);
         self.rate = rate;
         // a step at least as wide as the span: the plan is one step
@@ -270,6 +273,13 @@ impl Config {
         }
         if self.rate != board_rate(self.rate) {
             self.set_rate(board_rate(self.rate));
+        }
+        if self.live {
+            // live on another board: its spans and rates, and a sweep to go back to that it can run
+            if let Some(back) = &mut self.live_back {
+                back.3 = board_rate(back.3);
+            }
+            self.set_live(self.live_centre_mhz());
         }
         if !crate::hydra::board().ports().iter().any(|&(p, _)| p == self.port) {
             self.port = 0;
@@ -2018,7 +2028,9 @@ impl App {
                         ui.label(RichText::new("MHz").size(theme::SM).color(INK2));
                     });
                     let mut span = self.cfg.live_span_mhz;
-                    let changed = theme::row(ui, "Span", |ui| theme::segmented(ui, &mut span, LIVE_SPANS));
+                    let spans = live_spans();
+                    let spans: Vec<(f64, &str)> = spans.iter().map(|(v, l)| (*v, l.as_str())).collect();
+                    let changed = theme::row(ui, "Span", |ui| theme::segmented(ui, &mut span, &spans));
                     if c != c0 || changed {
                         self.cfg.live_span_mhz = span;
                         self.cfg.set_live(c);
@@ -4450,12 +4462,42 @@ fn fit_rate_step(rate: Rate, step_mhz: f64, rates: &[Rate]) -> (Rate, f64) {
     }
 }
 
-/// Live-view spans for the Pluto, MHz.
-const LIVE_SPANS: &[(f64, &str)] = &[(50.0, "50"), (25.0, "25"), (12.0, "12"), (6.0, "6"), (3.0, "3"), (1.0, "1 MHz")];
+/// Live-view spans for the board, MHz, widest first. The Pluto, RFOne and Airspys have set lists (one rate
+/// covers several); an RTL-SDR or a SoapySDR radio offers the usable width of each of its rates.
+fn live_spans() -> Vec<(f64, String)> {
+    live_spans_for(crate::hydra::board())
+}
 
-/// The lowest Pluto rate whose usable window covers `span_mhz`: the finest bins for that span.
+fn live_spans_for(b: crate::hydra::Board) -> Vec<(f64, String)> {
+    use crate::hydra::Board;
+    let mut v: Vec<f64> = match b {
+        Board::Pluto => vec![50.0, 25.0, 12.0, 6.0, 3.0, 1.0],
+        Board::RFOne => vec![10.0, 6.0, 3.0, 1.0],
+        Board::Airspy => vec![9.0, 6.0, 3.0, 1.0],
+        Board::Mini => vec![4.0, 2.0, 1.0],
+        _ => b.rates().iter().map(|r| {
+            let w = r.max_window_hz() / 1e6;
+            if w >= 10.0 { w.floor() } else { (w * 10.0 + 1e-6).floor() / 10.0 }
+        }).filter(|&w| w >= 0.2).collect(),
+    };
+    v.sort_by(|a, b| b.total_cmp(a));
+    v.dedup();
+    let n = v.len();
+    v.into_iter().enumerate().map(|(i, w)| (w, if i + 1 == n { format!("{} MHz", fmt_trim(w, 1)) } else { fmt_trim(w, 1) })).collect()
+}
+
+/// The board's rate with the narrowest usable window that still covers `span_mhz`: the finest bins for that
+/// span (else its widest).
 fn live_rate(span_mhz: f64) -> Rate {
-    [Rate::P3, Rate::P7, Rate::P15, Rate::P31, Rate::P61].into_iter().find(|r| r.max_window_hz() >= span_mhz * 1e6 - 1.0).unwrap_or(Rate::P61)
+    live_rate_for(crate::hydra::board(), span_mhz)
+}
+
+fn live_rate_for(b: crate::hydra::Board, span_mhz: f64) -> Rate {
+    let rates = b.rates();
+    let w = |r: &Rate| r.max_window_hz();
+    rates.iter().copied().filter(|r| w(r) >= span_mhz * 1e6 - 1.0).min_by(|a, b| w(a).total_cmp(&w(b)))
+        .or_else(|| rates.iter().copied().max_by(|a, b| w(a).total_cmp(&w(b))))
+        .unwrap_or(Rate::P61)
 }
 
 /// The board's rate for a requested one: the R2 runs 10 MSPS only.
@@ -4537,6 +4579,30 @@ fn _assert_send() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every board's live spans fit in one step at the rate chosen for them, and that rate is the board's own;
+    /// the Pluto keeps its spans and picks the narrowest rate that covers each.
+    #[test]
+    fn live_spans_fit_one_step() {
+        use crate::hydra::Board;
+        for b in [Board::Pluto, Board::RFOne, Board::Airspy, Board::Mini, Board::Rtl] {
+            let spans = live_spans_for(b);
+            assert!(!spans.is_empty(), "{b:?}");
+            for (span, _) in spans {
+                let r = live_rate_for(b, span);
+                assert!(b.rates().contains(&r), "{b:?} {span}: {r:?} isn't its rate");
+                let step = r.steps().last().map_or(span, |s| s.0).max(span);
+                let p = Plan::new(100.0 - span / 2.0, 100.0 + span / 2.0, step, 1, 0, 2, crate::plan::Order::VcoContinuous, r);
+                assert_eq!(p.n(), 1, "{b:?} {span} MHz at {}", r.label());
+            }
+        }
+        assert_eq!(live_spans_for(Board::Pluto).iter().map(|s| s.0).collect::<Vec<_>>(), [50.0, 25.0, 12.0, 6.0, 3.0, 1.0]);
+        assert_eq!(live_rate_for(Board::Pluto, 50.0), Rate::P61);
+        assert_eq!(live_rate_for(Board::Pluto, 1.0), Rate::P3);
+        assert_eq!(live_rate_for(Board::RFOne, 10.0), Rate::M12);
+        assert_eq!(live_rate_for(Board::RFOne, 6.0), Rate::M10);
+        assert_eq!(live_spans_for(Board::Rtl).iter().map(|s| s.0).collect::<Vec<_>>(), [1.8, 1.5, 0.7]);
+    }
 
     #[test]
     fn outdated_corvus_firmware_is_flagged() {
