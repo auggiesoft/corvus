@@ -778,6 +778,8 @@ pub struct App {
     screenshot: Option<(PathBuf, f32)>,
     shot_requested: Option<(PathBuf, bool)>,
     frame_times: std::collections::VecDeque<f32>,
+    /// When the next frame may start, to hold the frame rate setting.
+    frame_due: Option<Instant>,
     started: Instant,
     /// G was pressed: put the cursor in the Start field next frame.
     focus_start: bool,
@@ -886,6 +888,7 @@ impl App {
             screenshot: opts.screenshot,
             shot_requested: None,
             frame_times: Default::default(),
+            frame_due: None,
             started: Instant::now(),
             focus_start: false,
             show_keys: false,
@@ -3807,7 +3810,18 @@ fn freq_field(v: &mut f64, range: std::ops::RangeInclusive<f64>) -> egui::DragVa
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // The frame rate setting is a ceiling. Asking for the next frame in 1/fps s doesn't make one: input,
+        // hover and other repaint requests come sooner, and without vsync (Windows on a fast screen) the
+        // window drew at 267 fps with 60 set. Each frame holds the engine's lock while it reads the traces, so
+        // the worker fell behind and dropped blocks; wait out the rest of the frame's time here instead.
+        if let Some(due) = self.frame_due {
+            let wait = due.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+        }
         let frame_start = Instant::now();
+        self.frame_due = Some(frame_start + Duration::from_secs_f32(1.0 / self.cfg.fps.max(1) as f32));
         let before = self.cfg.clone();
         if self.styled != Some((self.cfg.density, self.cfg.text_scale)) {
             theme::apply(ui.ctx(), self.cfg.density);

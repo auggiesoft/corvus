@@ -620,6 +620,10 @@ impl OrderModel {
     }
 }
 
+/// Blocks the worker takes from its queue at once when it has fallen behind (a buffer is never split):
+/// about 20 ms of work between the moments it publishes to the window.
+const BATCH_BLOCKS: usize = 64;
+
 struct Worker {
     live: Arc<Mutex<Live>>,
     rx: Receiver<Vec<u16>>,
@@ -736,7 +740,19 @@ impl Worker {
     fn run(&mut self) {
         while !self.stop.load(Ordering::Relaxed) {
             match self.rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(buf) => self.process(&buf),
+                Ok(buf) => {
+                    // take what else has queued up too, so a backlog costs one lock rather than one per block:
+                    // the window holds the same lock while it draws, and a lock per block fell behind
+                    let mut words = buf.len();
+                    let mut bufs = vec![buf];
+                    while words < BATCH_BLOCKS * BLOCK_WORDS
+                        && let Ok(b) = self.rx.try_recv()
+                    {
+                        words += b.len();
+                        bufs.push(b);
+                    }
+                    self.process(&bufs);
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -833,11 +849,12 @@ impl Worker {
         self.order.s0 = None;
     }
 
-    fn process(&mut self, buf: &[u16]) {
+    fn process(&mut self, bufs: &[Vec<u16>]) {
         self.sync();
-        let nb = buf.len() / BLOCK_WORDS;
+        let words: usize = bufs.iter().map(Vec::len).sum();
+        let nb = words / BLOCK_WORDS;
         let (mut torn, mut untagged, mut misfiled, mut timeouts, mut valid) = (0, 0, 0, 0, 0);
-        for w in buf.chunks_exact(BLOCK_WORDS) {
+        for w in bufs.iter().flat_map(|b| b.chunks_exact(BLOCK_WORDS)) {
             let t = match parse_block(w) {
                 Block::Untagged => {
                     untagged += 1;
@@ -902,7 +919,7 @@ impl Worker {
             let mut l = live.lock();
             let s = &mut l.stats;
             s.blocks += nb as u64;
-            s.bytes += (buf.len() * 2) as u64;
+            s.bytes += (words * 2) as u64;
             s.valid += valid;
             s.torn += torn;
             s.untagged += untagged;
