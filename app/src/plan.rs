@@ -310,6 +310,14 @@ pub struct Plan {
     pub overlap: bool,
 }
 
+/// Steps from `f0`, `step` apart, whose centres stay at or below `cmax` (at least one, at most `n`).
+fn fit_steps(n: usize, f0: f64, step: f64, cmax: f64) -> usize {
+    if n <= 1 || f0 + (n as f64 - 1.0) * step <= cmax + 1.0 {
+        return n;
+    }
+    (((cmax + 1.0 - f0) / step).floor() as usize + 1).clamp(1, n)
+}
+
 impl Plan {
     #[allow(clippy::too_many_arguments)]
     pub fn new(start_mhz: f64, stop_mhz: f64, step_mhz: f64, dwell: u8, skip: u8, lock_reads: u8, order: Order, rate: Rate) -> Plan {
@@ -343,6 +351,9 @@ impl Plan {
             f0 -= last - cmax;
         }
         f0 = f0.max(cmin);
+        // a range wider than the centres can span: drop the steps the tuner can't reach (the cover then ends
+        // a little short of the stop) rather than plan steps the radio skips
+        let n = fit_steps(n, f0, step, cmax);
         Plan {
             start_hz: start,
             stop_hz: stop,
@@ -404,6 +415,7 @@ impl Plan {
             f0 -= last - cmax;
         }
         f0 = f0.max(cmin);
+        let n = fit_steps(n, f0, step, cmax);
         Plan { f0: f0.round() as u64, step_hz: step as u32, n_steps: n.min(u16::MAX as usize) as u16, window_hz: step, overlap: true, ..self }
     }
 
@@ -585,6 +597,20 @@ mod tests {
 
     /// IQ rates narrower than 1 MHz (an RTL-SDR at 1.024 MSPS: 0.77 MHz usable) still make plans, with steps
     /// no wider than the rate's usable width.
+    /// With two looks, a range as wide as the tuner's (an RTL-SDR's 24–1766 MHz) can't fit its last LO inside it
+    /// once the first is held at the bottom: that step is dropped, not planned for the radio to skip.
+    #[test]
+    fn every_centre_is_reachable() {
+        set_iq_range(24e6, 1766e6);
+        let r = Rate::Iq(2_400_000);
+        let (lo, hi) = r.centre_range(r.max_window_hz());
+        for p in [Plan::new(24.0, 1766.0, 1.8, 1, 0, 2, Order::VcoContinuous, r).overlapped(), Plan::new(24.0, 1766.0, 1.8, 1, 0, 2, Order::VcoContinuous, r)] {
+            let (a, b) = (p.centre(0), p.centre(p.n() - 1));
+            assert!(a >= lo - 1.0 && b <= hi + 1.0, "{} steps: centres {a}..{b} outside {lo}..{hi}", p.n());
+            assert!(p.cover().1 > 1765e6, "the cover still reaches the top ({})", p.cover().1);
+        }
+    }
+
     #[test]
     fn narrow_iq_rates_plan() {
         let r = Rate::Iq(1_024_000);
