@@ -320,7 +320,9 @@ impl Plan {
         // over a single divider run, so it never wraps from 6 GHz to 70 MHz
         let order = if rate.iq16() { Order::VcoContinuous } else { order };
         let (fmin, fmax) = rate.f_range();
-        let step = (step_mhz.clamp(1.0, rate.max_window_hz() / 1e6) * 1e6).round();
+        // at least 1 MHz, but never wider than the rate's window (an RTL-SDR at 1.024 MSPS has 0.77 MHz)
+        let wmax = rate.max_window_hz() / 1e6;
+        let step = (step_mhz.clamp(1.0f64.min(wmax), wmax) * 1e6).round();
         let mut start = (start_mhz * 1e6).clamp(fmin, fmax - 0.2e6);
         let mut stop = (stop_mhz * 1e6).clamp(fmin + 0.2e6, fmax);
         if stop < start + 0.2e6 {
@@ -580,6 +582,19 @@ pub const PRESETS: &[Preset] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// IQ rates narrower than 1 MHz (an RTL-SDR at 1.024 MSPS: 0.77 MHz usable) still make plans, with steps
+    /// no wider than the rate's usable width.
+    #[test]
+    fn narrow_iq_rates_plan() {
+        let r = Rate::Iq(1_024_000);
+        for step in [0.38, 0.77, 5.0] {
+            let p = Plan::new(88.0, 108.0, step, 1, 0, 2, Order::Ascending, r);
+            assert!(p.step_hz as f64 <= r.max_window_hz() + 1.0 && p.n() > 1, "step {step}: {} Hz × {}", p.step_hz, p.n());
+        }
+        let p = Plan::new(100.0, 100.5, 0.77, 1, 0, 2, Order::Ascending, r);
+        assert_eq!(p.n(), 1);
+    }
 
     #[test]
     fn full_range_matches_the_reference_plan() {
