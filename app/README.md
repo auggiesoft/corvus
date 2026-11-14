@@ -143,10 +143,11 @@ tuner (R820T/R828D 24–1766 MHz, E4000 52–2200, …), and steps outside it ar
 steps, 0–21 spread over them; the bias tee stays off. The 8-bit samples are scaled so both rails read full
 scale, so the status bar reports clipping as it does for the boards.
 
-Measured on two generic R820T dongles (RTL2838UHIDIR) under Linux: about 17 steps a second at 2.4 MSPS, so
-24–1766 MHz (1,937 steps with two looks) takes about two minutes. Nearly all of a step is librtlsdr retuning
-the R820T, ~50 ms of small register writes over USB; emptying the buffer, settling and reading the block take
-~7 ms. For a narrow band, the [live view](#live-view) reads every sample instead. On the FM band the stations
+Measured on two generic R820T dongles (RTL2838UHIDIR) under Linux: about 52 steps a second at 2.4 MSPS, so
+24–1766 MHz (1,937 steps with two looks) takes about 37 s. Most of a step is the retune: corvus-rtl's
+librtlsdr (v0.2.0) writes only the tuner registers that change, 5 USB transfers and ~11.5 ms where stock
+librtlsdr takes 22 and ~50 ms (17 steps a second). Emptying the buffer, settling and reading the block take
+~7.5 ms more. For a narrow band, the [live view](#live-view) reads every sample instead. On the FM band the stations
 land on their channels, matching the RFOne's sweep of the same band. The Windows side (the DLL and the driver installer) builds but hasn't been
 run on a Windows machine yet: if it misbehaves there, please open an issue.
 

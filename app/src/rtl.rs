@@ -21,14 +21,14 @@ use crate::pcsweep::{BLOCK_IQ, Pass, push_block};
 use crate::plan::{Plan, Rate};
 
 /// The corvus-rtl release this Corvus Sweep uses, where its files are, and their SHA-256.
-const VERSION: &str = "v0.1.0";
+const VERSION: &str = "v0.2.0";
 const BASE_URL: &str = "https://github.com/auggiesoft/corvus-rtl/releases/download";
 #[cfg(windows)]
-const LIB: (&str, &str) = ("corvus-rtl-v0.1.0-windows-x64.dll", "2e5e90f0e9e2284582d74d68be31de2c5d3309a0fd4cfb91f860dfc835ffecfd");
+const LIB: (&str, &str) = ("corvus-rtl-v0.2.0-windows-x64.dll", "7bd84177abd1d998f81fa1d38a5d07d1f2b620374bb8cd36eb38a126ccf97e92");
 #[cfg(not(windows))]
-const LIB: (&str, &str) = ("libcorvus-rtl-v0.1.0-linux-x86_64.so", "e193ef8270b467bd86a28e3be8c6aec0c7740cb50c42cb2c84d7aafd60525d11");
+const LIB: (&str, &str) = ("libcorvus-rtl-v0.2.0-linux-x86_64.so", "92ed0ee758d9e9f492f038f8eb5db23d093c8621be8ac456ca57cd25f93d9030");
 #[cfg(windows)]
-const DRIVER: (&str, &str) = ("corvus-rtl-driver-v0.1.0-windows-x64.exe", "4b8ea3302a54c9cd7a5860135e3c0e30eff2f8dc53048720f9f64f7d4de357f0");
+const DRIVER: (&str, &str) = ("corvus-rtl-driver-v0.2.0-windows-x64.exe", "308a2e5166d4dbd2b782cad325e35c64ac67f8eecc39014f85d1b4ba5542601c");
 
 /// The open error that means "download corvus-rtl first" / "install the WinUSB driver" (the window offers it).
 pub const NEEDS_LIB: &str = "RTL-SDR support isn't downloaded yet";
@@ -610,9 +610,9 @@ struct Sweeper {
     skipped: usize,
     tuned: Option<u32>,
     /// The block counter's clock: samples read, plus the samples the dongle made while it was retuned
-    /// (thrown away with its buffer), so it keeps real time. A retune costs ~50 ms in librtlsdr, far longer
-    /// than the step's reads: counting only what was read ran ~15 times fast, and so did the sweep rate shown
-    /// and the averaging and smoothing times.
+    /// (thrown away with its buffer), so it keeps real time. A retune costs ~11 ms in corvus-rtl's librtlsdr
+    /// (~50 in stock librtlsdr), longer than the step's reads: counting only what was read ran several times
+    /// fast, and so did the sweep rate shown and the averaging and smoothing times.
     samples: u64,
     /// When the last read ended (the retune's lost time runs from here).
     read_end: Option<Instant>,
