@@ -11,7 +11,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libloading::Library;
 use sha2::{Digest, Sha256};
@@ -548,7 +548,7 @@ impl RtlDevice {
             .name("rtl-sweep".into())
             .spawn(move || {
                 let dev = dev;
-                Sweeper { api, dev: dev.0, sink, rx, gains, range: (lo, hi), rate: None, plan: None, paused: false, pass: Pass::default(), skipped: 0, tuned: None, samples: 0, fifo: Vec::new(), chunk: Vec::new(), iq: vec![0.0; 2 * BLOCK_IQ] }.run(rx_cmd);
+                Sweeper { api, dev: dev.0, sink, rx, gains, range: (lo, hi), rate: None, plan: None, paused: false, pass: Pass::default(), skipped: 0, tuned: None, samples: 0, read_end: None, fifo: Vec::new(), chunk: Vec::new(), iq: vec![0.0; 2 * BLOCK_IQ] }.run(rx_cmd);
                 // SAFETY: our handle, closed once.
                 unsafe { (api.close)(dev.0) };
             })
@@ -609,7 +609,13 @@ struct Sweeper {
     /// Steps skipped in a row (all of them: nothing to sweep until the next plan).
     skipped: usize,
     tuned: Option<u32>,
+    /// The block counter's clock: samples read, plus the samples the dongle made while it was retuned
+    /// (thrown away with its buffer), so it keeps real time. A retune costs ~50 ms in librtlsdr, far longer
+    /// than the step's reads: counting only what was read ran ~15 times fast, and so did the sweep rate shown
+    /// and the averaging and smoothing times.
     samples: u64,
+    /// When the last read ended (the retune's lost time runs from here).
+    read_end: Option<Instant>,
     /// Bytes read but not yet used (u8 I/Q pairs).
     fifo: Vec<u8>,
     chunk: Vec<u8>,
@@ -687,6 +693,7 @@ impl Sweeper {
             let got = (got.max(0) as usize).min(want);
             self.fifo.extend_from_slice(&self.chunk[..got]);
             self.samples += got as u64 / 2;
+            self.read_end = Some(Instant::now());
         }
         Ok(())
     }
@@ -725,6 +732,9 @@ impl Sweeper {
             self.tuned = Some(f);
             // what the dongle buffered before the retune, then what comes while the tuner settles
             unsafe { (self.api.reset_buffer)(self.dev) };
+            if let Some(t) = self.read_end {
+                self.samples += (t.elapsed().as_secs_f64() * sr as f64) as u64;
+            }
             self.fifo.clear();
             let settle = ((sr as f64 * SETTLE_S) as usize).max(4096) + plan.skip as usize * BLOCK_IQ;
             self.fill(settle)?;
