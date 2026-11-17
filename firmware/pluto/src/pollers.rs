@@ -7,11 +7,17 @@
 //! reads and rewrites register 0x27 every second). Both are shell scripts; they're found by their exact
 //! script path (argv[1]), never by a substring, and only their own processes are signalled: a command they
 //! have running finishes, then the bus is waited on until it's quiet.
+//!
+//! The Tezuka builds that carry DATV (the ANTSDR E310 among them) also run three programs of its DATV stack:
+//! `pluto_mqtt_ctrl` (polls the AD936x over SPI ~24 times a second: the one that keeps fast mode off),
+//! `zynqrx` (the DATV receiver, which holds the AD936x's capture buffer open) and `pluto_stream`. They're
+//! found by the exact path in argv[0], the same way.
 
 use std::fs;
 use std::time::{Duration, Instant};
 
 const SCRIPTS: &[&str] = &["/root/api_controller.sh", "/root/watchconsoletx.sh"];
+const PROGRAMS: &[&str] = &["/usr/bin/pluto_mqtt_ctrl", "/usr/bin/zynqrx", "/usr/bin/pluto_stream"];
 
 /// A process by PID and start time, so a recycled PID is never signalled.
 #[derive(Clone, Copy, PartialEq)]
@@ -34,8 +40,8 @@ fn find() -> Vec<Proc> {
     for e in dir.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
         let Ok(cmd) = fs::read(format!("/proc/{pid}/cmdline")) else { continue };
-        let script = cmd.split(|&b| b == 0).nth(1).and_then(|a| std::str::from_utf8(a).ok());
-        if script.is_some_and(|s| SCRIPTS.contains(&s))
+        let arg = |n: usize| cmd.split(|&b| b == 0).nth(n).and_then(|a| std::str::from_utf8(a).ok());
+        if (arg(1).is_some_and(|s| SCRIPTS.contains(&s)) || arg(0).is_some_and(|s| PROGRAMS.contains(&s)))
             && let Some((_, start)) = stat(pid)
         {
             found.push(Proc { pid, start });

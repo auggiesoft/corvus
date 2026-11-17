@@ -90,7 +90,9 @@ an error or a disconnect; src/pollers.rs). On Tezuka those are the web dashboard
 (`/root/api_controller.sh`: ~100 IIO reads every 2 s, register reads through `direct_reg_access` among
 them) and its PTT watcher (`/root/watchconsoletx.sh`: reads and rewrites register 0x27 every second). They
 are found by their exact script path, only their own processes are signalled, and a start-up resumes any an
-earlier run left stopped. The dashboard's figures freeze while Corvus sweeps. Maia SDR's web server isn't
+earlier run left stopped. Tezuka builds that carry DATV (tested: the ANTSDR E310, v0.3.24) also run
+`/usr/bin/pluto_mqtt_ctrl` (polls the chip over SPI ~24 times a second), `/usr/bin/zynqrx` (holds the capture
+buffer open) and `/usr/bin/pluto_stream`; those are paused the same way, found by the exact path in argv[0]. The dashboard's figures freeze while Corvus sweeps. Maia SDR's web server isn't
 paused (idle, it leaves the chip alone), so don't change radio settings from its page mid-sweep. Unknown programs aren't touched: if one polls the chip, fast mode stays off (`NOTE`). PlutoDVB2's
 MQTT control daemon polls the chip ~24 times a second, which keeps fast mode off. `STOP_DATV=1 install.sh HOST`
 also installs `plutodvb2-quiet.sh`, which stops PlutoDVB2's DATV services at every boot (the MQTT control daemon
