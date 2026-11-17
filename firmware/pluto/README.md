@@ -39,6 +39,7 @@ fallback) does about 650 steps/s.
 firmware/pluto/build.sh                          # rustup target armv7-unknown-linux-musleabihf, rust-lld
 PLUTO_PASS=analog firmware/pluto/install.sh 192.168.1.50    # or with no PLUTO_PASS, type the password
 STOP_DATV=1 firmware/pluto/install.sh 192.168.1.50           # on PlutoDVB2: also stop its DATV services (fast mode)
+RAM=1 PLUTO_PASS=analog firmware/pluto/install.sh 192.168.1.50   # nothing written to flash: runs from /tmp until the next reboot
 ```
 
 `install.sh` copies the binary to `/mnt/jffs2` (the board's small persistent flash area; about 530 KB of

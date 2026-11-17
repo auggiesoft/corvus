@@ -5,6 +5,8 @@
 # The program goes to /mnt/jffs2, the board's small persistent flash area. Firmware that runs
 # /mnt/jffs2/backdoor.sh at boot (F5OEO's PlutoDVB2) gets a line there so it starts at every boot; on other
 # firmware it runs until the next reboot (run this again, or start it by hand: /mnt/jffs2/corvus-pluto &).
+# RAM=1 writes nothing to flash: the program goes to /tmp and runs until the next reboot (run this again after
+# each one). Nothing to undo; /mnt/jffs2 and backdoor.sh aren't touched.
 # STOP_DATV=1 (PlutoDVB2 only) also installs plutodvb2-quiet.sh, which stops PlutoDVB2's DATV services at
 # every boot: its MQTT daemon polls the AD936x all the time, which keeps corvus-pluto out of fast mode.
 set -euo pipefail
@@ -18,6 +20,18 @@ SCP=(scp -O -o ConnectTimeout=5)
 if [ -n "${PLUTO_PASS:-}" ] && command -v sshpass >/dev/null; then
   SSH=(sshpass -p "$PLUTO_PASS" "${SSH[@]}")
   SCP=(sshpass -p "$PLUTO_PASS" "${SCP[@]}")
+fi
+if [ "${RAM:-}" = 1 ]; then
+  # Nothing written to flash: the program goes to /tmp (RAM) and is gone at the next reboot or power cycle.
+  "${SSH[@]}" 'killall corvus-pluto 2>/dev/null; rm -f /tmp/corvus-pluto; true'
+  "${SCP[@]}" "$BIN" "root@$HOST:/tmp/corvus-pluto"
+  "${SSH[@]}" 'set -e
+chmod +x /tmp/corvus-pluto
+(/tmp/corvus-pluto serve >/dev/null 2>&1 &)
+sleep 0.5
+/tmp/corvus-pluto --version
+pidof corvus-pluto >/dev/null && echo "running from RAM (gone at the next reboot), port 30433"'
+  exit 0
 fi
 "${SSH[@]}" 'killall corvus-pluto 2>/dev/null; rm -f /mnt/jffs2/corvus-pluto; true'
 "${SCP[@]}" "$BIN" "root@$HOST:/mnt/jffs2/corvus-pluto"
