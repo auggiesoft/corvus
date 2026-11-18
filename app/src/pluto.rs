@@ -35,6 +35,14 @@ const PACKED_BYTES: usize = 2 * TAG_BYTES + (BLOCK_WORDS - 2 * crate::hydra::TAG
 /// The two DMA blocks still holding the previous step after a retune (measured: block 3 is the new band).
 const FLUSH_BLOCKS: u8 = 2;
 
+/// What `open` says when the board is there but corvus-pluto isn't running on it (then followed by " at ADDR…").
+pub const NEEDS_INSTALL: &str = "corvus-pluto isn't running on the board";
+
+/// Does this open error mean corvus-pluto needs installing?
+pub fn needs_install(err: &str) -> bool {
+    err.starts_with(NEEDS_INSTALL)
+}
+
 static ADDR: parking_lot::Mutex<Option<String>> = parking_lot::const_mutex(None);
 
 /// Set the board's address (`--pluto`, CORVUS_PLUTO).
@@ -171,7 +179,12 @@ impl PlutoDevice {
             .next()
             .ok_or_else(|| format!("Pluto address {addr}: no such host"))?;
         let mut stream = TcpStream::connect_timeout(&sa, Duration::from_secs(3)).map_err(|e| {
-            format!("no corvus-pluto at {addr} ({e}). Is the board on the network, and corvus-pluto installed on it? See firmware/pluto/README.md")
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                // the board answered and nothing listens: corvus-pluto isn't there (the window offers to install it)
+                format!("{NEEDS_INSTALL} at {addr}. Install it with --install-pluto, or see firmware/pluto/README.md")
+            } else {
+                format!("no corvus-pluto at {addr} ({e}). Is the board on the network, and corvus-pluto installed on it? See firmware/pluto/README.md")
+            }
         })?;
         let _ = stream.set_nodelay(true);
         stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
