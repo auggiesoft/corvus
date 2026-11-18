@@ -51,7 +51,13 @@ stay off. Gain presets and the manual sliders map onto the HackRF's LNA (0–40 
 
 `--pluto HOST[:PORT]` (or `CORVUS_PLUTO`, or `--board pluto` for 192.168.2.1, a Pluto's own USB network
 link) drives a **Pluto+ or PlutoSDR** through `corvus-pluto`, a small program on the board
-(`../firmware/pluto/`, installed with its `install.sh`). The board retunes, captures and tags the blocks
+(`../firmware/pluto/`, installed with its `install.sh`, or by Corvus Sweep itself: when the board answers but
+no corvus-pluto is running, the window offers **Install on this board**, and `--install-pluto` does the same
+from a terminal. It logs in over SSH with the stock root/analog, asks for another login if the board refuses
+it, downloads this release's `corvus-pluto-vX.Y.Z-armv7.tar.gz` (checked against the release's `SHA256SUMS`),
+and by default runs it from the board's RAM: nothing is written to flash, and a reboot removes it; `--keep`,
+or the window's checkbox, puts it in `/mnt/jffs2` with a boot hook as `install.sh` does; `CORVUS_PLUTO_BIN`
+uses a local build instead of the download). The board retunes, captures and tags the blocks
 itself, two words per 12-bit IQ sample, and serves them over TCP; Corvus Sweep only sends the plan and
 the gain (`src/pluto.rs`). 61.44 MSPS (steps up to 50 MHz, 40 by default) or 30.72 MSPS (up to 25 MHz),
 plus 15.36, 7.68 and 3.84 MSPS for finer bins (3.75, 1.9, 0.94 kHz native); passes back and forth (no wrap).

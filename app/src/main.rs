@@ -10,6 +10,7 @@ mod engine;
 mod hackrf;
 mod health;
 mod hydra;
+mod install;
 mod net;
 mod plan;
 mod pluto;
@@ -124,6 +125,12 @@ corvus-sweep [options]
   --get-rtl             download RTL-SDR support (corvus-rtl's librtlsdr; on Windows also install
                         the WinUSB driver, after a Windows admin prompt), then exit. The window
                         offers the same when an RTL-SDR dongle is chosen
+  --install-pluto       put corvus-pluto on the Pluto/Pluto+/AntSDR at --pluto HOST over SSH, then exit.
+                        Tries the stock login (root/analog) unless CORVUS_PLUTO_USER and
+                        CORVUS_PLUTO_PASS are set. The program goes to the board's RAM (gone at its next
+                        reboot, nothing written to flash); --keep puts it in /mnt/jffs2 with a boot hook.
+                        The window offers the same when no corvus-pluto answers. CORVUS_PLUTO_BIN uses a
+                        local binary instead of this release's download
   --screenshot PATH     save a PNG of the window after --after seconds, then exit
   --after SECS          (default 4)
 ";
@@ -153,6 +160,7 @@ fn main() -> eframe::Result {
     let mut headless: Option<f32> = None;
     let mut csv: Option<PathBuf> = None;
     let mut csv_every: Option<f32> = None;
+    let (mut install_pluto, mut keep_pluto) = (false, false);
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         if a == "--serve" {
@@ -278,6 +286,8 @@ fn main() -> eframe::Result {
             "--pin" => pin = Some(val("--pin")).filter(|p| !p.is_empty()).or_else(|| die("--pin PIN")),
             "--connect" => connect = Some(val("--connect")),
             "--share" => share = true,
+            "--install-pluto" => install_pluto = true,
+            "--keep" => keep_pluto = true,
             "--get-rtl" => {
                 let r = rtl::get_now();
                 match r {
@@ -297,6 +307,23 @@ fn main() -> eframe::Result {
             }
             _ => die(&format!("unknown option {a}")),
         }
+    }
+    if install_pluto {
+        let env = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string());
+        let req = install::Request {
+            addr: pluto::addr(),
+            user: env("CORVUS_PLUTO_USER", install::STOCK_USER),
+            pass: env("CORVUS_PLUTO_PASS", install::STOCK_PASS),
+            keep: keep_pluto,
+        };
+        match install::install_now(req) {
+            Ok(m) => println!("{m}"),
+            Err(install::Outcome::Login(w) | install::Outcome::Failed(w)) => {
+                eprintln!("corvus-sweep: {w}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
     }
     if connect.is_some() && (serve.is_some() || share) {
         die("--connect drives another machine's radio; it can't be shared from here");

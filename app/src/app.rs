@@ -784,6 +784,8 @@ pub struct App {
     /// G was pressed: put the cursor in the Start field next frame.
     focus_start: bool,
     show_keys: bool,
+    /// The login window for installing corvus-pluto on a board whose stock login didn't work.
+    install_ui: InstallUi,
     /// Sharing this radio: the server, and the last settings change it applied from a client.
     server: Option<net::Server>,
     served_ack: (u64, u64),
@@ -892,6 +894,7 @@ impl App {
             started: Instant::now(),
             focus_start: false,
             show_keys: false,
+            install_ui: InstallUi::default(),
             server: None,
             served_ack: (0, 0),
             served_radios: Vec::new(),
@@ -1716,6 +1719,14 @@ impl App {
                 text: "Windows has no driver that lets programs read this RTL-SDR. Corvus can install Windows' own WinUSB driver for it (a small download from corvus-rtl, then a Windows admin prompt), as Zadig would.".into(),
                 acts: vec![(Act::RtlDriver, "Install the USB driver"), (Act::Retry, "Try again")],
             }),
+            _ if dev.kind == SrcKind::Offline && crate::pluto::needs_install(&dev.err) => out.push(Cond {
+                level: Level::Caution,
+                text: format!(
+                    "The board at {} is on the network but corvus-pluto isn't running on it. Corvus can put it there over SSH (the stock login first): it goes to the board's RAM, nothing is written to its flash, and a reboot removes it.",
+                    crate::install::host_of(&crate::pluto::addr())
+                ),
+                acts: vec![(Act::PlutoInstall, "Install on this board"), (Act::Retry, "Try again"), (Act::Sim, "Run the simulator")],
+            }),
             _ if dev.kind == SrcKind::Offline => {
                 let e = if dev.err.is_empty() { "not connected".to_string() } else { dev.err.clone() };
                 out.push(Cond { level: Level::Alarm, text: format!("The {} isn't open: {e}.", crate::hydra::board().name()), acts: vec![(Act::Retry, "Try again"), (Act::Sim, "Run the simulator")] });
@@ -1723,6 +1734,9 @@ impl App {
             _ => {}
         }
         if let crate::rtl::Job::Running(what) = crate::rtl::job() {
+            out.push(Cond { level: Level::Info, text: format!("{what}…"), acts: vec![] });
+        }
+        if let crate::install::Job::Running(what) = crate::install::job() {
             out.push(Cond { level: Level::Info, text: format!("{what}…"), acts: vec![] });
         }
         if let Some(sv) = &self.server {
@@ -1868,6 +1882,7 @@ impl App {
             Some(Act::Unshare) => self.set_share(false),
             Some(Act::RtlGet) => crate::rtl::start_download(),
             Some(Act::RtlDriver) => crate::rtl::start_driver_install(),
+            Some(Act::PlutoInstall) => crate::install::start(crate::install::Request::stock(&crate::pluto::addr())),
             Some(Act::Dismiss) => self.error = None,
             Some(Act::FwHide) => self.fw_hidden = self.dev().details,
             Some(Act::LockOn) => self.cfg.lock_reads = 2,
@@ -3507,7 +3522,12 @@ impl App {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
         theme::card(&mut child, |ui| {
             ui.label(RichText::new(format!("The {} isn't open", crate::hydra::board().name())).size(theme::LG).color(INK));
-            ui.label(RichText::new("Check that it's plugged in and that no other program is using it, then try again.").size(theme::SM).color(INK));
+            let hint = if crate::pluto::needs_install(err) {
+                "The board answered, but corvus-pluto isn't running on it."
+            } else {
+                "Check that it's plugged in and that no other program is using it, then try again."
+            };
+            ui.label(RichText::new(hint).size(theme::SM).color(INK));
             if !err.is_empty() {
                 ui.label(RichText::new(err).size(theme::XS + 1.0).color(INK2));
             }
@@ -3519,6 +3539,12 @@ impl App {
                 }
                 if err == crate::rtl::NEEDS_DRIVER && ui.add_enabled(!busy, egui::Button::new("Install the USB driver")).clicked() {
                     crate::rtl::start_driver_install();
+                }
+                if crate::pluto::needs_install(err) {
+                    let installing = matches!(crate::install::job(), crate::install::Job::Running(_));
+                    if ui.add_enabled(!installing, egui::Button::new("Install on this board")).clicked() {
+                        crate::install::start(crate::install::Request::stock(&crate::pluto::addr()));
+                    }
                 }
                 if ui.button("Try again").clicked() {
                     self.retry_device();
@@ -3716,6 +3742,59 @@ impl App {
         }
     }
 
+    /// The login window: the board refused the stock login, so ask for another and try again.
+    fn install_window(&mut self, ui: &mut Ui) {
+        if !self.install_ui.open {
+            return;
+        }
+        let busy = matches!(crate::install::job(), crate::install::Job::Running(_));
+        let host = crate::install::host_of(&crate::pluto::addr());
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(RichText::new("Sign in to the board").size(theme::MD).color(INK))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.label(RichText::new(format!("{} Enter the login for {host}.", self.install_ui.why)).size(theme::SM).color(INK2));
+                ui.add_space(8.0);
+                egui::Grid::new("install_login").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
+                    ui.label(theme::label("User", theme::SM));
+                    ui.add(egui::TextEdit::singleline(&mut self.install_ui.user).desired_width(180.0));
+                    ui.end_row();
+                    ui.label(theme::label("Password", theme::SM));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.install_ui.pass).password(true).desired_width(180.0));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        go = true;
+                    }
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.install_ui.keep, "Keep it after a reboot (writes a small file to the board's flash)");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy && !self.install_ui.pass.is_empty(), egui::Button::new("Install")).clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+                theme::caption(ui, "The password is used for this one connection: it isn't saved or logged. The board's SSH host key isn't checked (it changes at every boot).");
+            });
+        if go && !busy && !self.install_ui.pass.is_empty() {
+            let u = &mut self.install_ui;
+            let req = crate::install::Request { addr: crate::pluto::addr(), user: u.user.clone(), pass: std::mem::take(&mut u.pass), keep: u.keep };
+            u.open = false;
+            crate::install::start(req);
+        }
+        if cancel || !open {
+            self.install_ui = InstallUi::default();
+        }
+    }
+
     fn keys_window(&mut self, ui: &mut Ui) {
         let mut open = self.show_keys;
         egui::Window::new(RichText::new("Keyboard shortcuts").size(theme::MD).color(INK))
@@ -3847,6 +3926,17 @@ impl eframe::App for App {
             Some(Err(e)) => self.toast(e, true),
             None => {}
         }
+        // corvus-pluto installed on a board (or its login refused: ask for another)
+        match crate::install::take_finished() {
+            Some(Ok(msg)) => {
+                self.install_ui = InstallUi::default();
+                self.toast(msg, false);
+                self.retry_device();
+            }
+            Some(Err(crate::install::Outcome::Login(why))) => self.install_ui.ask(why),
+            Some(Err(crate::install::Outcome::Failed(e))) => self.toast(e, true),
+            None => {}
+        }
         let bad = self.stats.torn + self.stats.gaps + self.stats.misfiled + self.stats.lock_timeouts + self.stats.host_drops;
         if bad > self.bad_last.0 {
             self.bad_last = (bad, self.now());
@@ -3867,6 +3957,7 @@ impl eframe::App for App {
         egui::Panel::right("controls").frame(theme::side_frame()).exact_size(392.0).resizable(false).show(ui, |ui| self.sidebar(ui));
         egui::CentralPanel::default().frame(theme::central_frame()).show(ui, |ui| self.central(ui));
         self.keys_window(ui);
+        self.install_window(ui);
         self.device_picker(ui);
         self.handle_screenshots(ui);
         if crate::QUIT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4190,6 +4281,30 @@ fn open_device(lib: &std::path::Path, serial: u64, engine: &Engine, plan: &Plan,
     }
 }
 
+/// The login window's fields. The password is cleared when it's used or the window closes.
+struct InstallUi {
+    open: bool,
+    user: String,
+    pass: String,
+    keep: bool,
+    why: String,
+}
+
+impl Default for InstallUi {
+    fn default() -> InstallUi {
+        InstallUi { open: false, user: crate::install::STOCK_USER.into(), pass: String::new(), keep: false, why: String::new() }
+    }
+}
+
+impl InstallUi {
+    /// Open the window, with why the last login failed.
+    fn ask(&mut self, why: String) {
+        self.pass.clear();
+        self.why = format!("{why}.");
+        self.open = true;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Act {
     Retry,
@@ -4199,6 +4314,8 @@ enum Act {
     /// Download corvus-rtl's librtlsdr; install the WinUSB driver for the dongle (Windows).
     RtlGet,
     RtlDriver,
+    /// Put corvus-pluto on the board (its stock login first).
+    PlutoInstall,
     Sim,
     Dismiss,
     /// Hide the outdated-firmware notice for this board until the next start.
