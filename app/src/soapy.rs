@@ -266,6 +266,62 @@ pub fn enumerate() -> Result<Vec<Found>, String> {
     Ok(out)
 }
 
+/// How a `--soapy-find` process marks its result lines (the modules print chatter of their own on stdout).
+const FIND_TAG: &str = "CORVUS-SOAPY-FOUND";
+
+/// `--soapy-find`: print what the modules find, one tagged line each and a last line when done, for `search`.
+pub fn find_main() {
+    match enumerate() {
+        Ok(list) => {
+            let flat = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+            for f in list.iter().filter(|f| flat(&f.args) == f.args) {
+                println!("{FIND_TAG}\t{}\t{}\t{}", f.args, flat(&f.driver), flat(&f.label));
+            }
+            println!("{FIND_TAG}-END");
+        }
+        Err(e) => {
+            eprintln!("corvus-sweep: SoapySDR: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The radios in a `--soapy-find` process's output; `None` unless it ran to the end.
+fn parse_found(out: &str) -> Option<Vec<Found>> {
+    let mut list = Vec::new();
+    for l in out.lines() {
+        if l == format!("{FIND_TAG}-END") {
+            return Some(list);
+        }
+        let mut p = l.split('\t');
+        if let (Some(FIND_TAG), Some(args), Some(driver), Some(label)) = (p.next(), p.next(), p.next(), p.next()) {
+            list.push(Found { id: fnv(args), args: args.into(), driver: driver.into(), label: label.into() });
+        }
+    }
+    None
+}
+
+/// Ask every module what it can open, each time from scratch: in a process of its own (this program again,
+/// with `--soapy-find`). Some modules search once per process and answer from that list ever after
+/// (SoapyPlutoSDR: a Pluto that came onto the network after the first look never appeared, Refresh or not).
+/// If the process can't be run, the modules are asked in this one.
+pub fn search() -> Result<Vec<Found>, String> {
+    let child = || -> Option<Vec<Found>> {
+        let mut cmd = std::process::Command::new(std::env::current_exe().ok()?);
+        cmd.arg("--soapy-find").stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        parse_found(&String::from_utf8_lossy(&cmd.output().ok()?.stdout))
+    };
+    match child() {
+        Some(list) => Ok(list),
+        None => enumerate(),
+    }
+}
+
 /// `--soapy ARGS`: which radio "the first one" means (every key=value given must match).
 static FILTER: parking_lot::Mutex<String> = parking_lot::const_mutex(String::new());
 
@@ -288,7 +344,7 @@ pub fn cached() -> Vec<Found> {
     if !f.1 && available() {
         f.1 = true;
         let _ = std::thread::Builder::new().name("soapy-find".into()).spawn(|| {
-            let list = enumerate().unwrap_or_else(|e| {
+            let list = search().unwrap_or_else(|e| {
                 log::warn!("SoapySDR: {e}");
                 Vec::new()
             });
@@ -376,7 +432,7 @@ impl SoapyDevice {
         let api = api()?;
         let mut list = FOUND.lock().0.clone();
         if id == 0 || !list.iter().any(|f| f.id == id) {
-            list = enumerate()?;
+            list = search()?;
             FOUND.lock().0 = list.clone();
         }
         let found = if id == 0 { list.iter().find(|f| matches_filter(f)) } else { list.iter().find(|f| f.id == id) }.cloned().ok_or_else(|| match id {
@@ -695,6 +751,18 @@ impl Sweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_output_is_read_back() {
+        let out = format!("[INFO] [UHD] linux\n{FIND_TAG}\tdevice=PlutoSDR,driver=plutosdr,uri=ip:pluto.local\tplutosdr\tPlutoSDR #1 ip:pluto.local\n{FIND_TAG}-END\n");
+        let list = parse_found(&out).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].driver.as_str(), list[0].label.as_str()), ("plutosdr", "PlutoSDR #1 ip:pluto.local"));
+        assert_eq!(list[0].id, fnv("device=PlutoSDR,driver=plutosdr,uri=ip:pluto.local"));
+        // no radios is an answer; output that stops short isn't
+        assert_eq!(parse_found(&format!("{FIND_TAG}-END\n")), Some(Vec::new()));
+        assert_eq!(parse_found(&format!("{FIND_TAG}\ta=b\tx\ty\n")), None);
+    }
 
     #[test]
     fn rates_offered() {
