@@ -2629,7 +2629,7 @@ impl App {
             let text = format!("{} – {} MHz", fmt_freq(self.view.0, dec), fmt_freq(self.view.1, dec));
             let g = p.layout_no_wrap(text, theme::num(theme::XS), INK);
             let w = g.size().x + 8.0;
-            let cx = vb.center().x.clamp(ov.left() + w / 2.0, ov.right() - w / 2.0);
+            let cx = keep_in(vb.center().x, ov.left() + w / 2.0, ov.right() - w / 2.0);
             let at = Rect::from_center_size(pos2(cx, ov.center().y), g.size() + vec2(8.0, 2.0));
             p.rect_filled(at, 2, WELL.gamma_multiply(0.9));
             p.galley(at.min + vec2(4.0, 1.0), g, INK);
@@ -2711,7 +2711,7 @@ impl App {
             }
             let g = p.layout_no_wrap(fmt_freq(f, dec), font.clone(), INK);
             let size = vec2(g.size().x + 12.0, rail.height() - 6.0);
-            let cx = x.clamp(rail.left() + size.x / 2.0, rail.right() - more_w - size.x / 2.0 - 4.0);
+            let cx = keep_in(x, rail.left() + size.x / 2.0, rail.right() - more_w - size.x / 2.0 - 4.0);
             let r = Rect::from_center_size(pos2(cx, rail.center().y - 1.0), size);
             if placed.iter().any(|o| o.expand2(vec2(3.0, 0.0)).intersects(r)) {
                 self.hidden_peaks.push((f, v));
@@ -3302,7 +3302,7 @@ impl App {
             let gs = (!sub.is_empty()).then(|| p.layout_no_wrap(sub.to_string(), theme::ui_font(theme::XS), INK2));
             let w = g.size().x.max(gs.as_ref().map_or(0.0, |g| g.size().x)) + 14.0;
             let h = g.size().y + gs.as_ref().map_or(0.0, |g| g.size().y + 2.0) + 8.0;
-            let cx = ((x0 + x1) / 2.0).clamp(r.left() + w / 2.0 + 2.0, r.right() - w / 2.0 - 2.0);
+            let cx = keep_in((x0 + x1) / 2.0, r.left() + w / 2.0 + 2.0, r.right() - w / 2.0 - 2.0);
             let cr = Rect::from_min_size(pos2(cx - w / 2.0, r.top() + 8.0), vec2(w, h));
             p.rect_filled(cr, 4, WELL.gamma_multiply(0.9));
             let gh = g.size().y;
@@ -4455,6 +4455,12 @@ fn paint_palette_bar(p: &Painter, r: Rect, pal: Palette) {
     p.rect_stroke(r, 2, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
 }
 
+/// `x` kept within `lo..=hi`, or in the middle when there's no room for that (`hi < lo`: a label wider than
+/// the strip it sits on, as in a window's first small frames), where `f32::clamp` panics.
+fn keep_in(x: f32, lo: f32, hi: f32) -> f32 {
+    if lo <= hi { x.clamp(lo, hi) } else { (lo + hi) / 2.0 }
+}
+
 fn gradient_rect(p: &Painter, r: Rect, top: Color32, bottom: Color32) {
     let mut m = Mesh::default();
     m.colored_vertex(r.left_top(), top);
@@ -4503,7 +4509,11 @@ fn fill_under(p: &Painter, pts: &[Option<Pos2>], bottom: f32, top_c: Color32, bo
             None => prev = None,
         }
     }
-    p.add(Shape::mesh(m));
+    // lone points make corners but no triangles, and wgpu panics on a mesh with nothing to draw ("buffer
+    // slice can not be empty"): a sweep's first step is one
+    if !m.indices.is_empty() {
+        p.add(Shape::mesh(m));
+    }
 }
 
 /// Nice frequency ticks: (Hz, major).
@@ -4740,6 +4750,13 @@ mod tests {
         assert_eq!(live_rate_for(Board::RFOne, 10.0), Rate::M12);
         assert_eq!(live_rate_for(Board::RFOne, 6.0), Rate::M10);
         assert_eq!(live_spans_for(Board::Rtl).iter().map(|s| s.0).collect::<Vec<_>>(), [1.8, 1.5, 0.7]);
+    }
+
+    #[test]
+    fn a_label_wider_than_its_strip_is_centred() {
+        assert_eq!(keep_in(50.0, 10.0, 90.0), 50.0);
+        assert_eq!(keep_in(5.0, 10.0, 90.0), 10.0);
+        assert_eq!(keep_in(50.0, 84.0, 67.0), 75.5); // f32::clamp: "min > max ... min = 84.0, max = 67.0"
     }
 
     #[test]
