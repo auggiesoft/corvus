@@ -136,6 +136,11 @@ corvus-sweep [options]
 ";
 
 fn main() -> eframe::Result {
+    // the app's own SoapySDR search, run as a process of its own (soapy::search); its output is read, not shown
+    if std::env::args().nth(1).as_deref() == Some("--soapy-find") {
+        soapy::find_main();
+        return Ok(());
+    }
     #[cfg(windows)]
     attach_parent_console();
     install_signal_handlers();
