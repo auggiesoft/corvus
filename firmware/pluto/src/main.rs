@@ -597,7 +597,9 @@ impl Sweeper<'_> {
             return Err(e);
         }
         if p.fast {
-            let why = fast::unavailable(&self.radio.phy);
+            // not after a pause that left the bus busy: a program we don't know is polling the radio
+            let busy = || (!self.paused.as_ref().is_some_and(|p| p.quiet())).then(|| "another program is using the radio (SPI traffic)".to_string());
+            let why = fast::unavailable(&self.radio.phy).or_else(busy);
             let r = match why {
                 Some(w) => Err(w),
                 None => self.take_fast(&p),

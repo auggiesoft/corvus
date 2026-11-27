@@ -94,7 +94,7 @@ are found by their exact script path, only their own processes are signalled, an
 earlier run left stopped. Tezuka builds that carry DATV (tested: the ANTSDR E310, v0.3.24) also run
 `/usr/bin/pluto_mqtt_ctrl` (polls the chip over SPI ~24 times a second), `/usr/bin/zynqrx` (holds the capture
 buffer open) and `/usr/bin/pluto_stream`; those are paused the same way, found by the exact path in argv[0]. The dashboard's figures freeze while Corvus sweeps. Maia SDR's web server isn't
-paused (idle, it leaves the chip alone), so don't change radio settings from its page mid-sweep. Unknown programs aren't touched: if one polls the chip, fast mode stays off (`NOTE`). PlutoDVB2's
+paused (idle, it leaves the chip alone), so don't change radio settings from its page mid-sweep. Unknown programs aren't touched: if one polls the chip, fast mode stays off (`NOTE`). From 0.2.5 a plan starts in fast mode only after the SPI bus has been silent for 150 ms; 0.2.4 looked for 30 ms, which a program polling 24 times a second (the E310's `pluto_mqtt_ctrl`) passed one time in three, and the collision that followed could leave the AD936x driver unusable until a reboot (`Calibration TIMEOUT` in dmesg, `CONFIG` failing with EINVAL). PlutoDVB2's
 MQTT control daemon polls the chip ~24 times a second, which keeps fast mode off. `STOP_DATV=1 install.sh HOST`
 also installs `plutodvb2-quiet.sh`, which stops PlutoDVB2's DATV services at every boot (the MQTT control daemon
 and broker, the DATV streamer, its LO/TX watcher scripts and its NFS server) and keeps iiod, SSH, DHCP and the

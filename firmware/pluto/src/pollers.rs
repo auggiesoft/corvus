@@ -57,39 +57,57 @@ fn signal(p: Proc, sig: i32) {
 }
 
 /// The pollers paused for a sweep; dropping it resumes them.
-pub struct Paused(Vec<Proc>);
+pub struct Paused {
+    procs: Vec<Proc>,
+    quiet: bool,
+}
 
 impl Paused {
     pub fn count(&self) -> usize {
-        self.0.len()
+        self.procs.len()
+    }
+
+    /// The SPI bus fell silent after the pause: nothing we don't know about is polling the radio (not
+    /// `QUIET` apart or closer, at least), so fast mode may take the bus.
+    pub fn quiet(&self) -> bool {
+        self.quiet
     }
 }
 
-/// Pause the pollers, then wait (up to a second) for a command one of them had running to finish: until the
-/// SPI bus has been quiet for 50 ms.
+/// How long the SPI bus must stay silent to count as free. A program this module doesn't know that polls
+/// the radio seven or more times a second is caught; fast mode's own 30 ms look let one polling 24 times a
+/// second through one time in three, and a transfer of ours landing inside one of the kernel's left the
+/// AD936x driver with garbage (calibration timeouts, clock rates of nonsense) until a reboot.
+const QUIET: Duration = Duration::from_millis(150);
+
+/// Pause the pollers, then wait (up to a second) for a command one of them had running to finish, and for
+/// anyone else on the bus to show: until the SPI bus has been silent for `QUIET`.
 pub fn pause() -> Paused {
     let procs = find();
     for &p in &procs {
         signal(p, libc::SIGSTOP);
     }
-    if !procs.is_empty() {
-        let t = Instant::now();
-        let mut last = crate::fast::spi_irqs();
-        while t.elapsed() < Duration::from_secs(1) {
-            std::thread::sleep(Duration::from_millis(50));
-            let now = crate::fast::spi_irqs();
-            if now == last {
-                break;
-            }
+    let t = Instant::now();
+    let mut last = crate::fast::spi_irqs();
+    let mut since = Instant::now();
+    let mut quiet = false;
+    while t.elapsed() < Duration::from_secs(1) {
+        std::thread::sleep(Duration::from_millis(25));
+        let now = crate::fast::spi_irqs();
+        if now != last {
             last = now;
+            since = Instant::now();
+        } else if since.elapsed() >= QUIET {
+            quiet = true;
+            break;
         }
     }
-    Paused(procs)
+    Paused { procs, quiet }
 }
 
 impl Drop for Paused {
     fn drop(&mut self) {
-        for &p in &self.0 {
+        for &p in &self.procs {
             signal(p, libc::SIGCONT);
         }
     }

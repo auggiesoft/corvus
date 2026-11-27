@@ -6,7 +6,8 @@
 //!   ahead is written into the slot just left while the current step's block fills.
 //! - **Registers:** written over the Zynq's SPI0 controller directly (/dev/mem), ~2 us per transaction
 //!   instead of ~45 us through the kernel. Only while nothing else uses the bus: the controller must be idle
-//!   the way the kernel leaves it, the bus quiet, and its interrupt count unchanged after every pass.
+//!   the way the kernel leaves it, the bus quiet (for 150 ms once the known pollers are paused, src/pollers.rs,
+//!   and again as the radio is taken), and its interrupt count unchanged after every pass.
 //! - **Gain tables:** fastlock doesn't reload the RX gain table the driver keeps per LO band (to 1.3 GHz,
 //!   1.3-4 GHz, 4-6 GHz), so the sweep writes it where a pass crosses a band edge (~0.5 ms), with the index
 //!   that gives the same gain in dB.
